@@ -8,6 +8,7 @@ import type {
   TransactionKind,
 } from '../db/types';
 import { normalizePlaceName } from './places';
+import { normalizeTags } from './tags';
 
 export interface CsvImportItem {
   rowNumber: number;
@@ -21,6 +22,7 @@ export interface CsvImportItem {
   subCategoryName: string;
   placeName: string | null;
   note: string | null;
+  tags: string[];
   invoiceNo: string | null;
 }
 
@@ -400,6 +402,8 @@ export function planCsvImport(csvText: string, existing: CsvImportExistingData):
     const placeName = rawPlaceName || null;
     const rawNote = getCell(row.cells, '備註').trim();
     const note = rawNote || null;
+    const rawTags = getCell(row.cells, '標籤').trim();
+    const tags = rawTags ? normalizeTags(rawTags.split('、')) : [];
     const rawInvoice = getCell(row.cells, '發票號碼').trim().toUpperCase();
     const invoiceNo = rawInvoice || null;
 
@@ -447,6 +451,7 @@ export function planCsvImport(csvText: string, existing: CsvImportExistingData):
       subCategoryName,
       placeName,
       note,
+      tags,
       invoiceNo,
     });
   }

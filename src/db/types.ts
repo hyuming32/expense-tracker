@@ -45,6 +45,8 @@ export interface Transaction extends BaseRecord {
   /** 地點識別碼（選填，可空） */
   placeId?: string | null;
   note: string | null;
+  /** 標籤清單（選填，最多 5 個） */
+  tags?: string[];
   /** 電子發票字軌號碼（選填，例如 AB12345678） */
   invoiceNo?: string | null;
   /** 所屬週期性收支規則識別碼（選填） */
@@ -134,6 +136,18 @@ export interface LotteryDraw extends BaseRecord {
   extraSixth: string[];
 }
 
+export interface Budget extends BaseRecord {
+  /** null 代表本月總預算；否則為「支出」主分類 id */
+  categoryId: string | null;
+  /** 每月預算金額（正整數，新台幣元） */
+  amount: number;
+}
+
+export interface NoSpendDay extends BaseRecord {
+  /** 標記為「這天沒花錢」的本地日期字串 YYYY-MM-DD */
+  date: string;
+}
+
 export interface MetaEntry {
   key: string;
   value: string;
@@ -147,7 +161,9 @@ export type SyncTableName =
   | 'recurringRules'
   | 'shortcuts'
   | 'places'
-  | 'lotteryDraws';
+  | 'lotteryDraws'
+  | 'budgets'
+  | 'noSpendDays';
 
 export interface OutboxEntry {
   /** 複合主鍵 `${table}:${recordId}`，避免同一筆紀錄重複排隊 */

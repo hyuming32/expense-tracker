@@ -14,8 +14,9 @@ import {
   XAxis,
   YAxis,
 } from 'recharts';
+import { useMoney, usePrivacy } from '../contexts/PrivacyContext';
 import { saveReportPeriodKind, type AmountColors } from '../db/repository';
-import type { Category, Place, Transaction } from '../db/types';
+import type { Budget, Category, Place, Transaction } from '../db/types';
 import {
   categoryBreakdownInRange,
   categoryCompare,
@@ -29,6 +30,8 @@ import {
   placeBreakdownInRange,
   sameLastYear,
   shiftPeriod,
+  summarizeAllTags,
+  summarizeByTag,
   type CompareResult,
   type PeriodKind,
 } from '../domain';
@@ -38,6 +41,7 @@ interface ReportsPageProps {
   transactions: readonly Transaction[];
   categories: readonly Category[];
   places: readonly Place[];
+  budgets: readonly Budget[];
   amountColors: AmountColors;
 }
 
@@ -71,7 +75,10 @@ const PIE_COLORS = [
   '#64748b',
 ] as const;
 
-function formatSignedCurrency(amount: number): string {
+function formatSignedCurrency(amount: number, hideAmounts = false): string {
+  if (hideAmounts) {
+    return formatCurrency(0).replace('0', '••••');
+  }
   if (amount > 0) {
     return `+${formatCurrency(amount)}`;
   }
@@ -106,10 +113,12 @@ function renderCompareLine(
   cmp: CompareResult,
   inverseGood: boolean,
   withAmount: boolean,
+  hideAmounts: boolean,
 ) {
   const colorClass = getDeltaColorClass(cmp.diff, inverseGood);
   const pctText = formatPctBadge(cmp.pct);
-  const amountText = withAmount && cmp.diff !== 0 ? `（${formatSignedCurrency(cmp.diff)}）` : '';
+  const amountText =
+    withAmount && cmp.diff !== 0 ? `（${formatSignedCurrency(cmp.diff, hideAmounts)}）` : '';
 
   return (
     <div className="mt-1 flex flex-wrap items-baseline gap-1 text-[11px] leading-tight">
@@ -122,9 +131,28 @@ function renderCompareLine(
   );
 }
 
-export function ReportsPage({ transactions, categories, places, amountColors }: ReportsPageProps) {
+export function ReportsPage({
+  transactions,
+  categories,
+  places,
+  budgets,
+  amountColors,
+}: ReportsPageProps) {
+  const formatMoney = useMoney();
+  const { hideAmounts } = usePrivacy();
+  const budgetByCategoryId = useMemo(() => {
+    const map = new Map<string, number>();
+    for (const b of budgets) {
+      if (!b.deleted && b.categoryId !== null && b.amount > 0) {
+        map.set(b.categoryId, b.amount);
+      }
+    }
+    return map;
+  }, [budgets]);
   const savedKind = useReportPeriodKind();
   const [periodKind, setPeriodKind] = useState<PeriodKind>(savedKind);
+  const [isTagsTab, setIsTagsTab] = useState(false);
+  const [selectedTag, setSelectedTag] = useState<string | null>(null);
   const [anchor, setAnchor] = useState<string>(getTodayDateString);
   const [expandedCategories, setExpandedCategories] = useState<Record<string, boolean>>({});
 
@@ -230,7 +258,14 @@ export function ReportsPage({ transactions, categories, places, amountColors }: 
     [trend],
   );
 
+  const allTagSummaries = useMemo(() => summarizeAllTags(transactions), [transactions]);
+  const selectedTagSummary = useMemo(
+    () => (selectedTag ? summarizeByTag(transactions, selectedTag, categories) : null),
+    [transactions, selectedTag, categories],
+  );
+
   function handleSelectKind(kind: PeriodKind) {
+    setIsTagsTab(false);
     setPeriodKind(kind);
     void saveReportPeriodKind(kind);
   }
@@ -257,14 +292,14 @@ export function ReportsPage({ transactions, categories, places, amountColors }: 
           🎟️ 發票兌獎
         </Link>
       </div>
-      {/* 期間模式分段按鈕：月｜季｜年 */}
+      {/* 期間模式分段按鈕：月｜季｜年｜標籤 */}
       <div
         role="tablist"
         aria-label="報表期間類型"
-        className="grid grid-cols-3 rounded-2xl border border-slate-200 bg-white p-1 dark:border-slate-800 dark:bg-slate-900"
+        className="grid grid-cols-4 rounded-2xl border border-slate-200 bg-white p-1 dark:border-slate-800 dark:bg-slate-900"
       >
         {PERIOD_TABS.map((tab) => {
-          const active = periodKind === tab.kind;
+          const active = !isTagsTab && periodKind === tab.kind;
           return (
             <button
               key={tab.kind}
@@ -282,7 +317,195 @@ export function ReportsPage({ transactions, categories, places, amountColors }: 
             </button>
           );
         })}
+        <button
+          type="button"
+          role="tab"
+          aria-selected={isTagsTab}
+          onClick={() => {
+            setIsTagsTab(true);
+            setSelectedTag(null);
+          }}
+          className={`rounded-xl py-2 text-sm font-medium transition-colors ${
+            isTagsTab
+              ? 'bg-slate-900 text-white dark:bg-slate-100 dark:text-slate-900'
+              : 'text-slate-600 hover:text-slate-900 dark:text-slate-400 dark:hover:text-slate-100'
+          }`}
+        >
+          標籤
+        </button>
       </div>
+
+      {isTagsTab ? (
+        selectedTagSummary ? (
+          <div className="space-y-4">
+            <div className="flex items-center justify-between rounded-2xl border border-slate-200 bg-white px-4 py-3 dark:border-slate-800 dark:bg-slate-900">
+              <button
+                type="button"
+                onClick={() => setSelectedTag(null)}
+                className="text-sm font-medium text-emerald-600 hover:text-emerald-700 dark:text-emerald-400"
+              >
+                ← 所有標籤
+              </button>
+              <div className="text-right">
+                <div className="text-base font-semibold text-slate-900 dark:text-slate-100">
+                  #{selectedTagSummary.tag}
+                </div>
+                <div className="text-[11px] text-slate-500 dark:text-slate-400">
+                  {selectedTagSummary.dateRange
+                    ? `${selectedTagSummary.dateRange.start} ～ ${selectedTagSummary.dateRange.end}`
+                    : '全部時間'}
+                </div>
+              </div>
+            </div>
+
+            <section className="grid grid-cols-3 gap-3">
+              <div className="rounded-2xl border border-slate-200 bg-white p-4 dark:border-slate-800 dark:bg-slate-900">
+                <div className="text-xs font-medium text-slate-500 dark:text-slate-400">總支出</div>
+                <div
+                  className="mt-1 text-lg font-bold tabular-nums"
+                  style={{ color: amountColors.expense }}
+                >
+                  {formatMoney(selectedTagSummary.expenseTotal)}
+                </div>
+              </div>
+              <div className="rounded-2xl border border-slate-200 bg-white p-4 dark:border-slate-800 dark:bg-slate-900">
+                <div className="text-xs font-medium text-slate-500 dark:text-slate-400">總收入</div>
+                <div
+                  className="mt-1 text-lg font-bold tabular-nums"
+                  style={{ color: amountColors.income }}
+                >
+                  {formatMoney(selectedTagSummary.incomeTotal)}
+                </div>
+              </div>
+              <div className="rounded-2xl border border-slate-200 bg-white p-4 dark:border-slate-800 dark:bg-slate-900">
+                <div className="text-xs font-medium text-slate-500 dark:text-slate-400">筆數</div>
+                <div className="mt-1 text-lg font-bold tabular-nums text-slate-900 dark:text-slate-100">
+                  {selectedTagSummary.count} 筆
+                </div>
+              </div>
+            </section>
+
+            <section className="rounded-2xl border border-slate-200 bg-white p-4 dark:border-slate-800 dark:bg-slate-900">
+              <div className="mb-3 flex items-center justify-between">
+                <h2 className="text-sm font-semibold text-slate-900 dark:text-slate-100">支出分類分布</h2>
+                {selectedTagSummary.expenseTotal > 0 && (
+                  <span className="text-xs font-medium tabular-nums text-slate-500 dark:text-slate-400">
+                    總支出 {formatMoney(selectedTagSummary.expenseTotal)}
+                  </span>
+                )}
+              </div>
+
+              {selectedTagSummary.categoryBreakdown.length === 0 ? (
+                <div className="py-10 text-center text-sm text-slate-500 dark:text-slate-400">
+                  此標籤還沒有支出紀錄
+                </div>
+              ) : (
+                <div className="grid gap-4 sm:grid-cols-2 sm:items-center">
+                  <div className="h-56 w-full">
+                    <ResponsiveContainer width="100%" height="100%">
+                      <PieChart>
+                        <Pie
+                          data={selectedTagSummary.categoryBreakdown}
+                          dataKey="amount"
+                          nameKey="name"
+                          cx="50%"
+                          cy="50%"
+                          innerRadius={48}
+                          outerRadius={84}
+                          paddingAngle={2}
+                        >
+                          {selectedTagSummary.categoryBreakdown.map((entry, idx) => (
+                            <Cell
+                              key={entry.categoryId}
+                              fill={PIE_COLORS[idx % PIE_COLORS.length]}
+                            />
+                          ))}
+                        </Pie>
+                        <Tooltip formatter={(value) => formatMoney(Number(value ?? 0))} />
+                      </PieChart>
+                    </ResponsiveContainer>
+                  </div>
+
+                  <div className="space-y-2">
+                    {selectedTagSummary.categoryBreakdown.map((item, idx) => (
+                      <div key={item.categoryId} className="flex items-center justify-between gap-2 text-sm">
+                        <div className="flex min-w-0 items-center gap-2">
+                          <span
+                            className="h-3 w-3 shrink-0 rounded-full"
+                            style={{ backgroundColor: PIE_COLORS[idx % PIE_COLORS.length] }}
+                            aria-hidden="true"
+                          />
+                          <span className="shrink-0">{item.icon}</span>
+                          <span className="truncate font-medium text-slate-800 dark:text-slate-200">
+                            {item.name}
+                          </span>
+                        </div>
+                        <div className="shrink-0 text-right tabular-nums">
+                          <span className="font-semibold text-slate-900 dark:text-slate-100">
+                            {formatMoney(item.amount)}
+                          </span>
+                          <span className="ml-2 text-xs text-slate-500 dark:text-slate-400">
+                            {item.percentage.toFixed(1)}%
+                          </span>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+            </section>
+          </div>
+        ) : (
+          <section className="rounded-2xl border border-slate-200 bg-white p-4 dark:border-slate-800 dark:bg-slate-900">
+            <div className="mb-3 flex items-center justify-between">
+              <h2 className="text-sm font-semibold text-slate-900 dark:text-slate-100">所有標籤</h2>
+              <span className="text-xs text-slate-400 dark:text-slate-500">全部時間・點選看明細</span>
+            </div>
+
+            {allTagSummaries.length === 0 ? (
+              <div className="py-10 text-center text-sm text-slate-500 dark:text-slate-400">
+                目前還沒有任何標籤紀錄
+              </div>
+            ) : (
+              <div className="divide-y divide-slate-100 dark:divide-slate-800">
+                {allTagSummaries.map((item) => (
+                  <button
+                    key={item.tag}
+                    type="button"
+                    onClick={() => setSelectedTag(item.tag)}
+                    className="flex w-full items-center justify-between gap-3 py-3 text-left transition-colors hover:bg-slate-50 dark:hover:bg-slate-800/50"
+                  >
+                    <div className="min-w-0">
+                      <div className="truncate text-sm font-medium text-slate-900 dark:text-slate-100">
+                        #{item.tag}
+                      </div>
+                      <div className="text-xs text-slate-500 dark:text-slate-400">
+                        {item.count} 筆 · 最近 {item.lastDate}
+                      </div>
+                    </div>
+                    <div className="shrink-0 text-right tabular-nums">
+                      <div
+                        className="text-sm font-semibold"
+                        style={{ color: amountColors.expense }}
+                      >
+                        {formatMoney(item.expenseTotal)}
+                      </div>
+                      {item.incomeTotal > 0 && (
+                        <div className="text-xs" style={{ color: amountColors.income }}>
+                          {hideAmounts
+                            ? formatMoney(item.incomeTotal)
+                            : `+${formatMoney(item.incomeTotal)}`}
+                        </div>
+                      )}
+                    </div>
+                  </button>
+                ))}
+              </div>
+            )}
+          </section>
+        )
+      ) : (
+        <>
 
       {/* 期間切換列 */}
       <div className="rounded-2xl border border-slate-200 bg-white px-4 py-3 dark:border-slate-800 dark:bg-slate-900">
@@ -330,10 +553,10 @@ export function ReportsPage({ transactions, categories, places, amountColors }: 
             className="mt-1 text-xl font-bold tabular-nums"
             style={{ color: amountColors.expense }}
           >
-            {formatCurrency(currentSumForPrev.expense)}
+            {formatMoney(currentSumForPrev.expense)}
           </div>
-          {renderCompareLine('比上一期', expensePrevCmp, true, true)}
-          {renderCompareLine('比去年同期', expenseLastYearCmp, true, false)}
+          {renderCompareLine('比上一期', expensePrevCmp, true, true, hideAmounts)}
+          {renderCompareLine('比去年同期', expenseLastYearCmp, true, false, hideAmounts)}
         </div>
 
         <div className="rounded-2xl border border-slate-200 bg-white p-4 dark:border-slate-800 dark:bg-slate-900">
@@ -342,19 +565,19 @@ export function ReportsPage({ transactions, categories, places, amountColors }: 
             className="mt-1 text-xl font-bold tabular-nums"
             style={{ color: amountColors.income }}
           >
-            {formatCurrency(currentSumForPrev.income)}
+            {formatMoney(currentSumForPrev.income)}
           </div>
-          {renderCompareLine('比上一期', incomePrevCmp, false, true)}
-          {renderCompareLine('比去年同期', incomeLastYearCmp, false, false)}
+          {renderCompareLine('比上一期', incomePrevCmp, false, true, hideAmounts)}
+          {renderCompareLine('比去年同期', incomeLastYearCmp, false, false, hideAmounts)}
         </div>
 
         <div className="rounded-2xl border border-slate-200 bg-white p-4 dark:border-slate-800 dark:bg-slate-900">
           <div className="text-xs font-medium text-slate-500 dark:text-slate-400">本期結餘</div>
           <div className="mt-1 text-xl font-bold tabular-nums text-slate-900 dark:text-slate-100">
-            {formatCurrency(currentSumForPrev.net)}
+            {formatMoney(currentSumForPrev.net)}
           </div>
-          {renderCompareLine('比上一期', netPrevCmp, false, true)}
-          {renderCompareLine('比去年同期', netLastYearCmp, false, false)}
+          {renderCompareLine('比上一期', netPrevCmp, false, true, hideAmounts)}
+          {renderCompareLine('比去年同期', netLastYearCmp, false, false, hideAmounts)}
         </div>
       </section>
 
@@ -364,7 +587,7 @@ export function ReportsPage({ transactions, categories, places, amountColors }: 
           <h2 className="text-sm font-semibold text-slate-900 dark:text-slate-100">支出分類佔比</h2>
           {totalExpense > 0 && (
             <span className="text-xs font-medium tabular-nums text-slate-500 dark:text-slate-400">
-              總支出 {formatCurrency(totalExpense)}
+              總支出 {formatMoney(totalExpense)}
             </span>
           )}
         </div>
@@ -395,38 +618,57 @@ export function ReportsPage({ transactions, categories, places, amountColors }: 
                       />
                     ))}
                   </Pie>
-                  <Tooltip formatter={(value) => formatCurrency(Number(value ?? 0))} />
+                  <Tooltip formatter={(value) => formatMoney(Number(value ?? 0))} />
                 </PieChart>
               </ResponsiveContainer>
             </div>
 
             <div className="space-y-2">
-              {breakdown.map((item, idx) => (
-                <div
-                  key={item.categoryId}
-                  className="flex items-center justify-between gap-2 text-sm"
-                >
-                  <div className="flex min-w-0 items-center gap-2">
-                    <span
-                      className="h-3 w-3 shrink-0 rounded-full"
-                      style={{ backgroundColor: PIE_COLORS[idx % PIE_COLORS.length] }}
-                      aria-hidden="true"
-                    />
-                    <span className="shrink-0">{item.icon}</span>
-                    <span className="truncate font-medium text-slate-800 dark:text-slate-200">
-                      {item.name}
-                    </span>
+              {breakdown.map((item, idx) => {
+                const catBudget =
+                  periodKind === 'month' ? budgetByCategoryId.get(item.categoryId) : undefined;
+                const budgetUsedPct =
+                  catBudget && catBudget > 0 ? Math.round((item.amount / catBudget) * 100) : null;
+
+                return (
+                  <div key={item.categoryId} className="space-y-0.5">
+                    <div className="flex items-center justify-between gap-2 text-sm">
+                      <div className="flex min-w-0 items-center gap-2">
+                        <span
+                          className="h-3 w-3 shrink-0 rounded-full"
+                          style={{ backgroundColor: PIE_COLORS[idx % PIE_COLORS.length] }}
+                          aria-hidden="true"
+                        />
+                        <span className="shrink-0">{item.icon}</span>
+                        <span className="truncate font-medium text-slate-800 dark:text-slate-200">
+                          {item.name}
+                        </span>
+                      </div>
+                      <div className="shrink-0 text-right tabular-nums">
+                        <span className="font-semibold text-slate-900 dark:text-slate-100">
+                          {formatMoney(item.amount)}
+                        </span>
+                        <span className="ml-2 text-xs text-slate-500 dark:text-slate-400">
+                          {item.percentage.toFixed(1)}%
+                        </span>
+                      </div>
+                    </div>
+                    {catBudget !== undefined && budgetUsedPct !== null && (
+                      <div
+                        className={`pl-5 text-[11px] tabular-nums ${
+                          budgetUsedPct > 100
+                            ? 'font-medium text-red-600 dark:text-red-400'
+                            : budgetUsedPct >= 80
+                              ? 'font-medium text-amber-600 dark:text-amber-400'
+                              : 'text-slate-500 dark:text-slate-400'
+                        }`}
+                      >
+                        預算 {formatMoney(catBudget)}／已用 {budgetUsedPct}%
+                      </div>
+                    )}
                   </div>
-                  <div className="shrink-0 text-right tabular-nums">
-                    <span className="font-semibold text-slate-900 dark:text-slate-100">
-                      {formatCurrency(item.amount)}
-                    </span>
-                    <span className="ml-2 text-xs text-slate-500 dark:text-slate-400">
-                      {item.percentage.toFixed(1)}%
-                    </span>
-                  </div>
-                </div>
-              ))}
+                );
+              })}
             </div>
           </div>
         )}
@@ -459,7 +701,7 @@ export function ReportsPage({ transactions, categories, places, amountColors }: 
                   </div>
                   <div className="shrink-0 text-right tabular-nums">
                     <span className="font-semibold text-slate-900 dark:text-slate-100">
-                      {formatCurrency(item.amount)}
+                      {formatMoney(item.amount)}
                     </span>
                     <span className="ml-2 text-xs text-slate-500 dark:text-slate-400">
                       {item.percentage.toFixed(1)}%
@@ -539,13 +781,13 @@ export function ReportsPage({ transactions, categories, places, amountColors }: 
                           </div>
                         </td>
                         <td className="py-2.5 px-2 text-right tabular-nums text-slate-900 dark:text-slate-100">
-                          {formatCurrency(row.current)}
+                          {formatMoney(row.current)}
                         </td>
                         <td className="py-2.5 px-2 text-right tabular-nums text-slate-500 dark:text-slate-400">
-                          {formatCurrency(row.previous)}
+                          {formatMoney(row.previous)}
                         </td>
                         <td className={`py-2.5 px-2 text-right font-medium tabular-nums ${deltaClass}`}>
-                          {formatSignedCurrency(row.diff)}
+                          {formatSignedCurrency(row.diff, hideAmounts)}
                         </td>
                         <td className={`py-2.5 pl-2 text-right font-medium tabular-nums ${deltaClass}`}>
                           {formatPctBadge(row.pct)}
@@ -568,13 +810,13 @@ export function ReportsPage({ transactions, categories, places, amountColors }: 
                                 </div>
                               </td>
                               <td className="py-2 px-2 text-right tabular-nums text-slate-700 dark:text-slate-200">
-                                {formatCurrency(sub.current)}
+                                {formatMoney(sub.current)}
                               </td>
                               <td className="py-2 px-2 text-right tabular-nums text-slate-500 dark:text-slate-400">
-                                {formatCurrency(sub.previous)}
+                                {formatMoney(sub.previous)}
                               </td>
                               <td className={`py-2 px-2 text-right tabular-nums ${subDeltaClass}`}>
-                                {formatSignedCurrency(sub.diff)}
+                                {formatSignedCurrency(sub.diff, hideAmounts)}
                               </td>
                               <td className={`py-2 pl-2 text-right tabular-nums ${subDeltaClass}`}>
                                 {formatPctBadge(sub.pct)}
@@ -620,13 +862,14 @@ export function ReportsPage({ transactions, categories, places, amountColors }: 
                   axisLine={false}
                   tickLine={false}
                   width={56}
+                  tickFormatter={(value) => (hideAmounts ? '••••' : String(value))}
                 />
                 <Tooltip
                   labelFormatter={(_, payload) => {
                     const item = payload?.[0]?.payload as { label?: string } | undefined;
                     return item?.label ?? '';
                   }}
-                  formatter={(value) => formatCurrency(Number(value ?? 0))}
+                  formatter={(value) => formatMoney(Number(value ?? 0))}
                 />
                 <Legend wrapperStyle={{ fontSize: '12px' }} />
                 <Bar
@@ -655,6 +898,8 @@ export function ReportsPage({ transactions, categories, places, amountColors }: 
           </div>
         )}
       </section>
+        </>
+      )}
     </div>
   );
 }

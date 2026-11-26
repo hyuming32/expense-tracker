@@ -1,7 +1,8 @@
 import { useMemo, useState } from 'react';
+import { useMoney } from '../contexts/PrivacyContext';
 import type { AmountColors } from '../db/repository';
 import type { Account, AccountType, Category, Place, Transaction } from '../db/types';
-import { accountBalance, formatCurrency } from '../domain';
+import { accountBalance } from '../domain';
 import { TransactionsPage } from './TransactionsPage';
 
 interface AccountsPageProps {
@@ -35,6 +36,7 @@ export function AccountsPage({
   amountColors,
   onEditTransaction,
 }: AccountsPageProps) {
+  const formatMoney = useMoney();
   const [selectedAccountId, setSelectedAccountId] = useState<string | null>(null);
 
   const accountBalances = useMemo(
@@ -74,7 +76,7 @@ export function AccountsPage({
       {/* 總資產卡片 */}
       <section className="rounded-2xl bg-slate-900 p-5 text-white shadow-sm dark:bg-slate-800">
         <div className="text-xs text-slate-300">總資產</div>
-        <div className="mt-1 text-2xl font-bold tabular-nums">{formatCurrency(totalAssets)}</div>
+        <div className="mt-1 text-2xl font-bold tabular-nums">{formatMoney(totalAssets)}</div>
       </section>
 
       {/* 帳戶列表 */}
@@ -121,7 +123,7 @@ export function AccountsPage({
                       }`}
                       style={balance < 0 ? { color: amountColors.expense } : undefined}
                     >
-                      {formatCurrency(balance)}
+                      {formatMoney(balance)}
                     </span>
                     <span className="text-xs text-slate-400" aria-hidden="true">
                       ›

@@ -1,11 +1,11 @@
 import { type ChangeEvent, useEffect, useMemo, useRef, useState } from 'react';
 import { useSearchParams } from 'react-router-dom';
+import { useMoney, usePrivacy } from '../contexts/PrivacyContext';
 import { saveLotteryDraw } from '../db/repository';
 import type { LotteryDraw, Place, Transaction } from '../db/types';
 import {
   claimDeadline,
   drawDateOfPeriod,
-  formatCurrency,
   formatPeriodLabel,
   getLatestDrawnPeriod,
   getRecentPeriods,
@@ -30,6 +30,8 @@ function formatDrawDateHint(period: string): string {
 }
 
 export function LotteryPage({ transactions, places, lotteryDraws }: LotteryPageProps) {
+  const formatMoney = useMoney();
+  const { hideAmounts } = usePrivacy();
   const [searchParams, setSearchParams] = useSearchParams();
   const periods = useMemo(() => getRecentPeriods(undefined, 12), []);
   const defaultPeriod = useMemo(() => getLatestDrawnPeriod(), []);
@@ -528,7 +530,7 @@ export function LotteryPage({ transactions, places, lotteryDraws }: LotteryPageP
                   恭喜中獎 {matchResult.matched.length} 張（共比對 {matchResult.checkedCount} 張）
                 </span>
                 <span className="text-base font-bold tabular-nums">
-                  {formatCurrency(matchResult.totalAmount)}
+                  {formatMoney(matchResult.totalAmount)}
                 </span>
               </div>
 
@@ -556,11 +558,11 @@ export function LotteryPage({ transactions, places, lotteryDraws }: LotteryPageP
                         </div>
                         <div className="truncate text-xs text-slate-500 dark:text-slate-400">
                           {item.transaction.date} · {storeLabel} · 消費{' '}
-                          {formatCurrency(item.transaction.amount)}
+                          {formatMoney(item.transaction.amount)}
                         </div>
                       </div>
                       <div className="shrink-0 font-bold tabular-nums text-emerald-600 dark:text-emerald-400">
-                        +{formatCurrency(item.amount)}
+                        {hideAmounts ? formatMoney(item.amount) : `+${formatMoney(item.amount)}`}
                       </div>
                     </div>
                   );

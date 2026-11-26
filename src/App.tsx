@@ -1,17 +1,29 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { HashRouter, Route, Routes } from 'react-router-dom';
 import { BottomNav } from './components/BottomNav';
+import type { BeforeInstallPromptEvent } from './components/InstallGuideContent';
+import { OnboardingModal } from './components/OnboardingModal';
+import { PinLockScreen } from './components/PinLockScreen';
+import { PwaUpdatePrompt } from './components/PwaUpdatePrompt';
 import { type RecurringRuleDraft, RecurringRuleSheet } from './components/RecurringRuleSheet';
 import { type ShortcutDraft, ShortcutSheet } from './components/ShortcutSheet';
 import { type TransactionDraft, TransactionSheet } from './components/TransactionSheet';
+import { PrivacyProvider, useMoney } from './contexts/PrivacyContext';
 import { ensureSeeded } from './db/database';
 import {
+  markOnboardingCompleted,
   processRecurringRules,
+  recordQuickTextTransaction,
   recordShortcutTransaction,
   softDeleteTransaction,
 } from './db/repository';
 import type { RecurringRule, Shortcut, Transaction } from './db/types';
-import { formatCurrency, getTodayDateString } from './domain';
+import { collectRecentTags, getTodayDateString, type QuickTextResult } from './domain';
+import {
+  detectInstallPlatform,
+  isStandaloneDisplayMode,
+  shouldShowOnboarding,
+} from './domain/onboarding';
 import {
   useActiveAccounts,
   useAllAccounts,
@@ -19,22 +31,31 @@ import {
   useAmountColors,
   useAutoAddNotePresets,
   useAutoSelectLastPlace,
+  useBudgets,
+  useHideAmountsDefault,
+  useHomeLayout,
   useLastUsedMeta,
   useLotteryDraws,
+  useNoSpendDays,
   useNotePresets,
+  useOnboardingMetaState,
   usePendingRecurringOccurrences,
+  usePinRecord,
   usePlaces,
   useRecurringRules,
   useShortcuts,
   useTransactions,
 } from './hooks/useExpenseData';
+import { shouldLockOnResume } from './lib/pinLock';
+import { requestStoragePersistence } from './lib/storagePersist';
 import { AccountsPage } from './pages/AccountsPage';
+import { CalendarPage } from './pages/CalendarPage';
 import { HomePage } from './pages/HomePage';
 import { LotteryPage } from './pages/LotteryPage';
 import { ReportsPage } from './pages/ReportsPage';
 import { SettingsPage } from './pages/SettingsPage';
 import { TransactionsPage } from './pages/TransactionsPage';
-import { startSyncManager, useSyncState } from './sync/syncManager';
+import { loginAndSync, startSyncManager, useSyncState } from './sync/syncManager';
 
 export function App() {
   const [ready, setReady] = useState(false);
@@ -49,6 +70,21 @@ export function App() {
   const [shortcutDraft, setShortcutDraft] = useState<ShortcutDraft | null>(null);
   const [lastSavedTx, setLastSavedTx] = useState<Transaction | null>(null);
   const [quickToast, setQuickToast] = useState<{ tx: Transaction; label: string } | null>(null);
+  const [persistedStatus, setPersistedStatus] = useState<boolean | null>(null);
+  const [deferredInstallPrompt, setDeferredInstallPrompt] = useState<BeforeInstallPromptEvent | null>(
+    null,
+  );
+  const [isInstalled, setIsInstalled] = useState<boolean>(() => {
+    if (typeof window === 'undefined') {
+      return false;
+    }
+    const nav = window.navigator as Navigator & { standalone?: boolean };
+    return isStandaloneDisplayMode(
+      window.matchMedia?.('(display-mode: standalone)').matches ?? false,
+      nav.standalone,
+    );
+  });
+  const [manualOnboardingOpen, setManualOnboardingOpen] = useState(false);
   const lastActiveDateRef = useRef<string>(getTodayDateString());
 
   const activeAccounts = useActiveAccounts();
@@ -64,8 +100,58 @@ export function App() {
   const shortcuts = useShortcuts();
   const places = usePlaces();
   const lotteryDraws = useLotteryDraws();
+  const budgets = useBudgets();
+  const noSpendDays = useNoSpendDays();
+  const homeLayout = useHomeLayout();
+  const pinRecord = usePinRecord();
+  const hideAmountsDefault = useHideAmountsDefault();
   const autoSelectLastPlace = useAutoSelectLastPlace();
+  const onboardingMeta = useOnboardingMetaState();
   const syncState = useSyncState();
+  const [isLocked, setIsLocked] = useState(false);
+  const initialLockCheckedRef = useRef(false);
+  const hiddenAtRef = useRef<number | null>(null);
+
+  const installPlatform = useMemo(() => {
+    if (typeof navigator === 'undefined') {
+      return 'other' as const;
+    }
+    return detectInstallPlatform({
+      userAgent: navigator.userAgent,
+      platform: navigator.platform,
+      maxTouchPoints: navigator.maxTouchPoints,
+    });
+  }, []);
+
+  useEffect(() => {
+    void requestStoragePersistence().then((result) => {
+      setPersistedStatus(result);
+    });
+  }, []);
+
+  useEffect(() => {
+    function handleBeforeInstallPrompt(event: Event) {
+      event.preventDefault();
+      setDeferredInstallPrompt(event as BeforeInstallPromptEvent);
+    }
+    function handleAppInstalled() {
+      setDeferredInstallPrompt(null);
+      setIsInstalled(true);
+    }
+
+    window.addEventListener('beforeinstallprompt', handleBeforeInstallPrompt);
+    window.addEventListener('appinstalled', handleAppInstalled);
+    return () => {
+      window.removeEventListener('beforeinstallprompt', handleBeforeInstallPrompt);
+      window.removeEventListener('appinstalled', handleAppInstalled);
+    };
+  }, []);
+
+  useEffect(() => {
+    if (ready && onboardingMeta && !onboardingMeta.onboardingCompleted && transactions.length > 0) {
+      void markOnboardingCompleted();
+    }
+  }, [ready, onboardingMeta, transactions.length]);
 
   useEffect(() => {
     void ensureSeeded().then(async () => {
@@ -75,6 +161,34 @@ export function App() {
       startSyncManager();
     });
   }, []);
+
+  useEffect(() => {
+    if (ready && pinRecord !== undefined && !initialLockCheckedRef.current) {
+      initialLockCheckedRef.current = true;
+      if (pinRecord !== null) {
+        setIsLocked(true);
+      }
+    }
+  }, [ready, pinRecord]);
+
+  useEffect(() => {
+    function handleVisibility() {
+      if (document.visibilityState === 'hidden') {
+        hiddenAtRef.current = Date.now();
+        return;
+      }
+      if (document.visibilityState === 'visible') {
+        if (pinRecord && shouldLockOnResume(hiddenAtRef.current, Date.now())) {
+          setIsLocked(true);
+        }
+        hiddenAtRef.current = null;
+      }
+    }
+    document.addEventListener('visibilitychange', handleVisibility);
+    return () => {
+      document.removeEventListener('visibilitychange', handleVisibility);
+    };
+  }, [pinRecord]);
 
   useEffect(() => {
     function handleResume() {
@@ -119,6 +233,7 @@ export function App() {
   const accountMap = useMemo(() => new Map(allAccounts.map((a) => [a.id, a])), [allAccounts]);
   const categoryMap = useMemo(() => new Map(categories.map((c) => [c.id, c])), [categories]);
   const placeMap = useMemo(() => new Map(places.map((p) => [p.id, p])), [places]);
+  const recentTags = useMemo(() => collectRecentTags(transactions, 8), [transactions]);
 
   function handleOpenCreate(draft?: TransactionDraft) {
     setEditingTx(null);
@@ -149,6 +264,17 @@ export function App() {
     const saved = await recordShortcutTransaction(shortcut);
     setLastSavedTx(null);
     setQuickToast({ tx: saved, label: shortcut.label });
+  }
+
+  async function handleQuickRecordText(parsed: QuickTextResult) {
+    const saved = await recordQuickTextTransaction(parsed);
+    setLastSavedTx(null);
+    const categoryName =
+      parsed.kind === 'transfer'
+        ? `${accountMap.get(parsed.accountId)?.name ?? '帳戶'} → ${accountMap.get(parsed.toAccountId ?? '')?.name ?? '帳戶'}`
+        : (categoryMap.get(parsed.categoryId ?? '')?.name ?? '其他');
+    const label = [categoryName, parsed.note].filter(Boolean).join(' ');
+    setQuickToast({ tx: saved, label });
   }
 
   async function handleUndoQuickRecord(tx: Transaction) {
@@ -241,7 +367,33 @@ export function App() {
     setRecurringDraft(null);
   }
 
-  if (!ready) {
+  async function handleTriggerInstall() {
+    if (!deferredInstallPrompt) {
+      return;
+    }
+    try {
+      await deferredInstallPrompt.prompt();
+      await deferredInstallPrompt.userChoice;
+    } finally {
+      setDeferredInstallPrompt(null);
+    }
+  }
+
+  function handleCompleteOnboarding() {
+    setManualOnboardingOpen(false);
+    void markOnboardingCompleted();
+  }
+
+  const autoOnboardingOpen =
+    ready &&
+    onboardingMeta !== undefined &&
+    shouldShowOnboarding({
+      onboardingCompleted: onboardingMeta.onboardingCompleted,
+      transactionCount: transactions.length,
+    });
+  const onboardingOpen = manualOnboardingOpen || autoOnboardingOpen;
+
+  if (!ready || pinRecord === undefined || hideAmountsDefault === undefined) {
     return (
       <div className="flex min-h-screen items-center justify-center text-sm text-slate-500 dark:text-slate-400">
         載入中...
@@ -250,7 +402,8 @@ export function App() {
   }
 
   return (
-    <HashRouter>
+    <PrivacyProvider initialDefault={hideAmountsDefault}>
+      <HashRouter>
       <div className="min-h-screen bg-slate-50 dark:bg-slate-950">
         <main className="mx-auto max-w-[720px] px-4 pt-4">
           <Routes>
@@ -261,15 +414,30 @@ export function App() {
                   transactions={transactions}
                   shortcuts={shortcuts}
                   lotteryDraws={lotteryDraws}
+                  budgets={budgets}
+                  noSpendDays={noSpendDays}
+                  homeLayout={homeLayout}
+                  accounts={activeAccounts}
+                  categories={categories}
+                  places={places}
+                  notePresets={notePresets}
+                  defaultAccountId={lastUsed.lastAccountId ?? activeAccounts[0]?.id ?? ''}
                   accountMap={accountMap}
                   categoryMap={categoryMap}
                   placeMap={placeMap}
                   amountColors={amountColors}
                   syncState={syncState}
                   pendingRecurring={pendingRecurring}
+                  isPersisted={persistedStatus}
+                  isInstalled={isInstalled}
+                  installPlatform={installPlatform}
+                  deferredInstallPrompt={deferredInstallPrompt}
+                  onboardingMeta={onboardingMeta}
+                  onTriggerInstall={handleTriggerInstall}
                   onOpenCreate={handleOpenCreate}
                   onEditTransaction={handleEditTransaction}
                   onQuickRecordShortcut={(s) => void handleQuickRecordShortcut(s)}
+                  onQuickRecordText={handleQuickRecordText}
                   onEditShortcut={handleEditShortcut}
                 />
               }
@@ -297,6 +465,7 @@ export function App() {
                   transactions={transactions}
                   categories={categories}
                   places={places}
+                  budgets={budgets}
                   amountColors={amountColors}
                 />
               }
@@ -329,13 +498,31 @@ export function App() {
               }
             />
             <Route
+              path="/calendar"
+              element={
+                <CalendarPage
+                  transactions={transactions}
+                  noSpendDays={noSpendDays}
+                  defaultAccountId={lastUsed.lastAccountId ?? activeAccounts[0]?.id ?? ''}
+                  accountMap={accountMap}
+                  categoryMap={categoryMap}
+                  placeMap={placeMap}
+                  amountColors={amountColors}
+                  onOpenCreate={handleOpenCreate}
+                  onEditTransaction={handleEditTransaction}
+                />
+              }
+            />
+            <Route
               path="/settings"
               element={
                 <SettingsPage
                   accounts={allAccounts}
                   categories={categories}
                   places={places}
+                  budgets={budgets}
                   autoSelectLastPlace={autoSelectLastPlace}
+                  homeLayout={homeLayout}
                   transactions={transactions}
                   amountColors={amountColors}
                   notePresets={notePresets}
@@ -346,6 +533,7 @@ export function App() {
                   onEditRecurring={handleEditRecurring}
                   onOpenCreateShortcut={handleOpenCreateShortcut}
                   onEditShortcut={handleEditShortcut}
+                  onReplayOnboarding={() => setManualOnboardingOpen(true)}
                 />
               }
             />
@@ -355,7 +543,7 @@ export function App() {
         {quickToast && (
           <div className="fixed bottom-20 left-1/2 z-30 flex w-[calc(100%-2rem)] max-w-[688px] -translate-x-1/2 items-center justify-between gap-2 rounded-xl border border-slate-200 bg-slate-900 px-3.5 py-2.5 text-xs text-white shadow-lg dark:border-slate-700 dark:bg-slate-800">
             <span>
-              已記一筆：{quickToast.label} {formatCurrency(quickToast.tx.amount)}
+              已記一筆：{quickToast.label} <QuickToastAmount amount={quickToast.tx.amount} />
             </span>
             <div className="flex items-center gap-2">
               <button
@@ -416,6 +604,7 @@ export function App() {
           accounts={activeAccounts}
           categories={categories}
           places={places}
+          recentTags={recentTags}
           autoSelectLastPlace={autoSelectLastPlace}
           lastUsed={lastUsed}
           amountColors={amountColors}
@@ -445,9 +634,30 @@ export function App() {
           amountColors={amountColors}
           onClose={handleCloseRecurringSheet}
         />
+
+        <PwaUpdatePrompt hasBottomToast={Boolean(quickToast || lastSavedTx)} />
+
+        <OnboardingModal
+          open={onboardingOpen}
+          platform={installPlatform}
+          deferredPrompt={deferredInstallPrompt}
+          onTriggerInstall={handleTriggerInstall}
+          onEnableSync={loginAndSync}
+          onComplete={handleCompleteOnboarding}
+        />
+
+        {isLocked && pinRecord && (
+          <PinLockScreen pinRecord={pinRecord} onUnlock={() => setIsLocked(false)} />
+        )}
       </div>
     </HashRouter>
+    </PrivacyProvider>
   );
+}
+
+function QuickToastAmount({ amount }: { amount: number }) {
+  const formatMoney = useMoney();
+  return <>{formatMoney(amount)}</>;
 }
 
 export default App;

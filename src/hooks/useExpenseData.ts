@@ -7,16 +7,30 @@ import {
   getAmountColors,
   getAutoAddNotePresets,
   getAutoSelectLastPlace,
+  getHideAmountsDefault,
+  getHomeLayout,
+  getOnboardingMetaState,
   getPendingRecurringOccurrences,
+  getPinRecord,
   getReportPeriodKind,
+  getShowHabitCard,
   getSyncSchedule,
+  type OnboardingMetaState,
   type PendingRecurringOccurrence,
   type SyncSchedule,
 } from '../db/repository';
+import type { PinRecord } from '../lib/pinLock';
+import {
+  DEFAULT_HOME_SECTION_KEYS,
+  type HomeLayoutItem,
+  type HomeSectionKey,
+} from '../domain';
 import type {
   Account,
+  Budget,
   Category,
   LotteryDraw,
+  NoSpendDay,
   NotePreset,
   Place,
   RecurringRule,
@@ -231,4 +245,66 @@ export function useLotteryDraws(): LotteryDraw[] {
       return rows.filter((d) => !d.deleted).sort((a, b) => b.period.localeCompare(a.period));
     }, []) ?? []
   );
+}
+
+/**
+ * 訂閱所有未刪除的每月預算設定。
+ */
+export function useBudgets(): Budget[] {
+  return (
+    useLiveQuery(async () => {
+      const rows = await db.budgets.toArray();
+      return rows.filter((b) => !b.deleted);
+    }, []) ?? []
+  );
+}
+
+/**
+ * 訂閱本機新手導覽與首頁提醒卡狀態（meta 表載入完成前為 undefined）。
+ */
+export function useOnboardingMetaState(): OnboardingMetaState | undefined {
+  return useLiveQuery(async () => getOnboardingMetaState(db), []);
+}
+
+/**
+ * 訂閱所有未刪除的「這天沒花錢」標記。
+ */
+export function useNoSpendDays(): NoSpendDay[] {
+  return (
+    useLiveQuery(async () => {
+      const rows = await db.noSpendDays.toArray();
+      return rows.filter((d) => !d.deleted);
+    }, []) ?? []
+  );
+}
+
+/**
+ * 訂閱首頁是否顯示「連續記帳與漏記提醒」卡片設定（預設開啟）。
+ */
+export function useShowHabitCard(): boolean {
+  return useLiveQuery(async () => getShowHabitCard(db), []) ?? true;
+}
+
+/**
+ * 訂閱首頁區塊顯示與順序設定（本機 meta）。
+ */
+export function useHomeLayout(): HomeLayoutItem<HomeSectionKey>[] {
+  return (
+    useLiveQuery(async () => getHomeLayout(db), []) ??
+    DEFAULT_HOME_SECTION_KEYS.map((key) => ({ key, visible: true }))
+  );
+}
+
+/**
+ * 訂閱本機密碼鎖設定（載入完成前為 undefined，未設定為 null）。
+ */
+export function usePinRecord(): PinRecord | null | undefined {
+  return useLiveQuery(async () => getPinRecord(db), []);
+}
+
+/**
+ * 訂閱「預設隱藏金額」設定（載入完成前為 undefined）。
+ */
+export function useHideAmountsDefault(): boolean | undefined {
+  return useLiveQuery(async () => getHideAmountsDefault(db), []);
 }

@@ -25,6 +25,7 @@ const CSV_HEADER = [
   '轉入帳戶',
   '地點',
   '備註',
+  '標籤',
   '發票號碼',
 ];
 
@@ -79,6 +80,7 @@ export function toCsv(
       toAccountName,
       placeName,
       tx.note ?? '',
+      (tx.tags ?? []).join('、'),
       tx.invoiceNo ?? '',
     ];
 
