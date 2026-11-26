@@ -16,6 +16,7 @@ import { HomePage } from './pages/HomePage';
 import { ReportsPage } from './pages/ReportsPage';
 import { SettingsPage } from './pages/SettingsPage';
 import { TransactionsPage } from './pages/TransactionsPage';
+import { startSyncManager, useSyncState } from './sync/syncManager';
 
 export function App() {
   const [ready, setReady] = useState(false);
@@ -27,9 +28,13 @@ export function App() {
   const categories = useAllCategories();
   const transactions = useTransactions();
   const lastUsed = useLastUsedMeta();
+  const syncState = useSyncState();
 
   useEffect(() => {
-    void ensureSeeded().then(() => setReady(true));
+    void ensureSeeded().then(() => {
+      setReady(true);
+      startSyncManager();
+    });
   }, []);
 
   const accountMap = useMemo(() => new Map(allAccounts.map((a) => [a.id, a])), [allAccounts]);
@@ -70,6 +75,7 @@ export function App() {
                   transactions={transactions}
                   accountMap={accountMap}
                   categoryMap={categoryMap}
+                  syncState={syncState}
                   onOpenCreate={handleOpenCreate}
                   onEditTransaction={handleEditTransaction}
                 />

@@ -14,6 +14,15 @@ import {
 } from '../db/repository';
 import type { Account, AccountType, Category, CategoryKind, Transaction } from '../db/types';
 import { formatCurrency, getTodayDateString, toCsv } from '../domain';
+import { isSyncEnabled } from '../sync/auth';
+import {
+  formatSyncStatusText,
+  formatSyncTimeLabel,
+  loginAndSync,
+  logoutAndClearSync,
+  triggerSync,
+  useSyncState,
+} from '../sync/syncManager';
 
 interface SettingsPageProps {
   accounts: readonly Account[];
@@ -60,7 +69,10 @@ export function SettingsPage({ accounts, categories, transactions }: SettingsPag
   const [pendingBackup, setPendingBackup] = useState<BackupPayload | null>(null);
   const [statusMessage, setStatusMessage] = useState<string | null>(null);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
+  const [authBusy, setAuthBusy] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const syncState = useSyncState();
+  const syncEnabled = isSyncEnabled();
 
   const usedCategoryIds = useMemo(() => {
     const set = new Set<string>();
@@ -714,20 +726,92 @@ export function SettingsPage({ accounts, categories, transactions }: SettingsPag
 
       {/* Google 同步 */}
       <section className="rounded-2xl border border-slate-200 bg-white p-4 dark:border-slate-800 dark:bg-slate-900">
-        <div className="flex items-center justify-between">
+        <div className="flex items-start justify-between gap-3">
           <div>
             <h2 className="text-sm font-semibold text-slate-900 dark:text-slate-100">Google 同步</h2>
-            <p className="mt-0.5 text-xs text-slate-500 dark:text-slate-400">
-              跨裝置雲端備份與同步
-            </p>
+            {!syncState.configured ? (
+              <p className="mt-1 text-xs text-amber-600 dark:text-amber-400">
+                尚未設定 Google Client ID
+              </p>
+            ) : (
+              <div className="mt-1 space-y-0.5 text-xs text-slate-500 dark:text-slate-400">
+                <div>目前狀態：{formatSyncStatusText(syncState)}</div>
+                <div>
+                  最後同步時間：
+                  {syncState.lastSyncAt ? formatSyncTimeLabel(syncState.lastSyncAt) : '尚未同步'}
+                </div>
+              </div>
+            )}
           </div>
-          <button
-            type="button"
-            disabled
-            className="cursor-not-allowed rounded-xl bg-slate-100 px-3.5 py-2 text-xs font-medium text-slate-400 dark:bg-slate-800 dark:text-slate-500"
-          >
-            即將推出
-          </button>
+
+          <div className="flex shrink-0 items-center gap-2">
+            {!syncState.configured ? (
+              <button
+                type="button"
+                disabled
+                className="cursor-not-allowed rounded-xl bg-slate-100 px-3.5 py-2 text-xs font-medium text-slate-400 dark:bg-slate-800 dark:text-slate-500"
+              >
+                登入 Google
+              </button>
+            ) : syncEnabled ? (
+              <>
+                <button
+                  type="button"
+                  disabled={syncState.status === 'syncing' || authBusy}
+                  onClick={() => void triggerSync()}
+                  className="rounded-xl bg-emerald-600 px-3 py-2 text-xs font-medium text-white hover:bg-emerald-700 disabled:opacity-50"
+                >
+                  {syncState.status === 'syncing' ? '同步中…' : '立即同步'}
+                </button>
+                {syncState.status === 'reauth' && (
+                  <button
+                    type="button"
+                    disabled={authBusy}
+                    onClick={() => {
+                      setAuthBusy(true);
+                      setErrorMessage(null);
+                      void loginAndSync()
+                        .catch((err) => {
+                          setErrorMessage(err instanceof Error ? err.message : 'Google 登入失敗');
+                        })
+                        .finally(() => setAuthBusy(false));
+                    }}
+                    className="rounded-xl border border-amber-500 px-3 py-2 text-xs font-medium text-amber-700 hover:bg-amber-50 disabled:opacity-50 dark:text-amber-300 dark:hover:bg-amber-950/40"
+                  >
+                    重新登入
+                  </button>
+                )}
+                <button
+                  type="button"
+                  disabled={authBusy}
+                  onClick={() => {
+                    setAuthBusy(true);
+                    void logoutAndClearSync().finally(() => setAuthBusy(false));
+                  }}
+                  className="rounded-xl border border-slate-200 px-3 py-2 text-xs font-medium text-slate-700 hover:bg-slate-50 disabled:opacity-50 dark:border-slate-700 dark:text-slate-200 dark:hover:bg-slate-800"
+                >
+                  登出
+                </button>
+              </>
+            ) : (
+              <button
+                type="button"
+                disabled={authBusy}
+                onClick={() => {
+                  setAuthBusy(true);
+                  setErrorMessage(null);
+                  void loginAndSync()
+                    .catch((err) => {
+                      setErrorMessage(err instanceof Error ? err.message : 'Google 登入失敗');
+                    })
+                    .finally(() => setAuthBusy(false));
+                }}
+                className="rounded-xl bg-emerald-600 px-3.5 py-2 text-xs font-medium text-white hover:bg-emerald-700 disabled:opacity-50"
+              >
+                {authBusy ? '登入中…' : '登入 Google'}
+              </button>
+            )}
+          </div>
         </div>
       </section>
     </div>

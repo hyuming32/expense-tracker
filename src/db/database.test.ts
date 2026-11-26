@@ -1,4 +1,5 @@
 import 'fake-indexeddb/auto';
+import Dexie from 'dexie';
 import { describe, expect, it } from 'vitest';
 import { ExpenseDatabase, META_KEYS, ensureSeeded } from './database';
 import { exportBackupData, restoreBackupData } from './repository';
@@ -80,7 +81,7 @@ describe('JSON 備份匯出與還原', () => {
     ]);
 
     const backup = await exportBackupData(sourceDb);
-    expect(backup.schemaVersion).toBe(1);
+    expect(backup.schemaVersion).toBe(3);
     expect(backup.transactions).toHaveLength(2);
     expect(backup.transactions.some((t) => t.id === 'tx-deleted' && t.deleted)).toBe(true);
 
@@ -114,5 +115,165 @@ describe('JSON 備份匯出與還原', () => {
 
     await sourceDb.delete();
     await targetDb.delete();
+  });
+});
+
+describe('預設資料固定識別碼與 v3 遷移', () => {
+  it('兩台裝置 A、B 各自首次啟動後，預設帳戶與分類 id 完全相同，且不寫入 outbox', async () => {
+    const dbA = new ExpenseDatabase(`test-seed-a-${Date.now()}`);
+    const dbB = new ExpenseDatabase(`test-seed-b-${Date.now()}`);
+
+    await ensureSeeded(dbA);
+    await ensureSeeded(dbB);
+
+    const [aAccounts, bAccounts, aCats, bCats] = await Promise.all([
+      dbA.accounts.orderBy('sortOrder').toArray(),
+      dbB.accounts.orderBy('sortOrder').toArray(),
+      dbA.categories.orderBy('id').toArray(),
+      dbB.categories.orderBy('id').toArray(),
+    ]);
+
+    expect(aAccounts.map((a) => a.id)).toEqual(bAccounts.map((b) => b.id));
+    expect(aCats.map((c) => c.id)).toEqual(bCats.map((c) => c.id));
+    expect(aAccounts.every((a) => a.updatedAt === 0 && a.deviceId === 'seed')).toBe(true);
+    expect(aCats.every((c) => c.updatedAt === 0 && c.deviceId === 'seed')).toBe(true);
+    expect(await dbA.outbox.count()).toBe(0);
+    expect(await dbB.outbox.count()).toBe(0);
+
+    await dbA.delete();
+    await dbB.delete();
+  });
+
+  it('舊版隨機 id 資料庫升級後，交易與 meta 仍指向正確的分類與帳戶，且不留下重複的預設資料', async () => {
+    const dbName = `test-migrate-v2-to-v3-${Date.now()}`;
+    const legacyDb = new Dexie(dbName);
+    legacyDb.version(1).stores({
+      accounts: 'id, updatedAt, deleted, sortOrder',
+      categories: 'id, kind, parentId, updatedAt, deleted, sortOrder',
+      transactions: 'id, kind, date, accountId, toAccountId, categoryId, updatedAt, deleted',
+      meta: 'key',
+    });
+    legacyDb.version(2).stores({
+      accounts: 'id, updatedAt, deleted, sortOrder',
+      categories: 'id, kind, parentId, updatedAt, deleted, sortOrder',
+      transactions: 'id, kind, date, accountId, toAccountId, categoryId, updatedAt, deleted',
+      meta: 'key',
+      outbox: 'key, table, recordId, updatedAt',
+    });
+
+    await legacyDb.table('accounts').bulkAdd([
+      {
+        id: 'old-cash-id',
+        name: '現金',
+        type: 'cash',
+        initialBalance: 500,
+        archived: false,
+        sortOrder: 1,
+        updatedAt: 1000,
+        deviceId: 'old-dev',
+        deleted: false,
+      },
+      {
+        id: 'old-bank-id',
+        name: '銀行帳戶',
+        type: 'bank',
+        initialBalance: 0,
+        archived: false,
+        sortOrder: 2,
+        updatedAt: 1000,
+        deviceId: 'old-dev',
+        deleted: false,
+      },
+    ]);
+
+    await legacyDb.table('categories').bulkAdd([
+      {
+        id: 'old-food-id',
+        name: '飲食',
+        icon: '🍽️',
+        kind: 'expense',
+        parentId: null,
+        sortOrder: 1,
+        archived: false,
+        updatedAt: 1000,
+        deviceId: 'old-dev',
+        deleted: false,
+      },
+      {
+        id: 'old-lunch-id',
+        name: '午餐',
+        icon: '🍱',
+        kind: 'expense',
+        parentId: 'old-food-id',
+        sortOrder: 2,
+        archived: false,
+        updatedAt: 1000,
+        deviceId: 'old-dev',
+        deleted: false,
+      },
+      {
+        id: 'old-salary-id',
+        name: '薪資',
+        icon: '💰',
+        kind: 'income',
+        parentId: null,
+        sortOrder: 1,
+        archived: false,
+        updatedAt: 1000,
+        deviceId: 'old-dev',
+        deleted: false,
+      },
+    ]);
+
+    await legacyDb.table('transactions').add({
+      id: 'tx-legacy-1',
+      kind: 'expense',
+      date: '2026-11-20',
+      amount: 120,
+      accountId: 'old-cash-id',
+      toAccountId: null,
+      categoryId: 'old-lunch-id',
+      note: '舊版午餐',
+      updatedAt: 2000,
+      deviceId: 'old-dev',
+      deleted: false,
+    });
+
+    await legacyDb.table('meta').bulkPut([
+      { key: META_KEYS.LAST_ACCOUNT_ID, value: 'old-cash-id' },
+      { key: META_KEYS.LAST_EXPENSE_CATEGORY_ID, value: 'old-lunch-id' },
+      { key: META_KEYS.LAST_INCOME_CATEGORY_ID, value: 'old-salary-id' },
+    ]);
+
+    legacyDb.close();
+
+    const upgradedDb = new ExpenseDatabase(dbName);
+    await ensureSeeded(upgradedDb);
+
+    const accounts = await upgradedDb.accounts.toArray();
+    const categories = await upgradedDb.categories.toArray();
+    const tx = await upgradedDb.transactions.get('tx-legacy-1');
+
+    expect(accounts).toHaveLength(2);
+    expect(accounts.find((a) => a.id === 'old-cash-id')).toBeUndefined();
+    expect(accounts.find((a) => a.id === 'seed-acc-cash')?.initialBalance).toBe(500);
+
+    expect(categories).toHaveLength(3);
+    expect(categories.find((c) => c.id === 'old-lunch-id')).toBeUndefined();
+    expect(categories.find((c) => c.id === 'seed-cat-food-lunch')?.parentId).toBe('seed-cat-food');
+
+    expect(tx?.accountId).toBe('seed-acc-cash');
+    expect(tx?.categoryId).toBe('seed-cat-food-lunch');
+
+    expect((await upgradedDb.meta.get(META_KEYS.LAST_ACCOUNT_ID))?.value).toBe('seed-acc-cash');
+    expect((await upgradedDb.meta.get(META_KEYS.LAST_EXPENSE_CATEGORY_ID))?.value).toBe(
+      'seed-cat-food-lunch',
+    );
+    expect((await upgradedDb.meta.get(META_KEYS.LAST_INCOME_CATEGORY_ID))?.value).toBe(
+      'seed-cat-income-salary',
+    );
+    expect(await upgradedDb.outbox.count()).toBe(0);
+
+    await upgradedDb.delete();
   });
 });

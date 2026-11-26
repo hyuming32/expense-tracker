@@ -7,10 +7,47 @@ import type {
   Category,
   CategoryKind,
   MetaEntry,
+  OutboxEntry,
+  SyncTableName,
   Transaction,
   TransactionKind,
 } from './types';
 import { uuidv7 } from './uuid';
+
+type LocalMutationListener = () => void;
+const localMutationListeners = new Set<LocalMutationListener>();
+
+/**
+ * 訂閱本機資料寫入事件（供同步排程觸發防抖上傳）。
+ */
+export function subscribeLocalMutation(listener: LocalMutationListener): () => void {
+  localMutationListeners.add(listener);
+  return () => {
+    localMutationListeners.delete(listener);
+  };
+}
+
+function notifyLocalMutation(database: ExpenseDatabase): void {
+  if (database !== db) {
+    return;
+  }
+  for (const listener of localMutationListeners) {
+    listener();
+  }
+}
+
+function createOutboxEntry(
+  table: SyncTableName,
+  recordId: string,
+  updatedAt: number,
+): OutboxEntry {
+  return {
+    key: `${table}:${recordId}`,
+    table,
+    recordId,
+    updatedAt,
+  };
+}
 
 export interface SaveTransactionInput {
   id?: string;
@@ -60,7 +97,10 @@ export interface RestoreSummary {
 /**
  * 儲存或更新一筆交易紀錄，並同步更新最後使用的帳戶與分類設定。
  */
-export async function saveTransaction(input: SaveTransactionInput): Promise<Transaction> {
+export async function saveTransaction(
+  input: SaveTransactionInput,
+  database: ExpenseDatabase = db,
+): Promise<Transaction> {
   const now = Date.now();
   const deviceId = getDeviceId();
   const record: Transaction = {
@@ -77,33 +117,50 @@ export async function saveTransaction(input: SaveTransactionInput): Promise<Tran
     deleted: false,
   };
 
-  await db.transaction('rw', db.transactions, db.meta, async () => {
-    await db.transactions.put(record);
-    await db.meta.put({ key: META_KEYS.LAST_ACCOUNT_ID, value: record.accountId });
+  await database.transaction('rw', database.transactions, database.meta, database.outbox, async () => {
+    await database.transactions.put(record);
+    await database.outbox.put(createOutboxEntry('transactions', record.id, now));
+    await database.meta.put({ key: META_KEYS.LAST_ACCOUNT_ID, value: record.accountId });
     if (record.kind === 'expense' && record.categoryId) {
-      await db.meta.put({ key: META_KEYS.LAST_EXPENSE_CATEGORY_ID, value: record.categoryId });
+      await database.meta.put({ key: META_KEYS.LAST_EXPENSE_CATEGORY_ID, value: record.categoryId });
     } else if (record.kind === 'income' && record.categoryId) {
-      await db.meta.put({ key: META_KEYS.LAST_INCOME_CATEGORY_ID, value: record.categoryId });
+      await database.meta.put({ key: META_KEYS.LAST_INCOME_CATEGORY_ID, value: record.categoryId });
     }
   });
 
+  notifyLocalMutation(database);
   return record;
 }
 
 /**
  * 軟刪除交易紀錄（設定 deleted = true）。
  */
-export async function softDeleteTransaction(id: string): Promise<void> {
-  const existing = await db.transactions.get(id);
-  if (!existing) {
-    return;
-  }
-  await db.transactions.put({
-    ...existing,
-    deleted: true,
-    updatedAt: Date.now(),
-    deviceId: getDeviceId(),
+export async function softDeleteTransaction(
+  id: string,
+  database: ExpenseDatabase = db,
+): Promise<void> {
+  const now = Date.now();
+  const deviceId = getDeviceId();
+  let updated = false;
+
+  await database.transaction('rw', database.transactions, database.outbox, async () => {
+    const existing = await database.transactions.get(id);
+    if (!existing) {
+      return;
+    }
+    await database.transactions.put({
+      ...existing,
+      deleted: true,
+      updatedAt: now,
+      deviceId,
+    });
+    await database.outbox.put(createOutboxEntry('transactions', id, now));
+    updated = true;
   });
+
+  if (updated) {
+    notifyLocalMutation(database);
+  }
 }
 
 /**
@@ -138,7 +195,11 @@ export async function saveCategory(
     deleted: false,
   };
 
-  await database.categories.put(record);
+  await database.transaction('rw', database.categories, database.outbox, async () => {
+    await database.categories.put(record);
+    await database.outbox.put(createOutboxEntry('categories', record.id, now));
+  });
+  notifyLocalMutation(database);
   return record;
 }
 
@@ -150,16 +211,28 @@ export async function archiveCategory(
   archived: boolean,
   database: ExpenseDatabase = db,
 ): Promise<void> {
-  const existing = await database.categories.get(id);
-  if (!existing) {
-    return;
-  }
-  await database.categories.put({
-    ...existing,
-    archived,
-    updatedAt: Date.now(),
-    deviceId: getDeviceId(),
+  const now = Date.now();
+  const deviceId = getDeviceId();
+  let updated = false;
+
+  await database.transaction('rw', database.categories, database.outbox, async () => {
+    const existing = await database.categories.get(id);
+    if (!existing) {
+      return;
+    }
+    await database.categories.put({
+      ...existing,
+      archived,
+      updatedAt: now,
+      deviceId,
+    });
+    await database.outbox.put(createOutboxEntry('categories', id, now));
+    updated = true;
   });
+
+  if (updated) {
+    notifyLocalMutation(database);
+  }
 }
 
 /**
@@ -169,31 +242,49 @@ export async function softDeleteCategory(
   id: string,
   database: ExpenseDatabase = db,
 ): Promise<void> {
-  const existing = await database.categories.get(id);
-  if (!existing) {
-    return;
-  }
+  const now = Date.now();
+  const deviceId = getDeviceId();
+  let updated = false;
 
-  const usedTxCount = await database.transactions
-    .filter((tx) => !tx.deleted && tx.categoryId === id)
-    .count();
-  if (usedTxCount > 0) {
-    throw new Error('此分類已有交易紀錄使用，僅可停用');
-  }
+  await database.transaction(
+    'rw',
+    database.categories,
+    database.transactions,
+    database.outbox,
+    async () => {
+      const existing = await database.categories.get(id);
+      if (!existing) {
+        return;
+      }
 
-  const childCount = await database.categories
-    .filter((c) => !c.deleted && c.parentId === id)
-    .count();
-  if (childCount > 0) {
-    throw new Error('此分類仍有子分類，請先處理子分類');
-  }
+      const usedTxCount = await database.transactions
+        .filter((tx) => !tx.deleted && tx.categoryId === id)
+        .count();
+      if (usedTxCount > 0) {
+        throw new Error('此分類已有交易紀錄使用，僅可停用');
+      }
 
-  await database.categories.put({
-    ...existing,
-    deleted: true,
-    updatedAt: Date.now(),
-    deviceId: getDeviceId(),
-  });
+      const childCount = await database.categories
+        .filter((c) => !c.deleted && c.parentId === id)
+        .count();
+      if (childCount > 0) {
+        throw new Error('此分類仍有子分類，請先處理子分類');
+      }
+
+      await database.categories.put({
+        ...existing,
+        deleted: true,
+        updatedAt: now,
+        deviceId,
+      });
+      await database.outbox.put(createOutboxEntry('categories', id, now));
+      updated = true;
+    },
+  );
+
+  if (updated) {
+    notifyLocalMutation(database);
+  }
 }
 
 /**
@@ -206,8 +297,9 @@ export async function swapCategorySortOrder(
 ): Promise<void> {
   const now = Date.now();
   const deviceId = getDeviceId();
+  let updated = false;
 
-  await database.transaction('rw', database.categories, async () => {
+  await database.transaction('rw', database.categories, database.outbox, async () => {
     const [a, b] = await Promise.all([database.categories.get(idA), database.categories.get(idB)]);
     if (!a || !b) {
       return;
@@ -219,7 +311,16 @@ export async function swapCategorySortOrder(
       { ...a, sortOrder: orderA, updatedAt: now, deviceId },
       { ...b, sortOrder: orderB, updatedAt: now, deviceId },
     ]);
+    await database.outbox.bulkPut([
+      createOutboxEntry('categories', a.id, now),
+      createOutboxEntry('categories', b.id, now),
+    ]);
+    updated = true;
   });
+
+  if (updated) {
+    notifyLocalMutation(database);
+  }
 }
 
 /**
@@ -251,7 +352,11 @@ export async function saveAccount(
     deleted: false,
   };
 
-  await database.accounts.put(record);
+  await database.transaction('rw', database.accounts, database.outbox, async () => {
+    await database.accounts.put(record);
+    await database.outbox.put(createOutboxEntry('accounts', record.id, now));
+  });
+  notifyLocalMutation(database);
   return record;
 }
 
@@ -263,16 +368,28 @@ export async function archiveAccount(
   archived: boolean,
   database: ExpenseDatabase = db,
 ): Promise<void> {
-  const existing = await database.accounts.get(id);
-  if (!existing) {
-    return;
-  }
-  await database.accounts.put({
-    ...existing,
-    archived,
-    updatedAt: Date.now(),
-    deviceId: getDeviceId(),
+  const now = Date.now();
+  const deviceId = getDeviceId();
+  let updated = false;
+
+  await database.transaction('rw', database.accounts, database.outbox, async () => {
+    const existing = await database.accounts.get(id);
+    if (!existing) {
+      return;
+    }
+    await database.accounts.put({
+      ...existing,
+      archived,
+      updatedAt: now,
+      deviceId,
+    });
+    await database.outbox.put(createOutboxEntry('accounts', id, now));
+    updated = true;
   });
+
+  if (updated) {
+    notifyLocalMutation(database);
+  }
 }
 
 /**
@@ -285,8 +402,9 @@ export async function swapAccountSortOrder(
 ): Promise<void> {
   const now = Date.now();
   const deviceId = getDeviceId();
+  let updated = false;
 
-  await database.transaction('rw', database.accounts, async () => {
+  await database.transaction('rw', database.accounts, database.outbox, async () => {
     const [a, b] = await Promise.all([database.accounts.get(idA), database.accounts.get(idB)]);
     if (!a || !b) {
       return;
@@ -298,7 +416,16 @@ export async function swapAccountSortOrder(
       { ...a, sortOrder: orderA, updatedAt: now, deviceId },
       { ...b, sortOrder: orderB, updatedAt: now, deviceId },
     ]);
+    await database.outbox.bulkPut([
+      createOutboxEntry('accounts', a.id, now),
+      createOutboxEntry('accounts', b.id, now),
+    ]);
+    updated = true;
   });
+
+  if (updated) {
+    notifyLocalMutation(database);
+  }
 }
 
 /**
@@ -356,11 +483,14 @@ export async function restoreBackupData(
   payload: BackupPayload,
   database: ExpenseDatabase = db,
 ): Promise<RestoreSummary> {
+  const now = Date.now();
+
   await database.transaction(
     'rw',
     database.accounts,
     database.categories,
     database.transactions,
+    database.outbox,
     async () => {
       const [existingAccounts, existingCategories, existingTransactions] = await Promise.all([
         database.accounts.toArray(),
@@ -372,13 +502,22 @@ export async function restoreBackupData(
       const mergedCategories = mergeBackup(existingCategories, payload.categories);
       const mergedTransactions = mergeBackup(existingTransactions, payload.transactions);
 
+      const outboxEntries: OutboxEntry[] = [
+        ...payload.accounts.map((item) => createOutboxEntry('accounts', item.id, now)),
+        ...payload.categories.map((item) => createOutboxEntry('categories', item.id, now)),
+        ...payload.transactions.map((item) => createOutboxEntry('transactions', item.id, now)),
+      ];
+
       await Promise.all([
         database.accounts.bulkPut(mergedAccounts),
         database.categories.bulkPut(mergedCategories),
         database.transactions.bulkPut(mergedTransactions),
+        outboxEntries.length > 0 ? database.outbox.bulkPut(outboxEntries) : Promise.resolve(),
       ]);
     },
   );
+
+  notifyLocalMutation(database);
 
   return {
     accounts: payload.accounts.length,

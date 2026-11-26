@@ -47,3 +47,13 @@ export interface MetaEntry {
   key: string;
   value: string;
 }
+
+export type SyncTableName = 'accounts' | 'categories' | 'transactions';
+
+export interface OutboxEntry {
+  /** 複合主鍵 `${table}:${recordId}`，避免同一筆紀錄重複排隊 */
+  key: string;
+  table: SyncTableName;
+  recordId: string;
+  updatedAt: number;
+}

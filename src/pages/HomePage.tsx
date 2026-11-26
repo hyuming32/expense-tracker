@@ -3,11 +3,13 @@ import { Link } from 'react-router-dom';
 import { TransactionRow } from '../components/TransactionRow';
 import type { Account, Category, Transaction } from '../db/types';
 import { formatCurrency, formatMonthLabel, getCurrentMonthString, monthSummary } from '../domain';
+import { formatSyncStatusText, type SyncState } from '../sync/syncManager';
 
 interface HomePageProps {
   transactions: readonly Transaction[];
   accountMap: ReadonlyMap<string, Account>;
   categoryMap: ReadonlyMap<string, Category>;
+  syncState: SyncState;
   onOpenCreate: () => void;
   onEditTransaction: (tx: Transaction) => void;
 }
@@ -16,15 +18,21 @@ export function HomePage({
   transactions,
   accountMap,
   categoryMap,
+  syncState,
   onOpenCreate,
   onEditTransaction,
 }: HomePageProps) {
   const currentMonth = getCurrentMonthString();
   const summary = useMemo(() => monthSummary(transactions, currentMonth), [transactions, currentMonth]);
   const recentTransactions = useMemo(() => transactions.slice(0, 10), [transactions]);
+  const syncStatusText = formatSyncStatusText(syncState);
 
   return (
     <div className="space-y-4 pb-24">
+      <div className="flex items-center justify-end px-1">
+        <span className="text-xs text-slate-500 dark:text-slate-400">{syncStatusText}</span>
+      </div>
+
       {/* 本月收支摘要卡片 */}
       <section className="rounded-2xl bg-slate-900 p-5 text-white shadow-sm dark:bg-slate-800">
         <div className="mb-3 flex items-center justify-between">
