@@ -21,6 +21,18 @@ export function useActiveAccounts(): Account[] {
 }
 
 /**
+ * 訂閱所有未刪除的帳戶（包含已停用供設定頁與歷史紀錄顯示）。
+ */
+export function useAllAccounts(): Account[] {
+  return (
+    useLiveQuery(async () => {
+      const rows = await db.accounts.orderBy('sortOrder').toArray();
+      return rows.filter((a) => !a.deleted);
+    }, []) ?? []
+  );
+}
+
+/**
  * 訂閱所有未刪除的分類（包含已封存供歷史紀錄顯示）。
  */
 export function useAllCategories(): Category[] {

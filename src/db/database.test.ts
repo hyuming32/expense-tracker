@@ -1,6 +1,7 @@
 import 'fake-indexeddb/auto';
 import { describe, expect, it } from 'vitest';
 import { ExpenseDatabase, META_KEYS, ensureSeeded } from './database';
+import { exportBackupData, restoreBackupData } from './repository';
 
 describe('ensureSeeded', () => {
   it('首次啟動時建立預設帳戶、分類與裝置識別碼，且重複呼叫不會重複寫入', async () => {
@@ -41,5 +42,77 @@ describe('ensureSeeded', () => {
     expect(deviceMeta?.value).toMatch(/^[0-9a-f-]{36}$/);
 
     await testDb.delete();
+  });
+});
+
+describe('JSON 備份匯出與還原', () => {
+  it('匯出包含 deleted 紀錄，還原時以 id 合併並保留雙方資料', async () => {
+    const sourceDb = new ExpenseDatabase(`test-backup-src-${Date.now()}`);
+    await ensureSeeded(sourceDb);
+
+    await sourceDb.transactions.bulkAdd([
+      {
+        id: 'tx-active',
+        kind: 'expense',
+        date: '2026-11-20',
+        amount: 250,
+        accountId: (await sourceDb.accounts.toArray())[0]!.id,
+        toAccountId: null,
+        categoryId: (await sourceDb.categories.toArray())[0]!.id,
+        note: '午餐',
+        updatedAt: 2000,
+        deviceId: 'dev-src',
+        deleted: false,
+      },
+      {
+        id: 'tx-deleted',
+        kind: 'income',
+        date: '2026-11-21',
+        amount: 1000,
+        accountId: (await sourceDb.accounts.toArray())[0]!.id,
+        toAccountId: null,
+        categoryId: (await sourceDb.categories.toArray())[0]!.id,
+        note: '已刪除紀錄',
+        updatedAt: 3000,
+        deviceId: 'dev-src',
+        deleted: true,
+      },
+    ]);
+
+    const backup = await exportBackupData(sourceDb);
+    expect(backup.schemaVersion).toBe(1);
+    expect(backup.transactions).toHaveLength(2);
+    expect(backup.transactions.some((t) => t.id === 'tx-deleted' && t.deleted)).toBe(true);
+
+    const targetDb = new ExpenseDatabase(`test-backup-dst-${Date.now()}`);
+    await targetDb.transactions.add({
+      id: 'tx-local-only',
+      kind: 'expense',
+      date: '2026-11-22',
+      amount: 99,
+      accountId: 'acc-local',
+      toAccountId: null,
+      categoryId: 'cat-local',
+      note: '目標端獨有',
+      updatedAt: 1000,
+      deviceId: 'dev-dst',
+      deleted: false,
+    });
+
+    await restoreBackupData(backup, targetDb);
+
+    const restoredAccounts = await targetDb.accounts.toArray();
+    const restoredCategories = await targetDb.categories.toArray();
+    const restoredTxs = await targetDb.transactions.toArray();
+
+    expect(restoredAccounts).toHaveLength(backup.accounts.length);
+    expect(restoredCategories).toHaveLength(backup.categories.length);
+    expect(restoredTxs).toHaveLength(3);
+    expect(restoredTxs.find((t) => t.id === 'tx-active')?.amount).toBe(250);
+    expect(restoredTxs.find((t) => t.id === 'tx-deleted')?.deleted).toBe(true);
+    expect(restoredTxs.find((t) => t.id === 'tx-local-only')?.note).toBe('目標端獨有');
+
+    await sourceDb.delete();
+    await targetDb.delete();
   });
 });

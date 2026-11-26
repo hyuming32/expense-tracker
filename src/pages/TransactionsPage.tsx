@@ -1,4 +1,4 @@
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { TransactionRow } from '../components/TransactionRow';
 import type { Account, Category, Transaction } from '../db/types';
 import {
@@ -17,6 +17,8 @@ interface TransactionsPageProps {
   accountMap: ReadonlyMap<string, Account>;
   categoryMap: ReadonlyMap<string, Category>;
   onEditTransaction: (tx: Transaction) => void;
+  initialAccountId?: string;
+  onBack?: () => void;
 }
 
 export function TransactionsPage({
@@ -26,11 +28,17 @@ export function TransactionsPage({
   accountMap,
   categoryMap,
   onEditTransaction,
+  initialAccountId = '',
+  onBack,
 }: TransactionsPageProps) {
   const [month, setMonth] = useState(getCurrentMonthString);
   const [searchText, setSearchText] = useState('');
   const [selectedCategoryId, setSelectedCategoryId] = useState('');
-  const [selectedAccountId, setSelectedAccountId] = useState('');
+  const [selectedAccountId, setSelectedAccountId] = useState(initialAccountId);
+
+  useEffect(() => {
+    setSelectedAccountId(initialAccountId);
+  }, [initialAccountId]);
 
   const filterCategories = useMemo(() => {
     return categories.filter((c) => !c.archived);
@@ -70,6 +78,23 @@ export function TransactionsPage({
 
   return (
     <div className="space-y-3 pb-24">
+      {onBack && (
+        <div className="flex items-center justify-between rounded-2xl border border-slate-200 bg-white px-4 py-2.5 dark:border-slate-800 dark:bg-slate-900">
+          <button
+            type="button"
+            onClick={onBack}
+            className="text-sm font-medium text-emerald-600 hover:text-emerald-700 dark:text-emerald-400"
+          >
+            ← 返回帳戶
+          </button>
+          {selectedAccountId && (
+            <span className="text-sm font-semibold text-slate-800 dark:text-slate-100">
+              {accountMap.get(selectedAccountId)?.name ?? '帳戶明細'}
+            </span>
+          )}
+        </div>
+      )}
+
       {/* 月份切換列 */}
       <div className="flex items-center justify-between rounded-2xl border border-slate-200 bg-white px-4 py-3 dark:border-slate-800 dark:bg-slate-900">
         <button

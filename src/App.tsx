@@ -6,12 +6,15 @@ import { ensureSeeded } from './db/database';
 import type { Transaction } from './db/types';
 import {
   useActiveAccounts,
+  useAllAccounts,
   useAllCategories,
   useLastUsedMeta,
   useTransactions,
 } from './hooks/useExpenseData';
-import { ComingSoonPage } from './pages/ComingSoonPage';
+import { AccountsPage } from './pages/AccountsPage';
 import { HomePage } from './pages/HomePage';
+import { ReportsPage } from './pages/ReportsPage';
+import { SettingsPage } from './pages/SettingsPage';
 import { TransactionsPage } from './pages/TransactionsPage';
 
 export function App() {
@@ -19,7 +22,8 @@ export function App() {
   const [sheetOpen, setSheetOpen] = useState(false);
   const [editingTx, setEditingTx] = useState<Transaction | null>(null);
 
-  const accounts = useActiveAccounts();
+  const activeAccounts = useActiveAccounts();
+  const allAccounts = useAllAccounts();
   const categories = useAllCategories();
   const transactions = useTransactions();
   const lastUsed = useLastUsedMeta();
@@ -28,7 +32,7 @@ export function App() {
     void ensureSeeded().then(() => setReady(true));
   }, []);
 
-  const accountMap = useMemo(() => new Map(accounts.map((a) => [a.id, a])), [accounts]);
+  const accountMap = useMemo(() => new Map(allAccounts.map((a) => [a.id, a])), [allAccounts]);
   const categoryMap = useMemo(() => new Map(categories.map((c) => [c.id, c])), [categories]);
 
   function handleOpenCreate() {
@@ -76,7 +80,7 @@ export function App() {
               element={
                 <TransactionsPage
                   transactions={transactions}
-                  accounts={accounts}
+                  accounts={allAccounts}
                   categories={categories}
                   accountMap={accountMap}
                   categoryMap={categoryMap}
@@ -84,9 +88,34 @@ export function App() {
                 />
               }
             />
-            <Route path="/reports" element={<ComingSoonPage title="報表" />} />
-            <Route path="/accounts" element={<ComingSoonPage title="帳戶" />} />
-            <Route path="/settings" element={<ComingSoonPage title="設定" />} />
+            <Route
+              path="/reports"
+              element={<ReportsPage transactions={transactions} categories={categories} />}
+            />
+            <Route
+              path="/accounts"
+              element={
+                <AccountsPage
+                  accounts={activeAccounts}
+                  allAccounts={allAccounts}
+                  categories={categories}
+                  transactions={transactions}
+                  accountMap={accountMap}
+                  categoryMap={categoryMap}
+                  onEditTransaction={handleEditTransaction}
+                />
+              }
+            />
+            <Route
+              path="/settings"
+              element={
+                <SettingsPage
+                  accounts={allAccounts}
+                  categories={categories}
+                  transactions={transactions}
+                />
+              }
+            />
           </Routes>
         </main>
 
@@ -95,7 +124,7 @@ export function App() {
         <TransactionSheet
           open={sheetOpen}
           editingTransaction={editingTx}
-          accounts={accounts}
+          accounts={activeAccounts}
           categories={categories}
           lastUsed={lastUsed}
           onClose={handleCloseSheet}
