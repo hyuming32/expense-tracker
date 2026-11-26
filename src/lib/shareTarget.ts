@@ -1,5 +1,5 @@
 export const SHARE_CACHE_NAME = 'expense-tracker-share-target-v1';
-export const SHARE_CACHE_KEY = '/expense-tracker/shared-lottery-image';
+export const SHARE_CACHE_KEY = '/shared-lottery-image';
 
 /**
  * 偵測目前瀏覽器是否為不支援 Web Share Target（檔案分享接收）的平台（例如 iOS Safari）。
