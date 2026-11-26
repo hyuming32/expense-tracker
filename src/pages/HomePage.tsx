@@ -1,5 +1,6 @@
 import { Fragment, useMemo, useRef, useState } from 'react';
 import { Link } from 'react-router-dom';
+import { CardShowModal } from '../components/CardShowModal';
 import {
   type BeforeInstallPromptEvent,
   InstallGuideSheet,
@@ -26,6 +27,7 @@ import type {
   Place,
   Shortcut,
   Transaction,
+  WalletCard,
 } from '../db/types';
 import {
   collectActiveDays,
@@ -60,6 +62,7 @@ import {
 interface HomePageProps {
   transactions: readonly Transaction[];
   shortcuts: readonly Shortcut[];
+  cards: readonly WalletCard[];
   lotteryDraws: readonly LotteryDraw[];
   budgets: readonly Budget[];
   noSpendDays: readonly NoSpendDay[];
@@ -91,6 +94,7 @@ interface HomePageProps {
 export function HomePage({
   transactions,
   shortcuts,
+  cards,
   lotteryDraws,
   budgets,
   noSpendDays,
@@ -118,6 +122,28 @@ export function HomePage({
   onQuickRecordText,
   onEditShortcut,
 }: HomePageProps) {
+  const [showCardsModal, setShowCardsModal] = useState(false);
+  const [selectedCardId, setSelectedCardId] = useState<string | null>(null);
+
+  function openShowCard(cardId: string | null) {
+    setSelectedCardId(cardId);
+    setShowCardsModal(true);
+  }
+
+  const homeCards = useMemo(() => {
+    const carrier = cards.find((c) => c.type === 'carrier');
+    const members = cards
+      .filter((c) => c.type === 'member')
+      .sort((a, b) => {
+        if (b.lastUsedAt !== a.lastUsedAt) {
+          return b.lastUsedAt - a.lastUsedAt;
+        }
+        return a.sortOrder - b.sortOrder;
+      })
+      .slice(0, 3);
+    return carrier ? [carrier, ...members] : members;
+  }, [cards]);
+
   const formatMoney = useMoney();
   const { hideAmounts, toggleHideAmounts } = usePrivacy();
   const currentMonth = getCurrentMonthString();
@@ -808,13 +834,71 @@ export function HomePage({
 
       case 'shortcuts':
         return null;
+
+      case 'cards':
+        return (
+          <section className="rounded-2xl border border-slate-200 bg-white p-4 dark:border-slate-800 dark:bg-slate-900">
+            <div className="mb-2.5 flex items-center justify-between">
+              <h2 className="text-sm font-semibold text-slate-900 dark:text-slate-100">
+                載具與會員卡
+              </h2>
+              <Link
+                to="/cards"
+                className="text-xs font-medium text-emerald-600 hover:underline dark:text-emerald-400"
+              >
+                管理 →
+              </Link>
+            </div>
+            {homeCards.length === 0 ? (
+              <Link
+                to="/cards"
+                className="block rounded-xl border border-dashed border-slate-300 px-3 py-2.5 text-center text-xs text-slate-500 hover:border-emerald-400 hover:text-emerald-700 dark:border-slate-700 dark:text-slate-400 dark:hover:border-emerald-500 dark:hover:text-emerald-300"
+              >
+                尚未設定手機條碼或會員卡，點此新增
+              </Link>
+            ) : (
+              <div className="grid grid-cols-2 gap-2">
+                {homeCards.map((card) => (
+                  <button
+                    key={card.id}
+                    type="button"
+                    onClick={() => openShowCard(card.id)}
+                    className="flex items-center gap-2.5 rounded-xl border border-slate-200 bg-slate-50 px-3 py-2.5 text-left transition-colors hover:border-emerald-400 hover:bg-emerald-50/50 dark:border-slate-800 dark:bg-slate-800/70 dark:hover:border-emerald-500"
+                  >
+                    <span
+                      className="h-7 w-1.5 shrink-0 rounded-full"
+                      style={{ backgroundColor: card.color }}
+                      aria-hidden="true"
+                    />
+                    <div className="min-w-0 flex-1">
+                      <div className="truncate text-xs font-semibold text-slate-900 dark:text-slate-100">
+                        {card.name}
+                      </div>
+                      <div className="truncate font-mono text-[11px] text-slate-500 dark:text-slate-400">
+                        {card.code}
+                      </div>
+                    </div>
+                  </button>
+                ))}
+              </div>
+            )}
+          </section>
+        );
     }
   }
 
   return (
     <div className="space-y-4 pb-40">
-      {/* 隱私隱藏金額切換按鈕 */}
-      <div className="flex items-center justify-end px-1">
+      {/* 頂部快速操作列：出示條碼與隱藏金額 */}
+      <div className="flex items-center justify-end gap-2 px-1">
+        <button
+          type="button"
+          onClick={() => openShowCard(cards[0]?.id ?? null)}
+          className="inline-flex items-center gap-1 rounded-full border border-slate-200 bg-white px-2.5 py-1 text-xs font-medium text-slate-700 transition-colors hover:border-emerald-400 hover:bg-emerald-50 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-200 dark:hover:border-emerald-500 dark:hover:bg-slate-800"
+        >
+          <span aria-hidden="true">💳</span>
+          <span>出示條碼</span>
+        </button>
         <button
           type="button"
           onClick={toggleHideAmounts}
@@ -931,6 +1015,13 @@ export function HomePage({
         deferredPrompt={deferredInstallPrompt}
         onTriggerInstall={onTriggerInstall}
         onClose={() => setInstallSheetOpen(false)}
+      />
+
+      <CardShowModal
+        open={showCardsModal}
+        cards={cards}
+        initialCardId={selectedCardId}
+        onClose={() => setShowCardsModal(false)}
       />
     </div>
   );

@@ -4,6 +4,11 @@ import { db, META_KEYS } from '../db/database';
 import { getDeviceId } from '../db/deviceId';
 import { getSyncSchedule, processRecurringRules } from '../db/repository';
 import {
+  isNewDevice,
+  type RestoreDataSummary,
+  summarizeTransactionsAndAccounts,
+} from '../domain/restore';
+import {
   clearCachedAccessToken,
   getValidAccessTokenSilently,
   isSyncEnabled,
@@ -11,7 +16,7 @@ import {
   signOutGoogle,
 } from './auth';
 import { DriveApiError, FetchDriveStore } from './driveStore';
-import { syncOnce } from './syncEngine';
+import { syncOnce, type SyncOnceResult } from './syncEngine';
 import { createSyncScheduler } from './syncScheduler';
 
 export type SyncStatus = 'disabled' | 'syncing' | 'synced' | 'offline' | 'reauth' | 'error';
@@ -23,8 +28,20 @@ export interface SyncState {
   configured: boolean;
 }
 
+export type RestorePromptState =
+  | { kind: 'idle' }
+  | {
+      kind: 'synced-restored';
+      appliedTransactionsCount: number;
+      summary: RestoreDataSummary;
+    }
+  | { kind: 'check-backups' };
+
 const listeners = new Set<() => void>();
+const restorePromptListeners = new Set<() => void>();
 let initialized = false;
+let lastSyncResult: SyncOnceResult | null = null;
+let restorePromptState: RestorePromptState = { kind: 'idle' };
 
 let state: SyncState = {
   status: isSyncEnabled() && isGoogleClientConfigured() ? 'synced' : 'disabled',
@@ -37,6 +54,24 @@ function emit(): void {
   for (const listener of listeners) {
     listener();
   }
+}
+
+function setRestorePromptState(next: RestorePromptState): void {
+  restorePromptState = next;
+  for (const listener of restorePromptListeners) {
+    listener();
+  }
+}
+
+function subscribeRestorePrompt(listener: () => void): () => void {
+  restorePromptListeners.add(listener);
+  return () => {
+    restorePromptListeners.delete(listener);
+  };
+}
+
+function getRestorePromptSnapshot(): RestorePromptState {
+  return restorePromptState;
 }
 
 function setState(patch: Partial<SyncState>): void {
@@ -126,6 +161,7 @@ async function executeSync(): Promise<boolean> {
       driveStore,
       deviceId: getDeviceId(),
     });
+    lastSyncResult = result;
     await processRecurringRules();
     setState({
       status: 'synced',
@@ -211,11 +247,49 @@ export function startSyncManager(): void {
 }
 
 /**
- * 執行 Google 登入並立即進行首次同步。
+ * 執行 Google 登入並立即進行首次同步；若為新裝置則觸發登入後還原提示流程。
  */
 export async function loginAndSync(): Promise<void> {
   await signInWithGoogle();
-  await scheduler.start();
+  const localTransactions = await db.transactions.toArray();
+  const wasNewDevice = isNewDevice(localTransactions);
+  lastSyncResult = null;
+  const ok = await scheduler.start();
+
+  if (ok && wasNewDevice && lastSyncResult !== null) {
+    const result: SyncOnceResult = lastSyncResult;
+    if (result.appliedTransactionsCount > 0) {
+      const [allTransactions, allAccounts] = await Promise.all([
+        db.transactions.toArray(),
+        db.accounts.toArray(),
+      ]);
+      setRestorePromptState({
+        kind: 'synced-restored',
+        appliedTransactionsCount: result.appliedTransactionsCount,
+        summary: summarizeTransactionsAndAccounts(allTransactions, allAccounts),
+      });
+    } else {
+      setRestorePromptState({ kind: 'check-backups' });
+    }
+  }
+}
+
+/**
+ * 訂閱登入後雲端還原提示狀態的 React Hook。
+ */
+export function useRestorePrompt(): RestorePromptState {
+  return useSyncExternalStore(
+    subscribeRestorePrompt,
+    getRestorePromptSnapshot,
+    getRestorePromptSnapshot,
+  );
+}
+
+/**
+ * 關閉登入後雲端還原提示面板。
+ */
+export function dismissRestorePrompt(): void {
+  setRestorePromptState({ kind: 'idle' });
 }
 
 /**

@@ -13,6 +13,15 @@ import { isValidSellerId, normalizePlaceName } from '../domain/places';
 import { normalizeTags } from '../domain/tags';
 import type { QuickTextResult } from '../domain/quickText';
 import type { PeriodKind } from '../domain/reports';
+import {
+  CARRIER_CARD_ID,
+  CARRIER_CARD_NAME,
+  isValidCarrier,
+  MEMBER_CARD_NAME_MAX_LENGTH,
+  normalizeCarrier,
+  pickCardColor,
+} from '../domain/carrier';
+import { type BarcodeFormat, guessFormat } from '../lib/barcode';
 import { parsePinRecordJson, type PinRecord } from '../lib/pinLock';
 import { db, type ExpenseDatabase, META_KEYS } from './database';
 import { getDeviceId } from './deviceId';
@@ -34,6 +43,7 @@ import type {
   SyncTableName,
   Transaction,
   TransactionKind,
+  WalletCard,
 } from './types';
 import { uuidv7 } from './uuid';
 
@@ -148,6 +158,7 @@ export interface BackupPayload {
   lotteryDraws?: LotteryDraw[];
   budgets?: Budget[];
   noSpendDays?: NoSpendDay[];
+  cards?: WalletCard[];
   meta?: MetaEntry[];
 }
 
@@ -162,6 +173,7 @@ export interface RestoreSummary {
   lotteryDraws: number;
   budgets: number;
   noSpendDays: number;
+  cards: number;
 }
 
 export interface AmountColors {
@@ -875,6 +887,7 @@ export async function exportBackupData(database: ExpenseDatabase = db): Promise<
     lotteryDraws,
     budgets,
     noSpendDays,
+    cards,
     meta,
   ] = await Promise.all([
     database.accounts.toArray(),
@@ -887,6 +900,7 @@ export async function exportBackupData(database: ExpenseDatabase = db): Promise<
     database.lotteryDraws.toArray(),
     database.budgets.toArray(),
     database.noSpendDays.toArray(),
+    database.cards.toArray(),
     database.meta.toArray(),
   ]);
 
@@ -906,6 +920,7 @@ export async function exportBackupData(database: ExpenseDatabase = db): Promise<
     lotteryDraws,
     budgets,
     noSpendDays,
+    cards,
     meta: exportableMeta,
   };
 }
@@ -942,6 +957,7 @@ export function parseBackupPayload(raw: unknown): BackupPayload {
     lotteryDraws: Array.isArray(obj.lotteryDraws) ? (obj.lotteryDraws as LotteryDraw[]) : [],
     budgets: Array.isArray(obj.budgets) ? (obj.budgets as Budget[]) : [],
     noSpendDays: Array.isArray(obj.noSpendDays) ? (obj.noSpendDays as NoSpendDay[]) : [],
+    cards: Array.isArray(obj.cards) ? (obj.cards as WalletCard[]) : [],
     meta: Array.isArray(obj.meta) ? (obj.meta as MetaEntry[]) : undefined,
   };
 }
@@ -961,6 +977,7 @@ export async function restoreBackupData(
   const incomingLotteryDraws = payload.lotteryDraws ?? [];
   const incomingBudgets = payload.budgets ?? [];
   const incomingNoSpendDays = payload.noSpendDays ?? [];
+  const incomingCards = payload.cards ?? [];
 
   await database.transaction(
     'rw',
@@ -975,6 +992,7 @@ export async function restoreBackupData(
       database.lotteryDraws,
       database.budgets,
       database.noSpendDays,
+      database.cards,
       database.outbox,
     ],
     async () => {
@@ -989,6 +1007,7 @@ export async function restoreBackupData(
         existingLotteryDraws,
         existingBudgets,
         existingNoSpendDays,
+        existingCards,
       ] = await Promise.all([
         database.accounts.toArray(),
         database.categories.toArray(),
@@ -1000,6 +1019,7 @@ export async function restoreBackupData(
         database.lotteryDraws.toArray(),
         database.budgets.toArray(),
         database.noSpendDays.toArray(),
+        database.cards.toArray(),
       ]);
 
       const mergedAccounts = mergeBackup(existingAccounts, payload.accounts);
@@ -1012,6 +1032,7 @@ export async function restoreBackupData(
       const mergedLotteryDraws = mergeBackup(existingLotteryDraws, incomingLotteryDraws);
       const mergedBudgets = mergeBackup(existingBudgets, incomingBudgets);
       const mergedNoSpendDays = mergeBackup(existingNoSpendDays, incomingNoSpendDays);
+      const mergedCards = mergeBackup(existingCards, incomingCards);
 
       const outboxEntries: OutboxEntry[] = [
         ...payload.accounts.map((item) => createOutboxEntry('accounts', item.id, now)),
@@ -1024,6 +1045,7 @@ export async function restoreBackupData(
         ...incomingLotteryDraws.map((item) => createOutboxEntry('lotteryDraws', item.id, now)),
         ...incomingBudgets.map((item) => createOutboxEntry('budgets', item.id, now)),
         ...incomingNoSpendDays.map((item) => createOutboxEntry('noSpendDays', item.id, now)),
+        ...incomingCards.map((item) => createOutboxEntry('cards', item.id, now)),
       ];
 
       await Promise.all([
@@ -1037,6 +1059,7 @@ export async function restoreBackupData(
         database.lotteryDraws.bulkPut(mergedLotteryDraws),
         database.budgets.bulkPut(mergedBudgets),
         database.noSpendDays.bulkPut(mergedNoSpendDays),
+        database.cards.bulkPut(mergedCards),
         outboxEntries.length > 0 ? database.outbox.bulkPut(outboxEntries) : Promise.resolve(),
       ]);
     },
@@ -1055,6 +1078,7 @@ export async function restoreBackupData(
     lotteryDraws: incomingLotteryDraws.length,
     budgets: incomingBudgets.length,
     noSpendDays: incomingNoSpendDays.length,
+    cards: incomingCards.length,
   };
 }
 
@@ -2695,4 +2719,242 @@ export async function setHideAmountsDefault(
     key: META_KEYS.UI_HIDE_AMOUNTS_DEFAULT,
     value: enabled ? 'true' : 'false',
   });
+}
+
+export interface SaveMemberCardInput {
+  id?: string;
+  name: string;
+  code: string;
+  format?: BarcodeFormat | 'auto';
+  color?: string;
+  sortOrder?: number;
+}
+
+/**
+ * 排序卡片清單：載具優先，其餘依 sortOrder 升冪、updatedAt 降冪。
+ */
+export function sortWalletCards(cards: readonly WalletCard[]): WalletCard[] {
+  return [...cards]
+    .filter((c) => !c.deleted)
+    .sort((a, b) => {
+      if (a.type !== b.type) {
+        return a.type === 'carrier' ? -1 : 1;
+      }
+      if (a.sortOrder !== b.sortOrder) {
+        return a.sortOrder - b.sortOrder;
+      }
+      return b.updatedAt - a.updatedAt;
+    });
+}
+
+/**
+ * 讀取所有未刪除的載具與會員卡。
+ */
+export async function getCards(database: ExpenseDatabase = db): Promise<WalletCard[]> {
+  const rows = await database.cards.toArray();
+  return sortWalletCards(rows);
+}
+
+/**
+ * 儲存或更新電子發票手機條碼載具（固定 id `card-carrier`，同步不重複）。
+ */
+export async function saveCarrierCard(
+  rawCode: string,
+  database: ExpenseDatabase = db,
+): Promise<WalletCard> {
+  const normalized = normalizeCarrier(rawCode);
+  if (!isValidCarrier(normalized)) {
+    throw new Error('手機條碼是 / 加 7 個英數字，例如 /ABC1234');
+  }
+
+  const now = Date.now();
+  const deviceId = getDeviceId();
+  let saved!: WalletCard;
+
+  await database.transaction('rw', database.cards, database.outbox, async () => {
+    const existing = await database.cards.get(CARRIER_CARD_ID);
+    saved = {
+      id: CARRIER_CARD_ID,
+      type: 'carrier',
+      name: CARRIER_CARD_NAME,
+      code: normalized,
+      format: 'code39',
+      color: existing?.color ?? '#0f766e',
+      sortOrder: 0,
+      lastUsedAt: existing?.lastUsedAt ?? 0,
+      updatedAt: now,
+      deviceId,
+      deleted: false,
+    };
+    await database.cards.put(saved);
+    await database.outbox.put(createOutboxEntry('cards', saved.id, now));
+  });
+
+  notifyLocalMutation(database);
+  return saved;
+}
+
+/**
+ * 新增或更新會員卡。
+ */
+export async function saveMemberCard(
+  input: SaveMemberCardInput,
+  database: ExpenseDatabase = db,
+): Promise<WalletCard> {
+  const name = input.name.trim();
+  if (!name) {
+    throw new Error('請輸入會員卡名稱');
+  }
+  if (name.length > MEMBER_CARD_NAME_MAX_LENGTH) {
+    throw new Error(`會員卡名稱最多 ${MEMBER_CARD_NAME_MAX_LENGTH} 字`);
+  }
+
+  const code = input.code.trim();
+  if (!code) {
+    throw new Error('請輸入條碼內容');
+  }
+
+  const format: BarcodeFormat =
+    !input.format || input.format === 'auto' ? guessFormat(code) : input.format;
+
+  const now = Date.now();
+  const deviceId = getDeviceId();
+  let saved!: WalletCard;
+
+  await database.transaction('rw', database.cards, database.outbox, async () => {
+    const existing = input.id ? await database.cards.get(input.id) : undefined;
+    let sortOrder = input.sortOrder ?? existing?.sortOrder;
+    if (sortOrder === undefined) {
+      const all = await database.cards.toArray();
+      const maxOrder = all
+        .filter((c) => !c.deleted && c.type === 'member')
+        .reduce((max, c) => Math.max(max, c.sortOrder), 0);
+      sortOrder = maxOrder + 1;
+    }
+
+    saved = {
+      id: existing?.id ?? input.id ?? uuidv7(),
+      type: 'member',
+      name,
+      code,
+      format,
+      color: input.color?.trim() || existing?.color || pickCardColor(name),
+      sortOrder,
+      lastUsedAt: existing?.lastUsedAt ?? 0,
+      updatedAt: now,
+      deviceId,
+      deleted: false,
+    };
+    await database.cards.put(saved);
+    await database.outbox.put(createOutboxEntry('cards', saved.id, now));
+  });
+
+  notifyLocalMutation(database);
+  return saved;
+}
+
+/**
+ * 軟刪除載具或會員卡並排入 outbox 同步。
+ */
+export async function deleteCard(
+  id: string,
+  database: ExpenseDatabase = db,
+): Promise<void> {
+  const now = Date.now();
+  const deviceId = getDeviceId();
+  let changed = false;
+
+  await database.transaction('rw', database.cards, database.outbox, async () => {
+    const existing = await database.cards.get(id);
+    if (!existing || existing.deleted) {
+      return;
+    }
+    await database.cards.put({
+      ...existing,
+      deleted: true,
+      updatedAt: now,
+      deviceId,
+    });
+    await database.outbox.put(createOutboxEntry('cards', id, now));
+    changed = true;
+  });
+
+  if (changed) {
+    notifyLocalMutation(database);
+  }
+}
+
+/**
+ * 更新卡片最後出示時間（lastUsedAt）。
+ */
+export async function touchCardUsed(
+  id: string,
+  database: ExpenseDatabase = db,
+): Promise<void> {
+  const now = Date.now();
+  const deviceId = getDeviceId();
+  let changed = false;
+
+  await database.transaction('rw', database.cards, database.outbox, async () => {
+    const existing = await database.cards.get(id);
+    if (!existing || existing.deleted) {
+      return;
+    }
+    await database.cards.put({
+      ...existing,
+      lastUsedAt: now,
+      updatedAt: now,
+      deviceId,
+    });
+    await database.outbox.put(createOutboxEntry('cards', id, now));
+    changed = true;
+  });
+
+  if (changed) {
+    notifyLocalMutation(database);
+  }
+}
+
+/**
+ * 重新排序會員卡並排入 outbox 同步。
+ */
+export async function reorderCards(
+  orderedIds: readonly string[],
+  database: ExpenseDatabase = db,
+): Promise<void> {
+  if (orderedIds.length === 0) return;
+  const now = Date.now();
+  const deviceId = getDeviceId();
+  let changed = false;
+
+  await database.transaction('rw', database.cards, database.outbox, async () => {
+    const rows = await database.cards.bulkGet([...orderedIds]);
+    const updates: WalletCard[] = [];
+    const outboxUpdates: OutboxEntry[] = [];
+
+    for (let i = 0; i < orderedIds.length; i += 1) {
+      const card = rows[i];
+      if (!card || card.deleted || card.type === 'carrier') continue;
+      const nextOrder = i + 1;
+      if (card.sortOrder !== nextOrder) {
+        updates.push({
+          ...card,
+          sortOrder: nextOrder,
+          updatedAt: now,
+          deviceId,
+        });
+        outboxUpdates.push(createOutboxEntry('cards', card.id, now));
+      }
+    }
+
+    if (updates.length > 0) {
+      await database.cards.bulkPut(updates);
+      await database.outbox.bulkPut(outboxUpdates);
+      changed = true;
+    }
+  });
+
+  if (changed) {
+    notifyLocalMutation(database);
+  }
 }

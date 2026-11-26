@@ -1,5 +1,6 @@
 import { type FormEvent, useEffect, useMemo, useRef, useState } from 'react';
 import { Link, useSearchParams } from 'react-router-dom';
+import { CloudRestoreModal } from '../components/CloudRestoreModal';
 import { useMoney, usePrivacy } from '../contexts/PrivacyContext';
 import {
   type AmountColors,
@@ -258,6 +259,7 @@ export function SettingsPage({
   const [newSellerIdInput, setNewSellerIdInput] = useState('');
 
   const [pendingBackup, setPendingBackup] = useState<BackupPayload | null>(null);
+  const [cloudRestoreOpen, setCloudRestoreOpen] = useState(false);
   const [pendingCsvPlan, setPendingCsvPlan] = useState<CsvImportPlan | null>(null);
   const [statusMessage, setStatusMessage] = useState<string | null>(null);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
@@ -848,6 +850,17 @@ export function SettingsPage({
           {errorMessage}
         </div>
       )}
+
+      {/* 載具與會員卡入口 */}
+      <section className="rounded-2xl border border-slate-200 bg-white p-4 dark:border-slate-800 dark:bg-slate-900">
+        <Link
+          to="/cards"
+          className="flex items-center justify-between text-sm font-semibold text-slate-900 hover:text-emerald-600 dark:text-slate-100 dark:hover:text-emerald-400"
+        >
+          <span>💳 載具與會員卡</span>
+          <span className="text-xs font-medium text-emerald-600 dark:text-emerald-400">管理 →</span>
+        </Link>
+      </section>
 
       {/* 發票兌獎入口 */}
       <section className="rounded-2xl border border-slate-200 bg-white p-4 dark:border-slate-800 dark:bg-slate-900">
@@ -2570,9 +2583,27 @@ export function SettingsPage({
                   ? '打開與離開 App 時都會同步；另外每週自動同步一次。'
                   : '打開與離開 App 時都會同步；不另行定時同步。'}
             </p>
+            <div className="mt-3 flex items-center justify-between gap-3 border-t border-slate-100 pt-3 dark:border-slate-800">
+              <div className="text-xs text-slate-500 dark:text-slate-400">
+                想從 Google 雲端「記帳備份」資料夾還原較早的備份？
+              </div>
+              <button
+                type="button"
+                disabled={!isOnline || authBusy}
+                onClick={() => setCloudRestoreOpen(true)}
+                className="shrink-0 rounded-xl border border-slate-200 px-3 py-2 text-xs font-medium text-slate-700 hover:bg-slate-50 disabled:opacity-50 dark:border-slate-700 dark:text-slate-200 dark:hover:bg-slate-800"
+              >
+                從 Google 雲端備份還原
+              </button>
+            </div>
           </div>
         )}
       </section>
+
+      <CloudRestoreModal
+        mode={cloudRestoreOpen ? { kind: 'manual-backups' } : null}
+        onClose={() => setCloudRestoreOpen(false)}
+      />
 
       {/* 關於 */}
       <section className="rounded-2xl border border-slate-200 bg-white p-4 dark:border-slate-800 dark:bg-slate-900">

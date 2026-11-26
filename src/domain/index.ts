@@ -149,3 +149,28 @@ export {
   resolveHomeLayout,
 } from './homeLayout';
 export type { HomeLayoutItem, HomeSectionKey, HomeSectionMeta } from './homeLayout';
+export {
+  formatBackupFileLabel,
+  formatBackupFileSize,
+  isNewDevice,
+  summarizeBackupPayload,
+  summarizeTransactionsAndAccounts,
+} from './restore';
+export type { RestoreDataSummary } from './restore';
+export { filterTransactions, summarizeFiltered } from './transactionFilter';
+export type {
+  FilteredSummary,
+  InvoiceFilterOption,
+  TransactionFilterContext,
+  TransactionFilterCriteria,
+  TransactionFilterRange,
+} from './transactionFilter';
+export {
+  CARD_COLOR_PALETTE,
+  CARRIER_CARD_ID,
+  CARRIER_CARD_NAME,
+  isValidCarrier,
+  MEMBER_CARD_NAME_MAX_LENGTH,
+  normalizeCarrier,
+  pickCardColor,
+} from './carrier';

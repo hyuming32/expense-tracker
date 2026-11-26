@@ -4,6 +4,7 @@
 export const DEFAULT_HOME_SECTION_KEYS = [
   'syncStatus',
   'reminders',
+  'cards',
   'quickText',
   'summary',
   'habit',
@@ -36,6 +37,10 @@ export const HOME_SECTION_META: Readonly<Record<HomeSectionKey, HomeSectionMeta>
     key: 'reminders',
     label: '提醒卡（資料保護／加到主畫面）',
     hideWarning: '隱藏後不會再提醒',
+  },
+  cards: {
+    key: 'cards',
+    label: '卡片（載具與會員卡）',
   },
   quickText: {
     key: 'quickText',

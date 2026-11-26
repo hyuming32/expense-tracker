@@ -148,6 +148,23 @@ export interface NoSpendDay extends BaseRecord {
   date: string;
 }
 
+export type WalletCardType = 'carrier' | 'member';
+export type WalletCardFormat = 'code39' | 'code128' | 'ean13' | 'qr';
+
+export interface WalletCard extends BaseRecord {
+  type: WalletCardType;
+  /** 載具固定「手機條碼」；會員卡最長 20 字 */
+  name: string;
+  /** 條碼內容 */
+  code: string;
+  /** 載具固定 code39 */
+  format: WalletCardFormat;
+  /** 卡片底色 */
+  color: string;
+  sortOrder: number;
+  lastUsedAt: number;
+}
+
 export interface MetaEntry {
   key: string;
   value: string;
@@ -163,7 +180,8 @@ export type SyncTableName =
   | 'places'
   | 'lotteryDraws'
   | 'budgets'
-  | 'noSpendDays';
+  | 'noSpendDays'
+  | 'cards';
 
 export interface OutboxEntry {
   /** 複合主鍵 `${table}:${recordId}`，避免同一筆紀錄重複排隊 */
