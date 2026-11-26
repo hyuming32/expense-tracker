@@ -1,5 +1,5 @@
 const SHARE_CACHE_NAME = 'expense-tracker-share-target-v1';
-const SHARE_CACHE_KEY = '/expense-tracker/shared-lottery-image';
+const SHARE_CACHE_KEY = '/shared-lottery-image';
 
 self.addEventListener('fetch', (event) => {
   const url = new URL(event.request.url);

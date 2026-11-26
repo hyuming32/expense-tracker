@@ -3,7 +3,7 @@ import react from '@vitejs/plugin-react';
 import { VitePWA } from 'vite-plugin-pwa';
 
 export default defineConfig({
-  base: '/expense-tracker/',
+  base: '/',
   plugins: [
     react(),
     VitePWA({
@@ -14,8 +14,8 @@ export default defineConfig({
         short_name: '記帳',
         description: '可離線使用的個人記帳工具',
         lang: 'zh-TW',
-        start_url: '/expense-tracker/',
-        scope: '/expense-tracker/',
+        start_url: '/',
+        scope: '/',
         display: 'standalone',
         theme_color: '#0f172a',
         background_color: '#ffffff',
@@ -55,6 +55,7 @@ export default defineConfig({
       workbox: {
         globPatterns: ['**/*.{js,css,html,ico,png,svg}'],
         importScripts: ['share-target-sw.js'],
+        navigateFallbackDenylist: [/^\/(privacy|about)\.html$/],
       },
     }),
   ],
