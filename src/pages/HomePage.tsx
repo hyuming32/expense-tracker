@@ -46,7 +46,16 @@ import {
   type QuickTextResult,
   shiftDate,
 } from '../domain';
-import { getHomeReminderCard, type InstallPlatform } from '../domain/onboarding';
+import {
+  detectInstallPlatform,
+  getHomeReminderCard,
+  type InstallPlatform,
+} from '../domain/onboarding';
+import {
+  chooseVoiceInputMode,
+  describeSpeechError,
+  KEYBOARD_DICTATION_TIP,
+} from '../domain/voiceInput';
 import { useOutboxCount } from '../hooks/useExpenseData';
 import {
   formatSyncStatusText,
@@ -65,7 +74,7 @@ interface BrowserSpeechRecognition {
   interimResults: boolean;
   maxAlternatives: number;
   onresult: ((event: SpeechRecognitionResultEvent) => void) | null;
-  onerror: (() => void) | null;
+  onerror: ((event: { error?: string }) => void) | null;
   onend: (() => void) | null;
   start: () => void;
   stop: () => void;
@@ -195,7 +204,23 @@ export function HomePage({
   const [submittingQuickText, setSubmittingQuickText] = useState(false);
   const [installSheetOpen, setInstallSheetOpen] = useState(false);
   const recognitionRef = useRef<BrowserSpeechRecognition | null>(null);
-  const speechSupported = useMemo(() => getSpeechRecognitionCtor() !== null, []);
+  const quickTextInputRef = useRef<HTMLInputElement | null>(null);
+  const [voiceTip, setVoiceTip] = useState('');
+  const voiceMode = useMemo(
+    () =>
+      typeof navigator === 'undefined'
+        ? 'none'
+        : chooseVoiceInputMode(
+            detectInstallPlatform({
+              userAgent: navigator.userAgent,
+              platform: navigator.platform,
+              maxTouchPoints: navigator.maxTouchPoints,
+            }),
+            getSpeechRecognitionCtor() !== null,
+          ),
+    [],
+  );
+  const speechSupported = voiceMode !== 'none';
 
   const reminderCard = useMemo(() => {
     if (!onboardingMeta) {
@@ -286,6 +311,13 @@ export function HomePage({
   }
 
   function handleToggleVoiceInput() {
+    if (voiceMode === 'keyboard-dictation') {
+      // iPhone：Web Speech API 不穩定，改用系統鍵盤聽寫
+      quickTextInputRef.current?.focus();
+      setVoiceTip(KEYBOARD_DICTATION_TIP);
+      return;
+    }
+    setVoiceTip('');
     if (isListening && recognitionRef.current) {
       try {
         recognitionRef.current.stop();
@@ -303,17 +335,25 @@ export function HomePage({
       recognition.lang = 'zh-TW';
       recognition.interimResults = false;
       recognition.maxAlternatives = 1;
+      let gotResult = false;
       recognition.onresult = (event) => {
+        gotResult = true;
         const transcript = event.results[0]?.[0]?.transcript?.trim();
         if (transcript) {
           setQuickText((prev) => (prev.trim() ? `${prev.trim()} ${transcript}` : transcript));
         }
       };
-      recognition.onerror = () => {
+      let errorShown = false;
+      recognition.onerror = (event) => {
+        errorShown = true;
+        setVoiceTip(describeSpeechError(event?.error));
         setIsListening(false);
         recognitionRef.current = null;
       };
       recognition.onend = () => {
+        if (!gotResult && !errorShown) {
+          setVoiceTip(describeSpeechError('no-speech'));
+        }
         setIsListening(false);
         recognitionRef.current = null;
       };
@@ -321,6 +361,7 @@ export function HomePage({
       setIsListening(true);
       recognition.start();
     } catch {
+      setVoiceTip(describeSpeechError(undefined));
       setIsListening(false);
       recognitionRef.current = null;
     }
@@ -460,9 +501,15 @@ export function HomePage({
           <section className="space-y-2">
         <div className="flex items-center gap-2 rounded-2xl border border-slate-200 bg-white px-3 py-2 shadow-sm focus-within:border-emerald-500 dark:border-slate-800 dark:bg-slate-900 dark:focus-within:border-emerald-500">
           <input
+            ref={quickTextInputRef}
             type="text"
             value={quickText}
-            onChange={(e) => setQuickText(e.target.value)}
+            onChange={(e) => {
+              setQuickText(e.target.value);
+              if (voiceTip) {
+                setVoiceTip('');
+              }
+            }}
             onKeyDown={(e) => {
               if (e.key === 'Enter' && !e.nativeEvent.isComposing) {
                 e.preventDefault();
@@ -497,6 +544,12 @@ export function HomePage({
             記下
           </button>
         </div>
+
+        {voiceTip && (
+          <p className="rounded-xl bg-amber-50 px-3 py-2 text-xs leading-relaxed text-amber-800 dark:bg-amber-950/40 dark:text-amber-200">
+            {voiceTip}
+          </p>
+        )}
 
         {parsedQuickText && (() => {
           const matchedCategory = parsedQuickText.categoryId
