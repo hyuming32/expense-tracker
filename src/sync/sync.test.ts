@@ -7,8 +7,10 @@ import {
   processRecurringRules,
   saveAccount,
   saveBudget,
+  saveCarrierCard,
   saveCategory,
   saveLotteryDraw,
+  saveMemberCard,
   saveNotePreset,
   savePlace,
   saveRecurringRule,
@@ -665,5 +667,96 @@ describe('syncOnce 雙裝置與快照同步', () => {
 
     expect(await dbA.noSpendDays.count()).toBe(1);
     expect((await dbA.noSpendDays.get('nospend-2026-11-24'))?.deleted).toBe(true);
+  });
+
+  it('A 裝置記 3 筆並同步，全新 B 裝置同步後回報帶進 3 筆交易', async () => {
+    const drive = new MemoryDriveStore();
+    const dbA = createTestDb('restore-a');
+    const dbB = createTestDb('restore-b');
+
+    await ensureSeeded(dbA);
+    await ensureSeeded(dbB);
+
+    await saveTransaction(
+      {
+        kind: 'expense',
+        date: '2026-11-24',
+        amount: 80,
+        accountId: 'seed-acc-cash',
+        toAccountId: null,
+        categoryId: 'seed-cat-food-breakfast',
+        note: '蛋餅',
+      },
+      dbA,
+    );
+    await saveTransaction(
+      {
+        kind: 'expense',
+        date: '2026-11-25',
+        amount: 150,
+        accountId: 'seed-acc-cash',
+        toAccountId: null,
+        categoryId: 'seed-cat-food-lunch',
+        note: '便當',
+      },
+      dbA,
+    );
+    await saveTransaction(
+      {
+        kind: 'income',
+        date: '2026-11-26',
+        amount: 30000,
+        accountId: 'seed-acc-bank',
+        toAccountId: null,
+        categoryId: 'seed-cat-income-salary',
+        note: '薪水',
+      },
+      dbA,
+    );
+    const deletedTx = await saveTransaction(
+      {
+        kind: 'expense',
+        date: '2026-11-26',
+        amount: 99,
+        accountId: 'seed-acc-cash',
+        toAccountId: null,
+        categoryId: 'seed-cat-food-snack',
+        note: '已刪除',
+      },
+      dbA,
+    );
+    await softDeleteTransaction(deletedTx.id, dbA);
+
+    await syncOnce({ database: dbA, driveStore: drive, deviceId: 'device-a' });
+    const resultB = await syncOnce({ database: dbB, driveStore: drive, deviceId: 'device-b' });
+
+    expect(resultB.appliedTransactionsCount).toBe(3);
+
+    const secondSyncB = await syncOnce({ database: dbB, driveStore: drive, deviceId: 'device-b' });
+    expect(secondSyncB.appliedTransactionsCount).toBe(0);
+  });
+
+  it('兩台裝置各自設定載具並同步，因固定 id card-carrier 不會重複', async () => {
+    const drive = new MemoryDriveStore();
+    const dbA = createTestDb('cards-a');
+    const dbB = createTestDb('cards-b');
+
+    await saveCarrierCard('/AAA1111', dbA);
+    await new Promise((r) => setTimeout(r, 5));
+    await saveCarrierCard('/BBB2222', dbB);
+    await saveMemberCard({ name: '7-11', code: '7110001' }, dbA);
+
+    await syncOnce({ database: dbA, driveStore: drive, deviceId: 'device-a' });
+    await syncOnce({ database: dbB, driveStore: drive, deviceId: 'device-b' });
+    await syncOnce({ database: dbA, driveStore: drive, deviceId: 'device-a' });
+
+    const cardsA = (await dbA.cards.toArray()).filter((c) => !c.deleted);
+    const cardsB = (await dbB.cards.toArray()).filter((c) => !c.deleted);
+    expect(cardsA.filter((c) => c.type === 'carrier')).toHaveLength(1);
+    expect(cardsB.filter((c) => c.type === 'carrier')).toHaveLength(1);
+    expect(cardsA.find((c) => c.id === 'card-carrier')?.code).toBe('/BBB2222');
+    expect(cardsB.find((c) => c.id === 'card-carrier')?.code).toBe('/BBB2222');
+    expect(cardsA).toHaveLength(2);
+    expect(cardsB).toHaveLength(2);
   });
 });

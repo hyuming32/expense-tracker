@@ -56,6 +56,21 @@ export default defineConfig({
         globPatterns: ['**/*.{js,css,html,ico,png,svg}'],
         importScripts: ['share-target-sw.js'],
         navigateFallbackDenylist: [/^\/(privacy|about)\.html$/],
+        runtimeCaching: [
+          {
+            urlPattern: ({ sameOrigin, url }) => sameOrigin && url.pathname.endsWith('.wasm'),
+            handler: 'CacheFirst',
+            options: {
+              cacheName: 'barcode-wasm',
+              expiration: {
+                maxEntries: 2,
+              },
+              cacheableResponse: {
+                statuses: [0, 200],
+              },
+            },
+          },
+        ],
       },
     }),
   ],

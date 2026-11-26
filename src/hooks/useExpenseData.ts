@@ -15,6 +15,7 @@ import {
   getReportPeriodKind,
   getShowHabitCard,
   getSyncSchedule,
+  sortWalletCards,
   type OnboardingMetaState,
   type PendingRecurringOccurrence,
   type SyncSchedule,
@@ -36,6 +37,7 @@ import type {
   RecurringRule,
   Shortcut,
   Transaction,
+  WalletCard,
 } from '../db/types';
 import { compareTransactionsByDateTimeDesc, getTodayDateString, type PeriodKind } from '../domain';
 
@@ -307,4 +309,16 @@ export function usePinRecord(): PinRecord | null | undefined {
  */
 export function useHideAmountsDefault(): boolean | undefined {
   return useLiveQuery(async () => getHideAmountsDefault(db), []);
+}
+
+/**
+ * 訂閱所有未刪除的載具與會員卡。
+ */
+export function useCards(): WalletCard[] {
+  return (
+    useLiveQuery(async () => {
+      const rows = await db.cards.toArray();
+      return sortWalletCards(rows);
+    }, []) ?? []
+  );
 }

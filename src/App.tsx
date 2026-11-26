@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { HashRouter, Route, Routes } from 'react-router-dom';
 import { BottomNav } from './components/BottomNav';
+import { CloudRestoreModal } from './components/CloudRestoreModal';
 import type { BeforeInstallPromptEvent } from './components/InstallGuideContent';
 import { OnboardingModal } from './components/OnboardingModal';
 import { PinLockScreen } from './components/PinLockScreen';
@@ -32,6 +33,7 @@ import {
   useAutoAddNotePresets,
   useAutoSelectLastPlace,
   useBudgets,
+  useCards,
   useHideAmountsDefault,
   useHomeLayout,
   useLastUsedMeta,
@@ -50,12 +52,19 @@ import { shouldLockOnResume } from './lib/pinLock';
 import { requestStoragePersistence } from './lib/storagePersist';
 import { AccountsPage } from './pages/AccountsPage';
 import { CalendarPage } from './pages/CalendarPage';
+import { CardsPage } from './pages/CardsPage';
 import { HomePage } from './pages/HomePage';
 import { LotteryPage } from './pages/LotteryPage';
 import { ReportsPage } from './pages/ReportsPage';
 import { SettingsPage } from './pages/SettingsPage';
 import { TransactionsPage } from './pages/TransactionsPage';
-import { loginAndSync, startSyncManager, useSyncState } from './sync/syncManager';
+import {
+  dismissRestorePrompt,
+  loginAndSync,
+  startSyncManager,
+  useRestorePrompt,
+  useSyncState,
+} from './sync/syncManager';
 
 export function App() {
   const [ready, setReady] = useState(false);
@@ -101,6 +110,7 @@ export function App() {
   const places = usePlaces();
   const lotteryDraws = useLotteryDraws();
   const budgets = useBudgets();
+  const cards = useCards();
   const noSpendDays = useNoSpendDays();
   const homeLayout = useHomeLayout();
   const pinRecord = usePinRecord();
@@ -108,6 +118,7 @@ export function App() {
   const autoSelectLastPlace = useAutoSelectLastPlace();
   const onboardingMeta = useOnboardingMetaState();
   const syncState = useSyncState();
+  const restorePrompt = useRestorePrompt();
   const [isLocked, setIsLocked] = useState(false);
   const initialLockCheckedRef = useRef(false);
   const hiddenAtRef = useRef<number | null>(null);
@@ -413,6 +424,7 @@ export function App() {
                 <HomePage
                   transactions={transactions}
                   shortcuts={shortcuts}
+                  cards={cards}
                   lotteryDraws={lotteryDraws}
                   budgets={budgets}
                   noSpendDays={noSpendDays}
@@ -496,6 +508,10 @@ export function App() {
                   lotteryDraws={lotteryDraws}
                 />
               }
+            />
+            <Route
+              path="/cards"
+              element={<CardsPage cards={cards} />}
             />
             <Route
               path="/calendar"
@@ -644,6 +660,11 @@ export function App() {
           onTriggerInstall={handleTriggerInstall}
           onEnableSync={loginAndSync}
           onComplete={handleCompleteOnboarding}
+        />
+
+        <CloudRestoreModal
+          mode={restorePrompt.kind === 'idle' ? null : restorePrompt}
+          onClose={dismissRestorePrompt}
         />
 
         {isLocked && pinRecord && (

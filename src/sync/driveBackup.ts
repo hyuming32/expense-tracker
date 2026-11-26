@@ -1,11 +1,13 @@
 import { db, type ExpenseDatabase, META_KEYS } from '../db/database';
-import { exportBackupData } from '../db/repository';
+import { type BackupPayload, exportBackupData, parseBackupPayload } from '../db/repository';
+import { type RestoreDataSummary, summarizeBackupPayload } from '../domain/restore';
 import { requestDriveFileAccessToken } from './auth';
-import { DriveApiError } from './driveStore';
+import { DriveApiError, type DriveStore } from './driveStore';
 
 export const BACKUP_FOLDER_NAME = '記帳備份';
 export const BACKUP_FILE_PREFIX = '記帳備份_';
 export const BACKUP_KEEP_COUNT = 10;
+export const BACKUP_LIST_DEFAULT_LIMIT = 5;
 
 const FOLDER_MIME_TYPE = 'application/vnd.google-apps.folder';
 const DRIVE_API_BASE = 'https://www.googleapis.com/drive/v3';
@@ -15,6 +17,7 @@ export interface DriveBackupFile {
   id: string;
   name: string;
   createdTime?: string;
+  size?: number;
 }
 
 export interface DriveBackupResult {
@@ -48,6 +51,29 @@ function parseCreatedTimeMs(createdTime?: string): number {
   return Number.isFinite(ms) ? ms : 0;
 }
 
+function compareBackupFilesDesc<T extends DriveBackupFile>(a: T, b: T): number {
+  const timeDiff = parseCreatedTimeMs(b.createdTime) - parseCreatedTimeMs(a.createdTime);
+  if (timeDiff !== 0) {
+    return timeDiff;
+  }
+  return b.name.localeCompare(a.name);
+}
+
+/**
+ * 從檔案清單中篩選以「記帳備份_」開頭的檔案，依時間由新到舊排序，最多回傳指定筆數（預設 5 份）。
+ */
+export function selectRecentBackups<T extends DriveBackupFile>(
+  files: readonly T[],
+  limit: number = BACKUP_LIST_DEFAULT_LIMIT,
+): T[] {
+  const safeLimit = Math.max(0, Math.trunc(limit));
+  const backupFiles = files.filter((f) => f.name.startsWith(BACKUP_FILE_PREFIX));
+  if (safeLimit === 0 || backupFiles.length === 0) {
+    return [];
+  }
+  return [...backupFiles].sort(compareBackupFilesDesc).slice(0, safeLimit);
+}
+
 /**
  * 從檔案清單中篩選以「記帳備份_」開頭的檔案，依建立時間由新到舊排序後，
  * 回傳超過保留份數（預設 10 份）的較舊檔案清單供移入垃圾桶。
@@ -62,9 +88,7 @@ export function selectBackupsToTrash<T extends DriveBackupFile>(
     return [];
   }
 
-  const sorted = [...backupFiles].sort(
-    (a, b) => parseCreatedTimeMs(b.createdTime) - parseCreatedTimeMs(a.createdTime),
-  );
+  const sorted = [...backupFiles].sort(compareBackupFilesDesc);
   return sorted.slice(safeKeep);
 }
 
@@ -108,10 +132,10 @@ async function isFolderValid(getToken: () => Promise<string>, folderId: string):
   }
 }
 
-async function findOrCreateBackupFolder(
+async function findBackupFolder(
   getToken: () => Promise<string>,
   database: ExpenseDatabase,
-): Promise<string> {
+): Promise<string | null> {
   const saved = await database.meta.get(META_KEYS.DRIVE_BACKUP_FOLDER_ID);
   if (saved?.value) {
     const valid = await isFolderValid(getToken, saved.value);
@@ -132,22 +156,38 @@ async function findOrCreateBackupFolder(
     files?: Array<{ id: string; name: string }>;
   };
 
-  let folderId = listData.files?.[0]?.id;
-  if (!folderId) {
-    const createRes = await authorizedFetch(getToken, `${DRIVE_API_BASE}/files?fields=id`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json; charset=UTF-8',
-      },
-      body: JSON.stringify({
-        name: BACKUP_FOLDER_NAME,
-        mimeType: FOLDER_MIME_TYPE,
-        parents: ['root'],
-      }),
+  const folderId = listData.files?.[0]?.id ?? null;
+  if (folderId) {
+    await database.meta.put({
+      key: META_KEYS.DRIVE_BACKUP_FOLDER_ID,
+      value: folderId,
     });
-    const created = (await createRes.json()) as { id: string };
-    folderId = created.id;
   }
+  return folderId;
+}
+
+async function findOrCreateBackupFolder(
+  getToken: () => Promise<string>,
+  database: ExpenseDatabase,
+): Promise<string> {
+  const existingId = await findBackupFolder(getToken, database);
+  if (existingId) {
+    return existingId;
+  }
+
+  const createRes = await authorizedFetch(getToken, `${DRIVE_API_BASE}/files?fields=id`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json; charset=UTF-8',
+    },
+    body: JSON.stringify({
+      name: BACKUP_FOLDER_NAME,
+      mimeType: FOLDER_MIME_TYPE,
+      parents: ['root'],
+    }),
+  });
+  const created = (await createRes.json()) as { id: string };
+  const folderId = created.id;
 
   await database.meta.put({
     key: META_KEYS.DRIVE_BACKUP_FOLDER_ID,
@@ -209,7 +249,7 @@ async function listFolderFiles(
     const params = new URLSearchParams({
       q: `'${folderId}' in parents and trashed = false`,
       spaces: 'drive',
-      fields: 'nextPageToken,files(id,name,createdTime)',
+      fields: 'nextPageToken,files(id,name,createdTime,size)',
       orderBy: 'createdTime desc',
       pageSize: '100',
     });
@@ -220,11 +260,24 @@ async function listFolderFiles(
     const res = await authorizedFetch(getToken, `${DRIVE_API_BASE}/files?${params.toString()}`);
     const data = (await res.json()) as {
       nextPageToken?: string;
-      files?: DriveBackupFile[];
+      files?: Array<{ id: string; name: string; createdTime?: string; size?: string | number }>;
     };
 
     if (Array.isArray(data.files)) {
-      files.push(...data.files);
+      for (const f of data.files) {
+        const parsedSize =
+          typeof f.size === 'number'
+            ? f.size
+            : typeof f.size === 'string' && f.size.trim().length > 0
+              ? Number(f.size)
+              : undefined;
+        files.push({
+          id: f.id,
+          name: f.name,
+          createdTime: f.createdTime,
+          size: parsedSize !== undefined && Number.isFinite(parsedSize) ? parsedSize : undefined,
+        });
+      }
     }
     pageToken = data.nextPageToken;
   } while (pageToken);
@@ -303,4 +356,80 @@ export async function backupToGoogleDrive(options?: {
     backedUpAt,
     trashedCount: toTrash.length,
   };
+}
+
+function createCachedTokenGetter(customGetToken?: () => Promise<string>): () => Promise<string> {
+  if (customGetToken) {
+    return customGetToken;
+  }
+  let cachedToken: string | null = null;
+  return async () => {
+    if (!cachedToken) {
+      cachedToken = await requestDriveFileAccessToken();
+    }
+    return cachedToken;
+  };
+}
+
+/**
+ * 列出 Google Drive「記帳備份」資料夾中的備份檔（依時間由新到舊排序，預設最多 5 份）。
+ * 若傳入 driveStore（如 MemoryDriveStore），則直接透過 DriveStore 介面讀取以便測試。
+ */
+export async function listDriveBackups(options?: {
+  driveStore?: DriveStore;
+  database?: ExpenseDatabase;
+  getToken?: () => Promise<string>;
+  limit?: number;
+}): Promise<DriveBackupFile[]> {
+  const limit = options?.limit ?? BACKUP_LIST_DEFAULT_LIMIT;
+
+  if (options?.driveStore) {
+    const files = await options.driveStore.list();
+    return selectRecentBackups(files, limit);
+  }
+
+  const database = options?.database ?? db;
+  const getToken = createCachedTokenGetter(options?.getToken);
+  const folderId = await findBackupFolder(getToken, database);
+  if (!folderId) {
+    return [];
+  }
+
+  const files = await listFolderFiles(getToken, folderId);
+  return selectRecentBackups(files, limit);
+}
+
+export interface DownloadedDriveBackup {
+  payload: BackupPayload;
+  summary: RestoreDataSummary;
+}
+
+/**
+ * 下載指定的 Google Drive 備份檔內容並解析為 BackupPayload 與摘要資訊。
+ * 若傳入 driveStore（如 MemoryDriveStore），則直接透過 DriveStore 介面下載以便測試。
+ */
+export async function downloadDriveBackup(
+  fileId: string,
+  options?: {
+    driveStore?: DriveStore;
+    getToken?: () => Promise<string>;
+  },
+): Promise<DownloadedDriveBackup> {
+  let raw: string;
+
+  if (options?.driveStore) {
+    raw = await options.driveStore.download(fileId);
+  } else {
+    const getToken = createCachedTokenGetter(options?.getToken);
+    const res = await authorizedFetch(
+      getToken,
+      `${DRIVE_API_BASE}/files/${encodeURIComponent(fileId)}?alt=media`,
+    );
+    raw = await res.text();
+  }
+
+  const parsed: unknown = JSON.parse(raw);
+  const payload = parseBackupPayload(parsed);
+  const summary = summarizeBackupPayload(payload);
+  return { payload, summary };
 }

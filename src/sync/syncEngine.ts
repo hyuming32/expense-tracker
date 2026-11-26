@@ -13,6 +13,7 @@ import type {
   RecurringRule,
   Shortcut,
   Transaction,
+  WalletCard,
 } from '../db/types';
 import type { DriveFile, DriveStore } from './driveStore';
 import { mergeRecord } from './merge';
@@ -32,6 +33,7 @@ export interface SyncRecordsPayload {
   lotteryDraws?: LotteryDraw[];
   budgets?: Budget[];
   noSpendDays?: NoSpendDay[];
+  cards?: WalletCard[];
 }
 
 export interface ChangeBatchFile {
@@ -60,6 +62,8 @@ export interface SyncOnceResult {
   usedSnapshot: boolean;
   compacted: boolean;
   lastSyncAt: number;
+  appliedRecordsCount: number;
+  appliedTransactionsCount: number;
 }
 
 interface ParsedChangeFile {
@@ -93,9 +97,9 @@ async function readMetaNumber(database: ExpenseDatabase, key: string): Promise<n
 async function mergeTableRecords<T extends BaseRecord>(
   table: EntityTable<T, 'id'>,
   incoming: readonly T[],
-): Promise<void> {
+): Promise<T[]> {
   if (incoming.length === 0) {
-    return;
+    return [];
   }
   const ids = incoming.map((item) => item.id) as Array<IDType<T, 'id'>>;
   const existingList = await table.bulkGet(ids);
@@ -116,14 +120,21 @@ async function mergeTableRecords<T extends BaseRecord>(
   if (winners.length > 0) {
     await table.bulkPut(winners as never);
   }
+
+  return winners;
+}
+
+interface ApplyRemoteResult {
+  appliedCount: number;
+  appliedTransactions: Transaction[];
 }
 
 async function applyRemoteRecords(
   database: ExpenseDatabase,
   records: SyncRecordsPayload,
   seenUpdates: Array<{ deviceId: string; seq: number }>,
-): Promise<void> {
-  await database.transaction(
+): Promise<ApplyRemoteResult> {
+  return database.transaction(
     'rw',
     [
       database.accounts,
@@ -136,10 +147,23 @@ async function applyRemoteRecords(
       database.lotteryDraws,
       database.budgets,
       database.noSpendDays,
+      database.cards,
       database.meta,
     ],
     async () => {
-      await Promise.all([
+      const [
+        appliedAccounts,
+        appliedCategories,
+        appliedTransactions,
+        appliedNotePresets,
+        appliedRecurringRules,
+        appliedShortcuts,
+        appliedPlaces,
+        appliedLotteryDraws,
+        appliedBudgets,
+        appliedNoSpendDays,
+        appliedCards,
+      ] = await Promise.all([
         mergeTableRecords(database.accounts, records.accounts),
         mergeTableRecords(database.categories, records.categories),
         mergeTableRecords(database.transactions, records.transactions),
@@ -150,6 +174,7 @@ async function applyRemoteRecords(
         mergeTableRecords(database.lotteryDraws, records.lotteryDraws ?? []),
         mergeTableRecords(database.budgets, records.budgets ?? []),
         mergeTableRecords(database.noSpendDays, records.noSpendDays ?? []),
+        mergeTableRecords(database.cards, records.cards ?? []),
       ]);
 
       for (const item of seenUpdates) {
@@ -159,6 +184,21 @@ async function applyRemoteRecords(
           await database.meta.put({ key, value: String(item.seq) });
         }
       }
+
+      const appliedCount =
+        appliedAccounts.length +
+        appliedCategories.length +
+        appliedTransactions.length +
+        appliedNotePresets.length +
+        appliedRecurringRules.length +
+        appliedShortcuts.length +
+        appliedPlaces.length +
+        appliedLotteryDraws.length +
+        appliedBudgets.length +
+        appliedNoSpendDays.length +
+        appliedCards.length;
+
+      return { appliedCount, appliedTransactions };
     },
   );
 }
@@ -177,6 +217,7 @@ async function buildOutboxRecords(
   const lotteryDrawIds: string[] = [];
   const budgetIds: string[] = [];
   const noSpendDayIds: string[] = [];
+  const cardIds: string[] = [];
 
   for (const entry of entries) {
     if (entry.table === 'accounts') {
@@ -197,6 +238,8 @@ async function buildOutboxRecords(
       budgetIds.push(entry.recordId);
     } else if (entry.table === 'noSpendDays') {
       noSpendDayIds.push(entry.recordId);
+    } else if (entry.table === 'cards') {
+      cardIds.push(entry.recordId);
     } else {
       transactionIds.push(entry.recordId);
     }
@@ -213,6 +256,7 @@ async function buildOutboxRecords(
     lotteryDrawsRaw,
     budgetsRaw,
     noSpendDaysRaw,
+    cardsRaw,
   ] = await Promise.all([
     accountIds.length > 0
       ? database.accounts.bulkGet(accountIds)
@@ -244,6 +288,9 @@ async function buildOutboxRecords(
     noSpendDayIds.length > 0
       ? database.noSpendDays.bulkGet(noSpendDayIds)
       : Promise.resolve<Array<NoSpendDay | undefined>>([]),
+    cardIds.length > 0
+      ? database.cards.bulkGet(cardIds)
+      : Promise.resolve<Array<WalletCard | undefined>>([]),
   ]);
 
   const accounts: Account[] = [];
@@ -306,6 +353,12 @@ async function buildOutboxRecords(
       noSpendDays.push(item);
     }
   }
+  const cards: WalletCard[] = [];
+  for (const item of cardsRaw) {
+    if (item) {
+      cards.push(item);
+    }
+  }
 
   return {
     accounts,
@@ -318,6 +371,7 @@ async function buildOutboxRecords(
     lotteryDraws,
     budgets,
     noSpendDays,
+    cards,
   };
 }
 
@@ -333,6 +387,8 @@ export async function syncOnce(options: SyncOnceOptions): Promise<SyncOnceResult
   let downloadedChanges = 0;
   let usedSnapshot = false;
   let compacted = false;
+  let appliedRecordsCount = 0;
+  const appliedTransactionsMap = new Map<string, Transaction>();
 
   // 1. 上傳本機待同步的 outbox 項目
   const outboxEntries = await database.outbox.toArray();
@@ -380,7 +436,11 @@ export async function syncOnce(options: SyncOnceOptions): Promise<SyncOnceResult
       deviceId: devId,
       seq,
     }));
-    await applyRemoteRecords(database, snapshot.records, seenUpdates);
+    const applied = await applyRemoteRecords(database, snapshot.records, seenUpdates);
+    appliedRecordsCount += applied.appliedCount;
+    for (const tx of applied.appliedTransactions) {
+      appliedTransactionsMap.set(tx.id, tx);
+    }
     usedSnapshot = true;
   }
 
@@ -404,9 +464,13 @@ export async function syncOnce(options: SyncOnceOptions): Promise<SyncOnceResult
     for (const item of pending) {
       const batchRaw = await driveStore.download(item.file.id);
       const batch = JSON.parse(batchRaw) as ChangeBatchFile;
-      await applyRemoteRecords(database, batch.records, [
+      const applied = await applyRemoteRecords(database, batch.records, [
         { deviceId: remoteDeviceId, seq: batch.seq },
       ]);
+      appliedRecordsCount += applied.appliedCount;
+      for (const tx of applied.appliedTransactions) {
+        appliedTransactionsMap.set(tx.id, tx);
+      }
       downloadedChanges += 1;
     }
   }
@@ -424,6 +488,7 @@ export async function syncOnce(options: SyncOnceOptions): Promise<SyncOnceResult
       lotteryDraws,
       budgets,
       noSpendDays,
+      cards,
       allMeta,
     ] = await Promise.all([
       database.accounts.toArray(),
@@ -436,6 +501,7 @@ export async function syncOnce(options: SyncOnceOptions): Promise<SyncOnceResult
       database.lotteryDraws.toArray(),
       database.budgets.toArray(),
       database.noSpendDays.toArray(),
+      database.cards.toArray(),
       database.meta.toArray(),
     ]);
 
@@ -469,6 +535,7 @@ export async function syncOnce(options: SyncOnceOptions): Promise<SyncOnceResult
         lotteryDraws,
         budgets,
         noSpendDays,
+        cards,
       },
     };
     const snapshotJson = JSON.stringify(snapshot);
@@ -492,11 +559,20 @@ export async function syncOnce(options: SyncOnceOptions): Promise<SyncOnceResult
   const lastSyncAt = Date.now();
   await database.meta.put({ key: META_KEYS.SYNC_LAST_SYNC_AT, value: String(lastSyncAt) });
 
+  let appliedTransactionsCount = 0;
+  for (const tx of appliedTransactionsMap.values()) {
+    if (!tx.deleted) {
+      appliedTransactionsCount += 1;
+    }
+  }
+
   return {
     uploadedCount,
     downloadedChanges,
     usedSnapshot,
     compacted,
     lastSyncAt,
+    appliedRecordsCount,
+    appliedTransactionsCount,
   };
 }

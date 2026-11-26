@@ -15,6 +15,7 @@ import {
   DuplicatePlaceNameError,
   DuplicateSellerIdError,
   exportBackupData,
+  deleteCard,
   getAmountColors,
   getAutoAddNotePresets,
   getAutoSelectLastPlace,
@@ -27,8 +28,10 @@ import {
   restoreBackupData,
   saveAmountColors,
   saveBudget,
+  saveCarrierCard,
   saveHomeLayout,
   saveLotteryDraw,
+  saveMemberCard,
   saveNotePreset,
   savePinRecord,
   savePlace,
@@ -128,7 +131,7 @@ describe('JSON 備份匯出與還原', () => {
     ]);
 
     const backup = await exportBackupData(sourceDb);
-    expect(backup.schemaVersion).toBe(11);
+    expect(backup.schemaVersion).toBe(12);
     expect(backup.transactions).toHaveLength(2);
     expect(backup.transactions.some((t) => t.id === 'tx-deleted' && t.deleted)).toBe(true);
     expect(backup.transactions.find((t) => t.id === 'tx-active')?.invoiceNo).toBe('AB12345678');
@@ -658,7 +661,7 @@ describe('常用備註與自動學習（v5）', () => {
     await softDeleteNotePreset(deletedPreset.id, srcDb);
 
     const backup = await exportBackupData(srcDb);
-    expect(backup.schemaVersion).toBe(11);
+    expect(backup.schemaVersion).toBe(12);
     expect(backup.notePresets).toHaveLength(2);
 
     const dstDb = new ExpenseDatabase(`test-notepreset-backup-dst-${Date.now()}`);
@@ -1248,7 +1251,7 @@ describe('地點與時間資料庫邏輯（v8）', () => {
 
     const place = await savePlace({ name: '公館夜市', icon: '🏮', sellerIds: ['87654321'] }, v8Db);
     const backup = await exportBackupData(v8Db);
-    expect(backup.schemaVersion).toBe(11);
+    expect(backup.schemaVersion).toBe(12);
     expect(backup.places).toHaveLength(1);
 
     const parsed = parseBackupPayload(JSON.parse(JSON.stringify(backup)));
@@ -1394,6 +1397,59 @@ describe('本機隱私與 ui.* 設定隔離（不進 JSON 備份與同步）', (
   });
 });
 
+describe('載具與會員卡資料庫邏輯（v12）', () => {
+  it('cards 寫入 outbox、載具固定 id、軟刪除，且 JSON 備份含 cards 並可還原舊版備份', async () => {
+    const testDb = new ExpenseDatabase(`test-cards-v12-${Date.now()}`);
+    await ensureSeeded(testDb);
+
+    const carrier = await saveCarrierCard('/abc1234', testDb);
+    expect(carrier.id).toBe('card-carrier');
+    expect(carrier.code).toBe('/ABC1234');
+    expect(carrier.format).toBe('code39');
+    expect((await testDb.outbox.get('cards:card-carrier'))?.recordId).toBe('card-carrier');
+
+    const member = await saveMemberCard(
+      { name: '全聯福利卡', code: '4006381333931' },
+      testDb,
+    );
+    expect(member.format).toBe('ean13');
+    expect((await testDb.outbox.get(`cards:${member.id}`))?.recordId).toBe(member.id);
+
+    const memberToDelete = await saveMemberCard(
+      { name: '家樂福', code: '99887766' },
+      testDb,
+    );
+    await deleteCard(memberToDelete.id, testDb);
+    expect((await testDb.cards.get(memberToDelete.id))?.deleted).toBe(true);
+
+    // JSON 備份含 cards（含軟刪除紀錄）
+    const backup = await exportBackupData(testDb);
+    expect(backup.cards).toHaveLength(3);
+
+    const parsed = parseBackupPayload(JSON.parse(JSON.stringify(backup)));
+    const restoreDb = new ExpenseDatabase(`test-cards-restore-${Date.now()}`);
+    await ensureSeeded(restoreDb);
+    const summary = await restoreBackupData(parsed, restoreDb);
+    expect(summary.cards).toBe(3);
+    expect((await restoreDb.cards.get('card-carrier'))?.code).toBe('/ABC1234');
+    expect((await restoreDb.cards.get(memberToDelete.id))?.deleted).toBe(true);
+
+    // 舊版備份（沒有 cards 欄位）也能正常還原
+    const legacyRaw = JSON.parse(JSON.stringify(backup)) as Record<string, unknown>;
+    delete legacyRaw.cards;
+    const legacyParsed = parseBackupPayload(legacyRaw);
+    expect(legacyParsed.cards).toEqual([]);
+    const legacyRestoreDb = new ExpenseDatabase(`test-cards-legacy-${Date.now()}`);
+    await ensureSeeded(legacyRestoreDb);
+    const legacySummary = await restoreBackupData(legacyParsed, legacyRestoreDb);
+    expect(legacySummary.cards).toBe(0);
+
+    await testDb.delete();
+    await restoreDb.delete();
+    await legacyRestoreDb.delete();
+  });
+});
+
 describe('每月預算資料庫邏輯（v10）', () => {
   it('saveBudget 使用固定 id 寫入 outbox、設 0 會軟刪除，且 JSON 備份含 budgets 並可還原舊版備份', async () => {
     const testDb = new ExpenseDatabase(`test-budget-v10-${Date.now()}`);
@@ -1472,6 +1528,59 @@ describe('本機隱私與 ui.* 設定隔離（不進 JSON 備份與同步）', (
     expect(serialized).not.toContain(pinRecord.salt);
 
     await testDb.delete();
+  });
+});
+
+describe('載具與會員卡資料庫邏輯（v12）', () => {
+  it('cards 寫入 outbox、載具固定 id、軟刪除，且 JSON 備份含 cards 並可還原舊版備份', async () => {
+    const testDb = new ExpenseDatabase(`test-cards-v12-${Date.now()}`);
+    await ensureSeeded(testDb);
+
+    const carrier = await saveCarrierCard('/abc1234', testDb);
+    expect(carrier.id).toBe('card-carrier');
+    expect(carrier.code).toBe('/ABC1234');
+    expect(carrier.format).toBe('code39');
+    expect((await testDb.outbox.get('cards:card-carrier'))?.recordId).toBe('card-carrier');
+
+    const member = await saveMemberCard(
+      { name: '全聯福利卡', code: '4006381333931' },
+      testDb,
+    );
+    expect(member.format).toBe('ean13');
+    expect((await testDb.outbox.get(`cards:${member.id}`))?.recordId).toBe(member.id);
+
+    const memberToDelete = await saveMemberCard(
+      { name: '家樂福', code: '99887766' },
+      testDb,
+    );
+    await deleteCard(memberToDelete.id, testDb);
+    expect((await testDb.cards.get(memberToDelete.id))?.deleted).toBe(true);
+
+    // JSON 備份含 cards（含軟刪除紀錄）
+    const backup = await exportBackupData(testDb);
+    expect(backup.cards).toHaveLength(3);
+
+    const parsed = parseBackupPayload(JSON.parse(JSON.stringify(backup)));
+    const restoreDb = new ExpenseDatabase(`test-cards-restore-${Date.now()}`);
+    await ensureSeeded(restoreDb);
+    const summary = await restoreBackupData(parsed, restoreDb);
+    expect(summary.cards).toBe(3);
+    expect((await restoreDb.cards.get('card-carrier'))?.code).toBe('/ABC1234');
+    expect((await restoreDb.cards.get(memberToDelete.id))?.deleted).toBe(true);
+
+    // 舊版備份（沒有 cards 欄位）也能正常還原
+    const legacyRaw = JSON.parse(JSON.stringify(backup)) as Record<string, unknown>;
+    delete legacyRaw.cards;
+    const legacyParsed = parseBackupPayload(legacyRaw);
+    expect(legacyParsed.cards).toEqual([]);
+    const legacyRestoreDb = new ExpenseDatabase(`test-cards-legacy-${Date.now()}`);
+    await ensureSeeded(legacyRestoreDb);
+    const legacySummary = await restoreBackupData(legacyParsed, legacyRestoreDb);
+    expect(legacySummary.cards).toBe(0);
+
+    await testDb.delete();
+    await restoreDb.delete();
+    await legacyRestoreDb.delete();
   });
 });
 
@@ -1606,5 +1715,58 @@ describe('本機隱私與 ui.* 設定隔離（不進 JSON 備份與同步）', (
     expect(serialized).not.toContain(pinRecord.salt);
 
     await testDb.delete();
+  });
+});
+
+describe('載具與會員卡資料庫邏輯（v12）', () => {
+  it('cards 寫入 outbox、載具固定 id、軟刪除，且 JSON 備份含 cards 並可還原舊版備份', async () => {
+    const testDb = new ExpenseDatabase(`test-cards-v12-${Date.now()}`);
+    await ensureSeeded(testDb);
+
+    const carrier = await saveCarrierCard('/abc1234', testDb);
+    expect(carrier.id).toBe('card-carrier');
+    expect(carrier.code).toBe('/ABC1234');
+    expect(carrier.format).toBe('code39');
+    expect((await testDb.outbox.get('cards:card-carrier'))?.recordId).toBe('card-carrier');
+
+    const member = await saveMemberCard(
+      { name: '全聯福利卡', code: '4006381333931' },
+      testDb,
+    );
+    expect(member.format).toBe('ean13');
+    expect((await testDb.outbox.get(`cards:${member.id}`))?.recordId).toBe(member.id);
+
+    const memberToDelete = await saveMemberCard(
+      { name: '家樂福', code: '99887766' },
+      testDb,
+    );
+    await deleteCard(memberToDelete.id, testDb);
+    expect((await testDb.cards.get(memberToDelete.id))?.deleted).toBe(true);
+
+    // JSON 備份含 cards（含軟刪除紀錄）
+    const backup = await exportBackupData(testDb);
+    expect(backup.cards).toHaveLength(3);
+
+    const parsed = parseBackupPayload(JSON.parse(JSON.stringify(backup)));
+    const restoreDb = new ExpenseDatabase(`test-cards-restore-${Date.now()}`);
+    await ensureSeeded(restoreDb);
+    const summary = await restoreBackupData(parsed, restoreDb);
+    expect(summary.cards).toBe(3);
+    expect((await restoreDb.cards.get('card-carrier'))?.code).toBe('/ABC1234');
+    expect((await restoreDb.cards.get(memberToDelete.id))?.deleted).toBe(true);
+
+    // 舊版備份（沒有 cards 欄位）也能正常還原
+    const legacyRaw = JSON.parse(JSON.stringify(backup)) as Record<string, unknown>;
+    delete legacyRaw.cards;
+    const legacyParsed = parseBackupPayload(legacyRaw);
+    expect(legacyParsed.cards).toEqual([]);
+    const legacyRestoreDb = new ExpenseDatabase(`test-cards-legacy-${Date.now()}`);
+    await ensureSeeded(legacyRestoreDb);
+    const legacySummary = await restoreBackupData(legacyParsed, legacyRestoreDb);
+    expect(legacySummary.cards).toBe(0);
+
+    await testDb.delete();
+    await restoreDb.delete();
+    await legacyRestoreDb.delete();
   });
 });
