@@ -2,9 +2,11 @@ import Dexie, { type EntityTable, type Table } from 'dexie';
 import { getDeviceId } from './deviceId';
 import type {
   Account,
+  Budget,
   Category,
   LotteryDraw,
   MetaEntry,
+  NoSpendDay,
   NotePreset,
   OutboxEntry,
   Place,
@@ -31,6 +33,14 @@ export const META_KEYS = {
   SYNC_SCHEDULE: 'sync.schedule',
   DRIVE_BACKUP_FOLDER_ID: 'driveBackup.folderId',
   DRIVE_BACKUP_LAST_AT: 'driveBackup.lastAt',
+  UI_ONBOARDING_COMPLETED: 'ui.onboardingCompleted',
+  UI_LAST_JSON_BACKUP_AT: 'ui.lastJsonBackupAt',
+  UI_DATA_PROTECTION_DISMISSED_AT: 'ui.dataProtectionDismissedAt',
+  UI_INSTALL_PROMPT_DISMISSED_AT: 'ui.installPromptDismissedAt',
+  UI_SHOW_HABIT_CARD: 'ui.showHabitCard',
+  UI_HOME_LAYOUT: 'ui.homeLayout',
+  UI_PIN_HASH: 'ui.pinHash',
+  UI_HIDE_AMOUNTS_DEFAULT: 'ui.hideAmountsDefault',
 } as const;
 
 export const SEED_DEVICE_ID = 'seed';
@@ -82,6 +92,8 @@ export class ExpenseDatabase extends Dexie {
   shortcuts!: EntityTable<Shortcut, 'id'>;
   places!: EntityTable<Place, 'id'>;
   lotteryDraws!: EntityTable<LotteryDraw, 'id'>;
+  budgets!: EntityTable<Budget, 'id'>;
+  noSpendDays!: EntityTable<NoSpendDay, 'id'>;
   meta!: Table<MetaEntry, string>;
   outbox!: Table<OutboxEntry, string>;
 
@@ -337,6 +349,35 @@ export class ExpenseDatabase extends Dexie {
       shortcuts: 'id, sortOrder, updatedAt, deleted',
       places: 'id, useCount, lastUsedAt, sortOrder, archived, updatedAt, deleted',
       lotteryDraws: 'id, period, updatedAt, deleted',
+      meta: 'key',
+      outbox: 'key, table, recordId, updatedAt',
+    });
+    this.version(10).stores({
+      accounts: 'id, updatedAt, deleted, sortOrder',
+      categories: 'id, kind, parentId, updatedAt, deleted, sortOrder',
+      transactions:
+        'id, kind, date, accountId, toAccountId, categoryId, placeId, invoiceNo, recurringId, occurrenceDate, updatedAt, deleted',
+      notePresets: 'id, categoryId, useCount, lastUsedAt, sortOrder, updatedAt, deleted',
+      recurringRules: 'id, frequency, paused, startDate, endDate, updatedAt, deleted',
+      shortcuts: 'id, sortOrder, updatedAt, deleted',
+      places: 'id, useCount, lastUsedAt, sortOrder, archived, updatedAt, deleted',
+      lotteryDraws: 'id, period, updatedAt, deleted',
+      budgets: 'id, categoryId, updatedAt, deleted',
+      meta: 'key',
+      outbox: 'key, table, recordId, updatedAt',
+    });
+    this.version(11).stores({
+      accounts: 'id, updatedAt, deleted, sortOrder',
+      categories: 'id, kind, parentId, updatedAt, deleted, sortOrder',
+      transactions:
+        'id, kind, date, accountId, toAccountId, categoryId, placeId, invoiceNo, recurringId, occurrenceDate, updatedAt, deleted',
+      notePresets: 'id, categoryId, useCount, lastUsedAt, sortOrder, updatedAt, deleted',
+      recurringRules: 'id, frequency, paused, startDate, endDate, updatedAt, deleted',
+      shortcuts: 'id, sortOrder, updatedAt, deleted',
+      places: 'id, useCount, lastUsedAt, sortOrder, archived, updatedAt, deleted',
+      lotteryDraws: 'id, period, updatedAt, deleted',
+      budgets: 'id, categoryId, updatedAt, deleted',
+      noSpendDays: 'id, date, updatedAt, deleted',
       meta: 'key',
       outbox: 'key, table, recordId, updatedAt',
     });

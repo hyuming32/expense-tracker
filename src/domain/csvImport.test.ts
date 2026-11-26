@@ -136,6 +136,7 @@ describe('planCsvImport', () => {
         subCategoryName: '午餐',
         placeName: null,
         note: '牛肉麵, 加蛋\n"特大碗"',
+        tags: [],
         invoiceNo: 'AB12345678',
       },
       {
@@ -150,6 +151,7 @@ describe('planCsvImport', () => {
         subCategoryName: '',
         placeName: null,
         note: null,
+        tags: [],
         invoiceNo: null,
       },
       {
@@ -164,6 +166,7 @@ describe('planCsvImport', () => {
         subCategoryName: '',
         placeName: null,
         note: '領現',
+        tags: [],
         invoiceNo: null,
       },
     ]);
@@ -363,5 +366,38 @@ describe('planCsvImport', () => {
     });
     expect(newPlacePlan.errors).toEqual([]);
     expect(newPlacePlan.newPlaces).toEqual(['新地點店']);
+  });
+
+  it('CSV 匯出包含標籤欄（以「、」分隔）並可匯入回來', () => {
+    const txs: Transaction[] = [
+      {
+        id: 'tx-tag-1',
+        kind: 'expense',
+        date: '2026-11-26',
+        time: '19:30',
+        amount: 1200,
+        accountId: 'acc-cash',
+        toAccountId: null,
+        categoryId: 'cat-lunch',
+        note: '拉麵',
+        tags: ['日本旅遊', '可報帳'],
+        updatedAt: 1000,
+        deviceId: 'dev-1',
+        deleted: false,
+      },
+    ];
+
+    const exported = toCsv(txs, baseCategories, baseAccounts);
+    expect(exported).toContain('標籤');
+    expect(exported).toContain('日本旅遊、可報帳');
+
+    const roundtripPlan = planCsvImport(exported, {
+      transactions: [],
+      categories: baseCategories,
+      accounts: baseAccounts,
+    });
+    expect(roundtripPlan.errors).toEqual([]);
+    expect(roundtripPlan.items).toHaveLength(1);
+    expect(roundtripPlan.items[0]?.tags).toEqual(['日本旅遊', '可報帳']);
   });
 });

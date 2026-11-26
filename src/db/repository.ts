@@ -1,18 +1,30 @@
 import { mergeBackup } from '../domain/backup';
 import type { CsvImportPlan } from '../domain/csvImport';
+import {
+  DEFAULT_HOME_SECTION_KEYS,
+  type HomeLayoutItem,
+  type HomeSectionKey,
+  parseHomeLayoutJson,
+  resolveHomeLayout,
+} from '../domain/homeLayout';
 import { buildRecurringTransactionId, dueOccurrences } from '../domain/recurring';
 import { getTodayDateString } from '../domain/format';
 import { isValidSellerId, normalizePlaceName } from '../domain/places';
+import { normalizeTags } from '../domain/tags';
+import type { QuickTextResult } from '../domain/quickText';
 import type { PeriodKind } from '../domain/reports';
+import { parsePinRecordJson, type PinRecord } from '../lib/pinLock';
 import { db, type ExpenseDatabase, META_KEYS } from './database';
 import { getDeviceId } from './deviceId';
 import type {
   Account,
   AccountType,
+  Budget,
   Category,
   CategoryKind,
   LotteryDraw,
   MetaEntry,
+  NoSpendDay,
   NotePreset,
   OutboxEntry,
   Place,
@@ -71,6 +83,7 @@ export interface SaveTransactionInput {
   categoryId: string | null;
   placeId?: string | null;
   note: string | null;
+  tags?: string[];
   invoiceNo?: string | null;
 }
 
@@ -133,6 +146,8 @@ export interface BackupPayload {
   shortcuts?: Shortcut[];
   places?: Place[];
   lotteryDraws?: LotteryDraw[];
+  budgets?: Budget[];
+  noSpendDays?: NoSpendDay[];
   meta?: MetaEntry[];
 }
 
@@ -145,6 +160,8 @@ export interface RestoreSummary {
   shortcuts: number;
   places: number;
   lotteryDraws: number;
+  budgets: number;
+  noSpendDays: number;
 }
 
 export interface AmountColors {
@@ -433,6 +450,7 @@ export async function saveTransaction(
     : undefined;
   const normalizedTime = input.time?.trim() ? input.time.trim() : null;
   const normalizedPlaceId = input.placeId?.trim() ? input.placeId.trim() : null;
+  const normalizedTags = input.tags ? normalizeTags(input.tags) : [];
 
   const record: Transaction = {
     id: input.id ?? uuidv7(),
@@ -445,6 +463,7 @@ export async function saveTransaction(
     categoryId: input.kind === 'transfer' ? null : input.categoryId,
     placeId: normalizedPlaceId,
     note: input.note?.trim() ? input.note.trim() : null,
+    ...(normalizedTags.length > 0 ? { tags: normalizedTags } : {}),
     ...(normalizedInvoiceNo ? { invoiceNo: normalizedInvoiceNo } : {}),
     updatedAt: now,
     deviceId,
@@ -854,6 +873,8 @@ export async function exportBackupData(database: ExpenseDatabase = db): Promise<
     shortcuts,
     places,
     lotteryDraws,
+    budgets,
+    noSpendDays,
     meta,
   ] = await Promise.all([
     database.accounts.toArray(),
@@ -864,8 +885,13 @@ export async function exportBackupData(database: ExpenseDatabase = db): Promise<
     database.shortcuts.toArray(),
     database.places.toArray(),
     database.lotteryDraws.toArray(),
+    database.budgets.toArray(),
+    database.noSpendDays.toArray(),
     database.meta.toArray(),
   ]);
+
+  // 過濾掉僅限本機使用的 ui.* 設定（如首頁排版、密碼鎖、隱藏金額等），避免隨 JSON 備份外流
+  const exportableMeta = meta.filter((entry) => !entry.key.startsWith('ui.'));
 
   return {
     schemaVersion: database.verno,
@@ -878,7 +904,9 @@ export async function exportBackupData(database: ExpenseDatabase = db): Promise<
     shortcuts,
     places,
     lotteryDraws,
-    meta,
+    budgets,
+    noSpendDays,
+    meta: exportableMeta,
   };
 }
 
@@ -912,6 +940,8 @@ export function parseBackupPayload(raw: unknown): BackupPayload {
     shortcuts: Array.isArray(obj.shortcuts) ? (obj.shortcuts as Shortcut[]) : [],
     places: Array.isArray(obj.places) ? (obj.places as Place[]) : [],
     lotteryDraws: Array.isArray(obj.lotteryDraws) ? (obj.lotteryDraws as LotteryDraw[]) : [],
+    budgets: Array.isArray(obj.budgets) ? (obj.budgets as Budget[]) : [],
+    noSpendDays: Array.isArray(obj.noSpendDays) ? (obj.noSpendDays as NoSpendDay[]) : [],
     meta: Array.isArray(obj.meta) ? (obj.meta as MetaEntry[]) : undefined,
   };
 }
@@ -929,6 +959,8 @@ export async function restoreBackupData(
   const incomingShortcuts = payload.shortcuts ?? [];
   const incomingPlaces = payload.places ?? [];
   const incomingLotteryDraws = payload.lotteryDraws ?? [];
+  const incomingBudgets = payload.budgets ?? [];
+  const incomingNoSpendDays = payload.noSpendDays ?? [];
 
   await database.transaction(
     'rw',
@@ -941,6 +973,8 @@ export async function restoreBackupData(
       database.shortcuts,
       database.places,
       database.lotteryDraws,
+      database.budgets,
+      database.noSpendDays,
       database.outbox,
     ],
     async () => {
@@ -953,6 +987,8 @@ export async function restoreBackupData(
         existingShortcuts,
         existingPlaces,
         existingLotteryDraws,
+        existingBudgets,
+        existingNoSpendDays,
       ] = await Promise.all([
         database.accounts.toArray(),
         database.categories.toArray(),
@@ -962,6 +998,8 @@ export async function restoreBackupData(
         database.shortcuts.toArray(),
         database.places.toArray(),
         database.lotteryDraws.toArray(),
+        database.budgets.toArray(),
+        database.noSpendDays.toArray(),
       ]);
 
       const mergedAccounts = mergeBackup(existingAccounts, payload.accounts);
@@ -972,6 +1010,8 @@ export async function restoreBackupData(
       const mergedShortcuts = mergeBackup(existingShortcuts, incomingShortcuts);
       const mergedPlaces = mergeBackup(existingPlaces, incomingPlaces);
       const mergedLotteryDraws = mergeBackup(existingLotteryDraws, incomingLotteryDraws);
+      const mergedBudgets = mergeBackup(existingBudgets, incomingBudgets);
+      const mergedNoSpendDays = mergeBackup(existingNoSpendDays, incomingNoSpendDays);
 
       const outboxEntries: OutboxEntry[] = [
         ...payload.accounts.map((item) => createOutboxEntry('accounts', item.id, now)),
@@ -982,6 +1022,8 @@ export async function restoreBackupData(
         ...incomingShortcuts.map((item) => createOutboxEntry('shortcuts', item.id, now)),
         ...incomingPlaces.map((item) => createOutboxEntry('places', item.id, now)),
         ...incomingLotteryDraws.map((item) => createOutboxEntry('lotteryDraws', item.id, now)),
+        ...incomingBudgets.map((item) => createOutboxEntry('budgets', item.id, now)),
+        ...incomingNoSpendDays.map((item) => createOutboxEntry('noSpendDays', item.id, now)),
       ];
 
       await Promise.all([
@@ -993,6 +1035,8 @@ export async function restoreBackupData(
         database.shortcuts.bulkPut(mergedShortcuts),
         database.places.bulkPut(mergedPlaces),
         database.lotteryDraws.bulkPut(mergedLotteryDraws),
+        database.budgets.bulkPut(mergedBudgets),
+        database.noSpendDays.bulkPut(mergedNoSpendDays),
         outboxEntries.length > 0 ? database.outbox.bulkPut(outboxEntries) : Promise.resolve(),
       ]);
     },
@@ -1009,6 +1053,8 @@ export async function restoreBackupData(
     shortcuts: incomingShortcuts.length,
     places: incomingPlaces.length,
     lotteryDraws: incomingLotteryDraws.length,
+    budgets: incomingBudgets.length,
+    noSpendDays: incomingNoSpendDays.length,
   };
 }
 
@@ -1240,6 +1286,7 @@ export async function importCsvPlan(
           categoryId,
           placeId: place?.id ?? null,
           note: item.note,
+          ...(item.tags.length > 0 ? { tags: item.tags } : {}),
           ...(item.invoiceNo ? { invoiceNo: item.invoiceNo } : {}),
           updatedAt: now,
           deviceId,
@@ -1812,6 +1859,33 @@ export async function recordShortcutTransaction(
   );
 }
 
+/**
+ * 依一句話快速記帳解析結果直接寫入交易紀錄（含 outbox 與地點使用統計）。
+ */
+export async function recordQuickTextTransaction(
+  parsed: QuickTextResult,
+  database: ExpenseDatabase = db,
+): Promise<Transaction> {
+  if (parsed.amount === null || parsed.amount <= 0) {
+    throw new Error('快速記帳缺少有效金額，請先輸入金額');
+  }
+
+  return saveTransaction(
+    {
+      kind: parsed.kind,
+      date: parsed.date,
+      amount: parsed.amount,
+      accountId: parsed.accountId,
+      toAccountId: parsed.kind === 'transfer' ? parsed.toAccountId : null,
+      categoryId: parsed.kind === 'transfer' ? null : parsed.categoryId,
+      placeId: parsed.placeId,
+      note: parsed.note,
+      tags: parsed.tags,
+    },
+    database,
+  );
+}
+
 export class DuplicatePlaceNameError extends Error {
   constructor() {
     super('已存在相同名稱的地點');
@@ -2267,4 +2341,358 @@ export async function softDeleteLotteryDraw(
   if (updated) {
     notifyLocalMutation(database);
   }
+}
+
+export interface SaveBudgetInput {
+  categoryId: string | null;
+  amount: number | null;
+}
+
+/**
+ * 產生每月預算的固定主鍵：總預算為 budget-total，分類預算為 budget-<categoryId>。
+ */
+export function buildBudgetId(categoryId: string | null): string {
+  return categoryId === null ? 'budget-total' : `budget-${categoryId}`;
+}
+
+/**
+ * 讀取所有未刪除的每月預算設定。
+ */
+export async function getBudgets(database: ExpenseDatabase = db): Promise<Budget[]> {
+  const rows = await database.budgets.toArray();
+  return rows.filter((b) => !b.deleted);
+}
+
+/**
+ * 批次設定或清除每月預算（金額為 0 或 null 時軟刪除），並排入 outbox 同步。
+ */
+export async function saveBudgets(
+  inputs: readonly SaveBudgetInput[],
+  database: ExpenseDatabase = db,
+): Promise<Budget[]> {
+  if (inputs.length === 0) {
+    return [];
+  }
+
+  const now = Date.now();
+  const deviceId = getDeviceId();
+  const savedRecords: Budget[] = [];
+  let changed = false;
+
+  await database.transaction('rw', database.budgets, database.outbox, async () => {
+    for (const input of inputs) {
+      const id = buildBudgetId(input.categoryId);
+      const rawAmount = input.amount;
+
+      if (rawAmount === null || rawAmount === 0) {
+        const existing = await database.budgets.get(id);
+        if (existing && !existing.deleted) {
+          await database.budgets.put({
+            ...existing,
+            deleted: true,
+            updatedAt: now,
+            deviceId,
+          });
+          await database.outbox.put(createOutboxEntry('budgets', id, now));
+          changed = true;
+        }
+        continue;
+      }
+
+      if (!Number.isFinite(rawAmount) || !Number.isInteger(rawAmount) || rawAmount < 0) {
+        throw new Error('預算金額須為正整數');
+      }
+
+      const record: Budget = {
+        id,
+        categoryId: input.categoryId,
+        amount: rawAmount,
+        updatedAt: now,
+        deviceId,
+        deleted: false,
+      };
+      await database.budgets.put(record);
+      await database.outbox.put(createOutboxEntry('budgets', id, now));
+      savedRecords.push(record);
+      changed = true;
+    }
+  });
+
+  if (changed) {
+    notifyLocalMutation(database);
+  }
+
+  return savedRecords;
+}
+
+/**
+ * 設定或清除單筆每月預算（金額為 0 或 null 時軟刪除該筆），並排入 outbox 同步。
+ */
+export async function saveBudget(
+  input: SaveBudgetInput,
+  database: ExpenseDatabase = db,
+): Promise<Budget | null> {
+  const saved = await saveBudgets([input], database);
+  return saved[0] ?? null;
+}
+
+export interface OnboardingMetaState {
+  onboardingCompleted: boolean;
+  lastJsonBackupAt: number | null;
+  dataProtectionDismissedAt: number | null;
+  installPromptDismissedAt: number | null;
+}
+
+function parseOptionalTimestamp(raw: string | undefined): number | null {
+  if (!raw) {
+    return null;
+  }
+  const num = Number(raw);
+  return Number.isFinite(num) && num > 0 ? num : null;
+}
+
+/**
+ * 讀取本機儲存的新手導覽與首頁提醒卡狀態（不同步至雲端）。
+ */
+export async function getOnboardingMetaState(
+  database: ExpenseDatabase = db,
+): Promise<OnboardingMetaState> {
+  const [completed, lastBackup, dataDismissed, installDismissed] = await Promise.all([
+    database.meta.get(META_KEYS.UI_ONBOARDING_COMPLETED),
+    database.meta.get(META_KEYS.UI_LAST_JSON_BACKUP_AT),
+    database.meta.get(META_KEYS.UI_DATA_PROTECTION_DISMISSED_AT),
+    database.meta.get(META_KEYS.UI_INSTALL_PROMPT_DISMISSED_AT),
+  ]);
+  return {
+    onboardingCompleted: completed?.value === 'true',
+    lastJsonBackupAt: parseOptionalTimestamp(lastBackup?.value),
+    dataProtectionDismissedAt: parseOptionalTimestamp(dataDismissed?.value),
+    installPromptDismissedAt: parseOptionalTimestamp(installDismissed?.value),
+  };
+}
+
+/**
+ * 記錄使用者已完成或略過新手導覽。
+ */
+export async function markOnboardingCompleted(database: ExpenseDatabase = db): Promise<void> {
+  await database.meta.put({ key: META_KEYS.UI_ONBOARDING_COMPLETED, value: 'true' });
+}
+
+/**
+ * 記錄最近一次成功匯出 JSON 備份的時間戳記。
+ */
+export async function recordJsonBackupTimestamp(
+  timestamp: number = Date.now(),
+  database: ExpenseDatabase = db,
+): Promise<void> {
+  await database.meta.put({ key: META_KEYS.UI_LAST_JSON_BACKUP_AT, value: String(timestamp) });
+}
+
+/**
+ * 記錄使用者暫時關閉資料保護提醒卡的時間戳記。
+ */
+export async function dismissDataProtectionCard(
+  timestamp: number = Date.now(),
+  database: ExpenseDatabase = db,
+): Promise<void> {
+  await database.meta.put({
+    key: META_KEYS.UI_DATA_PROTECTION_DISMISSED_AT,
+    value: String(timestamp),
+  });
+}
+
+/**
+ * 記錄使用者暫時關閉「加到主畫面」提醒卡的時間戳記。
+ */
+export async function dismissInstallPromptCard(
+  timestamp: number = Date.now(),
+  database: ExpenseDatabase = db,
+): Promise<void> {
+  await database.meta.put({
+    key: META_KEYS.UI_INSTALL_PROMPT_DISMISSED_AT,
+    value: String(timestamp),
+  });
+}
+
+/**
+ * 產生「這天沒花錢」標記的固定主鍵 nospend-YYYY-MM-DD。
+ */
+export function buildNoSpendDayId(date: string): string {
+  return `nospend-${date}`;
+}
+
+/**
+ * 讀取所有未刪除的「這天沒花錢」標記。
+ */
+export async function getNoSpendDays(database: ExpenseDatabase = db): Promise<NoSpendDay[]> {
+  const rows = await database.noSpendDays.toArray();
+  return rows.filter((d) => !d.deleted);
+}
+
+/**
+ * 設定或取消某天的「這天沒花錢」標記（取消時軟刪除），並排入 outbox 同步。
+ */
+export async function setNoSpendDay(
+  date: string,
+  enabled: boolean,
+  database: ExpenseDatabase = db,
+): Promise<NoSpendDay | null> {
+  const id = buildNoSpendDayId(date);
+  const now = Date.now();
+  const deviceId = getDeviceId();
+  let saved: NoSpendDay | null = null;
+  let changed = false;
+
+  await database.transaction('rw', database.noSpendDays, database.outbox, async () => {
+    if (enabled) {
+      const record: NoSpendDay = {
+        id,
+        date,
+        updatedAt: now,
+        deviceId,
+        deleted: false,
+      };
+      await database.noSpendDays.put(record);
+      await database.outbox.put(createOutboxEntry('noSpendDays', id, now));
+      saved = record;
+      changed = true;
+    } else {
+      const existing = await database.noSpendDays.get(id);
+      if (existing && !existing.deleted) {
+        await database.noSpendDays.put({
+          ...existing,
+          deleted: true,
+          updatedAt: now,
+          deviceId,
+        });
+        await database.outbox.put(createOutboxEntry('noSpendDays', id, now));
+        changed = true;
+      }
+    }
+  });
+
+  if (changed) {
+    notifyLocalMutation(database);
+  }
+
+  return saved;
+}
+
+/**
+ * 讀取首頁是否顯示「連續記帳與漏記提醒」卡片（預設開啟）。
+ */
+export async function getShowHabitCard(database: ExpenseDatabase = db): Promise<boolean> {
+  const entry = await database.meta.get(META_KEYS.UI_SHOW_HABIT_CARD);
+  return entry?.value !== 'false';
+}
+
+/**
+ * 設定首頁是否顯示「連續記帳與漏記提醒」卡片（存本機 meta，不同步）。
+ */
+export async function setShowHabitCard(
+  enabled: boolean,
+  database: ExpenseDatabase = db,
+): Promise<void> {
+  await database.meta.put({
+    key: META_KEYS.UI_SHOW_HABIT_CARD,
+    value: enabled ? 'true' : 'false',
+  });
+}
+
+/**
+ * 讀取首頁區塊顯示與順序設定（存本機 meta，不同步、不進 JSON 備份）。
+ */
+export async function getHomeLayout(
+  database: ExpenseDatabase = db,
+): Promise<HomeLayoutItem<HomeSectionKey>[]> {
+  const [layoutEntry, habitEntry] = await Promise.all([
+    database.meta.get(META_KEYS.UI_HOME_LAYOUT),
+    database.meta.get(META_KEYS.UI_SHOW_HABIT_CARD),
+  ]);
+  const saved = parseHomeLayoutJson(layoutEntry?.value);
+  const resolved = resolveHomeLayout(saved, DEFAULT_HOME_SECTION_KEYS);
+  // 若尚未自訂過首頁排版，沿用舊版「顯示連續記帳卡片」設定
+  if (!saved && habitEntry?.value === 'false') {
+    return resolved.map((item) =>
+      item.key === 'habit' ? { ...item, visible: false } : item,
+    );
+  }
+  return resolved;
+}
+
+/**
+ * 儲存首頁區塊顯示與順序設定至本機 meta（不同步、不進 JSON 備份）。
+ */
+export async function saveHomeLayout(
+  layout: readonly HomeLayoutItem<HomeSectionKey>[],
+  database: ExpenseDatabase = db,
+): Promise<void> {
+  const habitItem = layout.find((item) => item.key === 'habit');
+  await database.meta.put({
+    key: META_KEYS.UI_HOME_LAYOUT,
+    value: JSON.stringify(layout),
+  });
+  if (habitItem) {
+    await database.meta.put({
+      key: META_KEYS.UI_SHOW_HABIT_CARD,
+      value: habitItem.visible ? 'true' : 'false',
+    });
+  }
+}
+
+/**
+ * 將首頁區塊顯示與順序恢復為預設值。
+ */
+export async function resetHomeLayout(database: ExpenseDatabase = db): Promise<void> {
+  await database.meta.bulkDelete([META_KEYS.UI_HOME_LAYOUT]);
+  await database.meta.put({ key: META_KEYS.UI_SHOW_HABIT_CARD, value: 'true' });
+}
+
+/**
+ * 讀取本機密碼鎖的 salt 與雜湊紀錄（未設定時回傳 null）。
+ */
+export async function getPinRecord(database: ExpenseDatabase = db): Promise<PinRecord | null> {
+  const entry = await database.meta.get(META_KEYS.UI_PIN_HASH);
+  return parsePinRecordJson(entry?.value);
+}
+
+/**
+ * 儲存本機密碼鎖的 salt 與雜湊（只存雜湊，不存明碼、不同步）。
+ */
+export async function savePinRecord(
+  record: PinRecord,
+  database: ExpenseDatabase = db,
+): Promise<void> {
+  await database.meta.put({
+    key: META_KEYS.UI_PIN_HASH,
+    value: JSON.stringify(record),
+  });
+}
+
+/**
+ * 清除本機密碼鎖設定。
+ */
+export async function clearPinRecord(database: ExpenseDatabase = db): Promise<void> {
+  await database.meta.delete(META_KEYS.UI_PIN_HASH);
+}
+
+/**
+ * 讀取「預設隱藏金額」設定（預設為 false）。
+ */
+export async function getHideAmountsDefault(database: ExpenseDatabase = db): Promise<boolean> {
+  const entry = await database.meta.get(META_KEYS.UI_HIDE_AMOUNTS_DEFAULT);
+  return entry?.value === 'true';
+}
+
+/**
+ * 儲存「預設隱藏金額」設定至本機 meta（不同步、不進 JSON 備份）。
+ */
+export async function setHideAmountsDefault(
+  enabled: boolean,
+  database: ExpenseDatabase = db,
+): Promise<void> {
+  await database.meta.put({
+    key: META_KEYS.UI_HIDE_AMOUNTS_DEFAULT,
+    value: enabled ? 'true' : 'false',
+  });
 }

@@ -1,23 +1,30 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
-import { Link } from 'react-router-dom';
+import { type FormEvent, useEffect, useMemo, useRef, useState } from 'react';
+import { Link, useSearchParams } from 'react-router-dom';
+import { useMoney, usePrivacy } from '../contexts/PrivacyContext';
 import {
   type AmountColors,
   archiveAccount,
   archiveCategory,
   archivePlace,
   type BackupPayload,
+  clearPinRecord,
   endRecurringRule,
   exportBackupData,
   importCsvPlan,
   NOTE_PRESET_MAX_LENGTH,
   parseBackupPayload,
   pauseRecurringRule,
+  recordJsonBackupTimestamp,
   resetAmountColors,
+  resetHomeLayout,
   restoreBackupData,
   saveAccount,
   saveAmountColors,
+  saveBudgets,
   saveCategory,
+  saveHomeLayout,
   saveNotePreset,
+  savePinRecord,
   savePlace,
   setAutoAddNotePresets,
   setAutoSelectLastPlace,
@@ -37,6 +44,7 @@ import {
 import type {
   Account,
   AccountType,
+  Budget,
   Category,
   CategoryKind,
   NotePreset,
@@ -47,18 +55,27 @@ import type {
 } from '../db/types';
 import {
   type CsvImportPlan,
-  formatCurrency,
   formatRecurringFrequency,
   getNextOccurrenceDate,
   getRecurringRuleStatus,
   getTodayDateString,
+  HOME_SECTION_META,
+  type HomeLayoutItem,
+  type HomeSectionKey,
   isValidSellerId,
   PLACE_NAME_MAX_LENGTH,
   planCsvImport,
   toCsv,
 } from '../domain';
-import { useLastDriveBackupAt, useOutboxCount, useSyncSchedule } from '../hooks/useExpenseData';
+import {
+  useLastDriveBackupAt,
+  useOutboxCount,
+  usePinRecord,
+  useSyncSchedule,
+} from '../hooks/useExpenseData';
 import { pickFileWithSystemPicker, saveFile, supportsOpenFilePicker } from '../lib/fileSave';
+import { hashPin, isValidPinFormat, verifyPin } from '../lib/pinLock';
+import { getStoragePersistedStatus } from '../lib/storagePersist';
 import { DriveAuthCancelledError, isSyncEnabled } from '../sync/auth';
 import { backupToGoogleDrive } from '../sync/driveBackup';
 import {
@@ -75,7 +92,9 @@ interface SettingsPageProps {
   accounts: readonly Account[];
   categories: readonly Category[];
   places: readonly Place[];
+  budgets: readonly Budget[];
   autoSelectLastPlace: boolean;
+  homeLayout: readonly HomeLayoutItem<HomeSectionKey>[];
   transactions: readonly Transaction[];
   amountColors: AmountColors;
   notePresets: readonly NotePreset[];
@@ -86,6 +105,7 @@ interface SettingsPageProps {
   onEditRecurring: (rule: RecurringRule) => void;
   onOpenCreateShortcut: () => void;
   onEditShortcut: (shortcut: Shortcut) => void;
+  onReplayOnboarding: () => void;
 }
 
 const ACCOUNT_TYPE_LABELS: Record<AccountType, string> = {
@@ -102,7 +122,9 @@ export function SettingsPage({
   accounts,
   categories,
   places,
+  budgets,
   autoSelectLastPlace,
+  homeLayout,
   transactions,
   amountColors,
   notePresets,
@@ -113,7 +135,103 @@ export function SettingsPage({
   onEditRecurring,
   onOpenCreateShortcut,
   onEditShortcut,
+  onReplayOnboarding,
 }: SettingsPageProps) {
+  const formatMoney = useMoney();
+  const { defaultHideAmounts, setDefaultHideAmounts } = usePrivacy();
+  const pinRecord = usePinRecord();
+  const [searchParams] = useSearchParams();
+  const [pinMode, setPinMode] = useState<'idle' | 'enable' | 'change' | 'disable'>('idle');
+  const [oldPin, setOldPin] = useState('');
+  const [newPin, setNewPin] = useState('');
+  const [confirmPin, setConfirmPin] = useState('');
+  const [pinError, setPinError] = useState<string | null>(null);
+  const [pinBusy, setPinBusy] = useState(false);
+
+  function resetPinForm() {
+    setPinMode('idle');
+    setOldPin('');
+    setNewPin('');
+    setConfirmPin('');
+    setPinError(null);
+  }
+
+  async function handleToggleHomeSection(key: HomeSectionKey) {
+    const next = homeLayout.map((item) =>
+      item.key === key ? { ...item, visible: !item.visible } : item,
+    );
+    await saveHomeLayout(next);
+  }
+
+  async function handleMoveHomeSection(index: number, delta: -1 | 1) {
+    const targetIndex = index + delta;
+    if (targetIndex < 0 || targetIndex >= homeLayout.length) {
+      return;
+    }
+    const next = [...homeLayout];
+    const current = next[index]!;
+    next[index] = next[targetIndex]!;
+    next[targetIndex] = current;
+    await saveHomeLayout(next);
+  }
+
+  async function handleResetHomeLayout() {
+    await resetHomeLayout();
+    setStatusMessage('已恢復首頁預設顯示與順序');
+  }
+
+  async function handleSubmitPinForm(e: FormEvent) {
+    e.preventDefault();
+    if (pinBusy) {
+      return;
+    }
+    setPinError(null);
+    setPinBusy(true);
+    try {
+      if (pinMode === 'change' || pinMode === 'disable') {
+        if (!pinRecord) {
+          setPinError('尚未設定密碼鎖');
+          return;
+        }
+        if (!isValidPinFormat(oldPin)) {
+          setPinError('請輸入 4 位數字舊密碼');
+          return;
+        }
+        const verified = await verifyPin(oldPin, pinRecord);
+        if (!verified) {
+          setPinError('舊密碼錯誤');
+          return;
+        }
+        if (pinMode === 'disable') {
+          await clearPinRecord();
+          resetPinForm();
+          setStatusMessage('已關閉密碼鎖');
+          return;
+        }
+      }
+
+      if (pinMode === 'enable' || pinMode === 'change') {
+        if (!isValidPinFormat(newPin)) {
+          setPinError('新密碼必須為 4 位數字');
+          return;
+        }
+        if (newPin !== confirmPin) {
+          setPinError('兩次輸入的密碼不一致');
+          return;
+        }
+        const record = await hashPin(newPin);
+        await savePinRecord(record);
+        resetPinForm();
+        setStatusMessage(pinMode === 'enable' ? '已開啟密碼鎖' : '已更新密碼鎖');
+      }
+    } finally {
+      setPinBusy(false);
+    }
+  }
+  const budgetSectionRef = useRef<HTMLElement | null>(null);
+  const [totalBudgetInput, setTotalBudgetInput] = useState('');
+  const [categoryBudgetInputs, setCategoryBudgetInputs] = useState<Record<string, string>>({});
+  const [budgetSaving, setBudgetSaving] = useState(false);
   const [catTab, setCatTab] = useState<CategoryKind>('expense');
   const [catFormOpen, setCatFormOpen] = useState(false);
   const [editingCatId, setEditingCatId] = useState<string | null>(null);
@@ -145,9 +263,16 @@ export function SettingsPage({
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [authBusy, setAuthBusy] = useState(false);
   const [driveBackupBusy, setDriveBackupBusy] = useState(false);
+  const [persistedStatus, setPersistedStatus] = useState<boolean | null>(null);
   const [isOnline, setIsOnline] = useState(() =>
     typeof navigator === 'undefined' ? true : navigator.onLine !== false,
   );
+
+  useEffect(() => {
+    void getStoragePersistedStatus().then((status) => {
+      setPersistedStatus(status);
+    });
+  }, []);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const csvFileInputRef = useRef<HTMLInputElement>(null);
   const syncState = useSyncState();
@@ -155,6 +280,66 @@ export function SettingsPage({
   const syncSchedule = useSyncSchedule();
   const outboxCount = useOutboxCount();
   const lastDriveBackupAt = useLastDriveBackupAt();
+
+  const expenseRootCategories = useMemo(
+    () =>
+      categories
+        .filter((c) => !c.deleted && !c.archived && c.kind === 'expense' && c.parentId === null)
+        .sort((a, b) => a.sortOrder - b.sortOrder),
+    [categories],
+  );
+
+  useEffect(() => {
+    const total = budgets.find((b) => !b.deleted && b.categoryId === null);
+    setTotalBudgetInput(total && total.amount > 0 ? String(total.amount) : '');
+    const nextMap: Record<string, string> = {};
+    for (const b of budgets) {
+      if (!b.deleted && b.categoryId !== null && b.amount > 0) {
+        nextMap[b.categoryId] = String(b.amount);
+      }
+    }
+    setCategoryBudgetInputs(nextMap);
+  }, [budgets]);
+
+  useEffect(() => {
+    if (searchParams.get('section') === 'budget' && budgetSectionRef.current) {
+      budgetSectionRef.current.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    }
+  }, [searchParams]);
+
+  async function handleSaveBudgets() {
+    setBudgetSaving(true);
+    setErrorMessage(null);
+    setStatusMessage(null);
+    try {
+      const parseAmount = (raw: string, label: string): number | null => {
+        const trimmed = raw.trim();
+        if (trimmed === '') {
+          return null;
+        }
+        const num = Number(trimmed);
+        if (!Number.isInteger(num) || num < 0) {
+          throw new Error(`${label}需為非負整數`);
+        }
+        return num;
+      };
+
+      const inputs = [
+        { categoryId: null, amount: parseAmount(totalBudgetInput, '每月總預算') },
+        ...expenseRootCategories.map((cat) => ({
+          categoryId: cat.id,
+          amount: parseAmount(categoryBudgetInputs[cat.id] ?? '', `${cat.name}預算`),
+        })),
+      ];
+
+      await saveBudgets(inputs);
+      setStatusMessage('已儲存每月預算');
+    } catch (err) {
+      setErrorMessage(err instanceof Error ? err.message : '儲存每月預算失敗');
+    } finally {
+      setBudgetSaving(false);
+    }
+  }
 
   useEffect(() => {
     if (typeof window === 'undefined') {
@@ -501,6 +686,7 @@ export function SettingsPage({
         'application/json;charset=utf-8',
       );
       if (result === 'saved') {
+        await recordJsonBackupTimestamp();
         setStatusMessage('已存檔');
         setErrorMessage(null);
       }
@@ -753,6 +939,325 @@ export function SettingsPage({
         </div>
       </section>
 
+      {/* 首頁顯示 */}
+      <section className="rounded-2xl border border-slate-200 bg-white p-4 dark:border-slate-800 dark:bg-slate-900">
+        <div className="mb-3 flex items-center justify-between gap-2">
+          <div>
+            <h2 className="text-sm font-semibold text-slate-900 dark:text-slate-100">首頁顯示</h2>
+            <p className="mt-0.5 text-xs text-slate-500 dark:text-slate-400">
+              自訂首頁要顯示的區塊與排列順序（僅儲存於本機）
+            </p>
+          </div>
+          <button
+            type="button"
+            onClick={() => void handleResetHomeLayout()}
+            className="shrink-0 rounded-xl border border-slate-200 px-2.5 py-1.5 text-xs font-medium text-slate-600 hover:bg-slate-50 dark:border-slate-700 dark:text-slate-300 dark:hover:bg-slate-800"
+          >
+            恢復預設
+          </button>
+        </div>
+
+        <div className="divide-y divide-slate-100 dark:divide-slate-800">
+          {homeLayout.map((item, idx) => {
+            const meta = HOME_SECTION_META[item.key];
+            return (
+              <div
+                key={item.key}
+                className="flex items-center justify-between gap-3 py-2.5"
+              >
+                <label className="flex min-w-0 flex-1 cursor-pointer items-start gap-2.5">
+                  <input
+                    type="checkbox"
+                    checked={item.visible}
+                    onChange={() => void handleToggleHomeSection(item.key)}
+                    aria-label={`顯示 ${meta.label}`}
+                    className="mt-0.5 h-4 w-4 shrink-0 accent-emerald-600"
+                  />
+                  <div className="min-w-0">
+                    <div className="text-sm font-medium text-slate-800 dark:text-slate-200">
+                      {meta.label}
+                    </div>
+                    {meta.hideWarning && (
+                      <div className="text-[11px] text-amber-600 dark:text-amber-400">
+                        {meta.hideWarning}
+                      </div>
+                    )}
+                  </div>
+                </label>
+
+                <div className="flex shrink-0 items-center gap-1 text-xs">
+                  <button
+                    type="button"
+                    disabled={idx === 0}
+                    onClick={() => void handleMoveHomeSection(idx, -1)}
+                    aria-label={`上移 ${meta.label}`}
+                    className="rounded px-1.5 py-1 text-slate-500 hover:bg-slate-100 disabled:opacity-30 dark:hover:bg-slate-800"
+                  >
+                    ↑
+                  </button>
+                  <button
+                    type="button"
+                    disabled={idx === homeLayout.length - 1}
+                    onClick={() => void handleMoveHomeSection(idx, 1)}
+                    aria-label={`下移 ${meta.label}`}
+                    className="rounded px-1.5 py-1 text-slate-500 hover:bg-slate-100 disabled:opacity-30 dark:hover:bg-slate-800"
+                  >
+                    ↓
+                  </button>
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      </section>
+
+      {/* 隱私 */}
+      <section className="rounded-2xl border border-slate-200 bg-white p-4 dark:border-slate-800 dark:bg-slate-900">
+        <div className="mb-3">
+          <h2 className="text-sm font-semibold text-slate-900 dark:text-slate-100">隱私</h2>
+          <p className="mt-0.5 text-xs text-slate-500 dark:text-slate-400">
+            僅儲存於這台裝置，不會同步到雲端或放進 JSON 備份
+          </p>
+        </div>
+
+        <div className="space-y-3">
+          <label className="flex cursor-pointer items-center justify-between gap-3 rounded-xl border border-slate-100 bg-slate-50/70 px-3 py-2.5 dark:border-slate-800 dark:bg-slate-800/50">
+            <div>
+              <div className="text-sm font-medium text-slate-700 dark:text-slate-200">
+                預設隱藏金額
+              </div>
+              <div className="text-xs text-slate-500 dark:text-slate-400">
+                開啟 App 時自動隱藏所有顯示金額（可於首頁右上角暫時切換）
+              </div>
+            </div>
+            <input
+              type="checkbox"
+              aria-label="預設隱藏金額"
+              checked={defaultHideAmounts}
+              onChange={(e) => {
+                void setDefaultHideAmounts(e.target.checked);
+              }}
+              className="h-4 w-4 accent-emerald-600"
+            />
+          </label>
+
+          <div className="rounded-xl border border-slate-100 bg-slate-50/70 p-3 dark:border-slate-800 dark:bg-slate-800/50">
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <div>
+                <div className="text-sm font-medium text-slate-700 dark:text-slate-200">
+                  4 位數密碼鎖
+                </div>
+                <div className="text-xs text-slate-500 dark:text-slate-400">
+                  {pinRecord
+                    ? '已開啟（開啟 App 或背景超過 60 秒回來時需輸入密碼）'
+                    : '未開啟'}
+                </div>
+              </div>
+
+              {pinMode === 'idle' && (
+                <div className="flex items-center gap-2">
+                  {!pinRecord ? (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        resetPinForm();
+                        setPinMode('enable');
+                      }}
+                      className="rounded-xl bg-emerald-600 px-3 py-1.5 text-xs font-medium text-white hover:bg-emerald-700"
+                    >
+                      開啟密碼鎖
+                    </button>
+                  ) : (
+                    <>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          resetPinForm();
+                          setPinMode('change');
+                        }}
+                        className="rounded-xl border border-slate-200 bg-white px-3 py-1.5 text-xs font-medium text-slate-700 hover:bg-slate-50 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-200 dark:hover:bg-slate-800"
+                      >
+                        修改密碼
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          resetPinForm();
+                          setPinMode('disable');
+                        }}
+                        className="rounded-xl border border-red-200 bg-white px-3 py-1.5 text-xs font-medium text-red-600 hover:bg-red-50 dark:border-red-900/60 dark:bg-slate-900 dark:text-red-400 dark:hover:bg-red-950/40"
+                      >
+                        關閉密碼鎖
+                      </button>
+                    </>
+                  )}
+                </div>
+              )}
+            </div>
+
+            {pinMode !== 'idle' && (
+              <form onSubmit={(e) => void handleSubmitPinForm(e)} className="mt-3 space-y-2.5 border-t border-slate-200 pt-3 dark:border-slate-700">
+                {(pinMode === 'change' || pinMode === 'disable') && (
+                  <div>
+                    <label className="mb-1 block text-xs font-medium text-slate-600 dark:text-slate-300">
+                      輸入舊密碼（4 位數字）
+                    </label>
+                    <input
+                      type="password"
+                      inputMode="numeric"
+                      maxLength={4}
+                      value={oldPin}
+                      onChange={(e) => setOldPin(e.target.value.replace(/\D/g, '').slice(0, 4))}
+                      placeholder="••••"
+                      className="w-full rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm tracking-widest dark:border-slate-700 dark:bg-slate-900"
+                    />
+                  </div>
+                )}
+
+                {(pinMode === 'enable' || pinMode === 'change') && (
+                  <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
+                    <div>
+                      <label className="mb-1 block text-xs font-medium text-slate-600 dark:text-slate-300">
+                        輸入新密碼（4 位數字）
+                      </label>
+                      <input
+                        type="password"
+                        inputMode="numeric"
+                        maxLength={4}
+                        value={newPin}
+                        onChange={(e) => setNewPin(e.target.value.replace(/\D/g, '').slice(0, 4))}
+                        placeholder="••••"
+                        className="w-full rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm tracking-widest dark:border-slate-700 dark:bg-slate-900"
+                      />
+                    </div>
+                    <div>
+                      <label className="mb-1 block text-xs font-medium text-slate-600 dark:text-slate-300">
+                        再次確認新密碼
+                      </label>
+                      <input
+                        type="password"
+                        inputMode="numeric"
+                        maxLength={4}
+                        value={confirmPin}
+                        onChange={(e) => setConfirmPin(e.target.value.replace(/\D/g, '').slice(0, 4))}
+                        placeholder="••••"
+                        className="w-full rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm tracking-widest dark:border-slate-700 dark:bg-slate-900"
+                      />
+                    </div>
+                  </div>
+                )}
+
+                {pinError && (
+                  <p className="text-xs font-medium text-red-600 dark:text-red-400">{pinError}</p>
+                )}
+
+                <div className="flex justify-end gap-2">
+                  <button
+                    type="button"
+                    onClick={resetPinForm}
+                    className="rounded-xl px-3 py-1.5 text-xs font-medium text-slate-600 hover:bg-slate-200/70 dark:text-slate-300 dark:hover:bg-slate-700"
+                  >
+                    取消
+                  </button>
+                  <button
+                    type="submit"
+                    disabled={pinBusy}
+                    className={`rounded-xl px-3 py-1.5 text-xs font-medium text-white disabled:opacity-50 ${
+                      pinMode === 'disable'
+                        ? 'bg-red-600 hover:bg-red-700'
+                        : 'bg-emerald-600 hover:bg-emerald-700'
+                    }`}
+                  >
+                    {pinBusy ? '處理中…' : pinMode === 'disable' ? '確認關閉' : '儲存密碼'}
+                  </button>
+                </div>
+              </form>
+            )}
+          </div>
+        </div>
+      </section>
+
+      {/* 每月預算設定 */}
+      <section
+        id="budget-section"
+        ref={budgetSectionRef}
+        className="rounded-2xl border border-slate-200 bg-white p-4 dark:border-slate-800 dark:bg-slate-900"
+      >
+        <div className="mb-3 flex items-center justify-between gap-2">
+          <div>
+            <h2 className="text-sm font-semibold text-slate-900 dark:text-slate-100">每月預算</h2>
+            <p className="mt-0.5 text-xs text-slate-500 dark:text-slate-400">
+              空白或輸入 0 代表不設預算，子分類支出會併入主分類計算
+            </p>
+          </div>
+          <button
+            type="button"
+            disabled={budgetSaving}
+            onClick={() => void handleSaveBudgets()}
+            className="shrink-0 rounded-xl bg-emerald-600 px-3 py-1.5 text-xs font-medium text-white hover:bg-emerald-700 disabled:opacity-50"
+          >
+            {budgetSaving ? '儲存中…' : '儲存預算'}
+          </button>
+        </div>
+
+        <div className="space-y-3">
+          <div className="flex items-center justify-between gap-3 rounded-xl border border-slate-200 bg-slate-50/80 px-3 py-2.5 dark:border-slate-700 dark:bg-slate-800/60">
+            <label
+              htmlFor="budget-total-input"
+              className="text-sm font-semibold text-slate-900 dark:text-slate-100"
+            >
+              每月總預算
+            </label>
+            <div className="flex items-center gap-1.5">
+              <span className="text-xs text-slate-400">NT$</span>
+              <input
+                id="budget-total-input"
+                type="text"
+                inputMode="numeric"
+                pattern="[0-9]*"
+                value={totalBudgetInput}
+                onChange={(e) => setTotalBudgetInput(e.target.value.replace(/[^\d]/g, ''))}
+                placeholder="不設"
+                className="w-28 rounded-lg border border-slate-200 bg-white px-2.5 py-1.5 text-right text-sm tabular-nums text-slate-900 outline-none focus:border-emerald-500 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100"
+              />
+            </div>
+          </div>
+
+          <div className="space-y-2">
+            {expenseRootCategories.map((cat) => (
+              <div
+                key={cat.id}
+                className="flex items-center justify-between gap-3 rounded-xl border border-slate-100 bg-slate-50/50 px-3 py-2 dark:border-slate-800 dark:bg-slate-800/40"
+              >
+                <label
+                  htmlFor={`budget-cat-${cat.id}`}
+                  className="flex min-w-0 items-center gap-2 text-sm text-slate-700 dark:text-slate-200"
+                >
+                  <span className="shrink-0">{cat.icon}</span>
+                  <span className="truncate">{cat.name}</span>
+                </label>
+                <div className="flex items-center gap-1.5">
+                  <span className="text-xs text-slate-400">NT$</span>
+                  <input
+                    id={`budget-cat-${cat.id}`}
+                    type="text"
+                    inputMode="numeric"
+                    pattern="[0-9]*"
+                    value={categoryBudgetInputs[cat.id] ?? ''}
+                    onChange={(e) => {
+                      const val = e.target.value.replace(/[^\d]/g, '');
+                      setCategoryBudgetInputs((prev) => ({ ...prev, [cat.id]: val }));
+                    }}
+                    placeholder="不設"
+                    className="w-28 rounded-lg border border-slate-200 bg-white px-2.5 py-1 text-right text-sm tabular-nums text-slate-900 outline-none focus:border-emerald-500 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100"
+                  />
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+      </section>
+
       {/* 週期性收支 */}
       <section className="rounded-2xl border border-slate-200 bg-white p-4 dark:border-slate-800 dark:bg-slate-900">
         <div className="mb-3 flex items-center justify-between">
@@ -822,7 +1327,7 @@ export function SettingsPage({
                             : undefined
                       }
                     >
-                      {formatCurrency(rule.amount)}
+                      {formatMoney(rule.amount)}
                     </span>
                   </div>
 
@@ -1207,7 +1712,7 @@ export function SettingsPage({
                   )}
                 </div>
                 <div className="text-xs tabular-nums text-slate-500 dark:text-slate-400">
-                  開帳餘額 {formatCurrency(acc.initialBalance)}
+                  開帳餘額 {formatMoney(acc.initialBalance)}
                 </div>
               </div>
 
@@ -1674,7 +2179,7 @@ export function SettingsPage({
                             : undefined
                         }
                       >
-                        {shortcut.amount !== null ? formatCurrency(shortcut.amount) : '每次輸入'}
+                        {shortcut.amount !== null ? formatMoney(shortcut.amount) : '每次輸入'}
                       </span>
                     </div>
                     <div className="mt-0.5 truncate text-xs text-slate-500 dark:text-slate-400">
@@ -1821,6 +2326,13 @@ export function SettingsPage({
             className="hidden"
           />
         </div>
+
+        <p className="mt-3 border-t border-slate-100 pt-3 text-xs text-slate-500 dark:border-slate-800 dark:text-slate-400">
+          瀏覽器永久保存：
+          {persistedStatus === true
+            ? '已開啟'
+            : '未開啟（iPhone 建議加到主畫面）'}
+        </p>
 
         {pendingBackup && (
           <div className="mt-3 rounded-xl border border-amber-200 bg-amber-50 p-3 dark:border-amber-800 dark:bg-amber-950/50">
@@ -2060,6 +2572,23 @@ export function SettingsPage({
             </p>
           </div>
         )}
+      </section>
+
+      {/* 關於 */}
+      <section className="rounded-2xl border border-slate-200 bg-white p-4 dark:border-slate-800 dark:bg-slate-900">
+        <h2 className="mb-3 text-sm font-semibold text-slate-900 dark:text-slate-100">關於</h2>
+        <div className="flex items-center justify-between gap-3">
+          <div className="text-xs text-slate-500 dark:text-slate-400">
+            想再看一次基本操作與加入主畫面說明？
+          </div>
+          <button
+            type="button"
+            onClick={onReplayOnboarding}
+            className="shrink-0 rounded-xl border border-slate-200 px-3 py-2 text-xs font-medium text-slate-700 hover:bg-slate-50 dark:border-slate-700 dark:text-slate-200 dark:hover:bg-slate-800"
+          >
+            重看新手導覽
+          </button>
+        </div>
       </section>
     </div>
   );

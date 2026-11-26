@@ -22,6 +22,8 @@ import {
   getTodayDateString,
   hasCalcOperator,
   isValidSellerId,
+  MAX_TAGS_PER_TRANSACTION,
+  normalizeTags,
   PLACE_NAME_MAX_LENGTH,
   resolveAmountExpression,
   selectQuickNotePresets,
@@ -40,6 +42,9 @@ export interface TransactionDraft {
   toAccountId: string | null;
   categoryId: string | null;
   note: string | null;
+  tags?: string[];
+  date?: string;
+  placeId?: string | null;
 }
 
 interface TransactionSheetProps {
@@ -49,6 +54,7 @@ interface TransactionSheetProps {
   accounts: readonly Account[];
   categories: readonly Category[];
   places: readonly Place[];
+  recentTags?: readonly string[];
   autoSelectLastPlace: boolean;
   lastUsed: LastUsedMeta;
   amountColors: AmountColors;
@@ -70,6 +76,7 @@ export function TransactionSheet({
   accounts,
   categories,
   places,
+  recentTags = [],
   autoSelectLastPlace,
   lastUsed,
   amountColors,
@@ -105,6 +112,8 @@ export function TransactionSheet({
     placeName: string;
   } | null>(null);
   const [note, setNote] = useState('');
+  const [tags, setTags] = useState<string[]>([]);
+  const [tagInput, setTagInput] = useState('');
   const [invoiceNo, setInvoiceNo] = useState<string | null>(null);
   const [scannerOpen, setScannerOpen] = useState(false);
   const [duplicateMessage, setDuplicateMessage] = useState<string | null>(null);
@@ -200,6 +209,8 @@ export function TransactionSheet({
       setTime(editingTransaction.time ?? '');
       setPlaceId(editingTransaction.placeId ?? null);
       setNote(editingTransaction.note ?? '');
+      setTags(normalizeTags(editingTransaction.tags ?? []));
+      setTagInput('');
       setInvoiceNo(editingTransaction.invoiceNo ?? null);
 
       if (editingTransaction.categoryId) {
@@ -223,10 +234,12 @@ export function TransactionSheet({
       setAccountId(validAcc);
       setToAccountId(validToAcc);
       setCategoryId(initialDraft.kind === 'transfer' ? null : initialDraft.categoryId);
-      setDate(getTodayDateString());
+      setDate(initialDraft.date ?? getTodayDateString());
       setTime(getCurrentTimeString());
-      setPlaceId(resolveDefaultPlaceId());
+      setPlaceId(initialDraft.placeId !== undefined ? initialDraft.placeId : resolveDefaultPlaceId());
       setNote(initialDraft.note ?? '');
+      setTags(normalizeTags(initialDraft.tags ?? []));
+      setTagInput('');
       setInvoiceNo(null);
 
       if (initialDraft.kind !== 'transfer' && initialDraft.categoryId) {
@@ -251,6 +264,8 @@ export function TransactionSheet({
       setTime(getCurrentTimeString());
       setPlaceId(resolveDefaultPlaceId());
       setNote('');
+      setTags([]);
+      setTagInput('');
       setInvoiceNo(null);
 
       const defaultExpCat =
@@ -527,12 +542,14 @@ export function TransactionSheet({
         }
       }
 
+      const finalTags = tagInput.trim() ? normalizeTags([...tags, tagInput]) : tags;
       const saved = await saveTransaction({
         id: editingTransaction?.id,
         ...payload,
         time: time || null,
         placeId: placeId || null,
         note: note || null,
+        tags: finalTags,
         invoiceNo: effectiveInvoiceNo,
       });
       onSaved?.(saved);
@@ -587,6 +604,32 @@ export function TransactionSheet({
     }
     await softDeleteNotePreset(deletingPreset.id);
     setDeletingPreset(null);
+  }
+
+  function handleAddTag(raw: string) {
+    if (!raw.trim()) {
+      return;
+    }
+    setTags((prev) => normalizeTags([...prev, raw]));
+    setTagInput('');
+  }
+
+  function handleRemoveTag(target: string) {
+    setTags((prev) => prev.filter((t) => t !== target));
+  }
+
+  function handleTagInputChange(value: string) {
+    if (/[,，]/.test(value)) {
+      const parts = value.split(/[,，]/);
+      const completed = parts.slice(0, -1);
+      const rest = parts[parts.length - 1] ?? '';
+      if (completed.some((p) => p.trim().length > 0)) {
+        setTags((prev) => normalizeTags([...prev, ...completed]));
+      }
+      setTagInput(rest);
+      return;
+    }
+    setTagInput(value);
   }
 
   function clearLongPressTimer() {
@@ -1158,6 +1201,86 @@ export function TransactionSheet({
                     取消
                   </button>
                 </div>
+              </div>
+            )}
+          </div>
+
+          {/* 標籤 */}
+          <div>
+            <div className="mb-1 flex items-center justify-between">
+              <label htmlFor="tx-tag-input" className="text-xs font-medium text-slate-500 dark:text-slate-400">
+                標籤（選填，最多 {MAX_TAGS_PER_TRANSACTION} 個）
+              </label>
+              {tags.length > 0 && (
+                <span className="text-[11px] text-slate-400 dark:text-slate-500">
+                  {tags.length}/{MAX_TAGS_PER_TRANSACTION}
+                </span>
+              )}
+            </div>
+
+            {tags.length > 0 && (
+              <div className="mb-2 flex flex-wrap items-center gap-1.5" aria-label="已選標籤">
+                {tags.map((tag) => (
+                  <span
+                    key={tag}
+                    className="inline-flex items-center gap-1 rounded-full border border-emerald-500 bg-emerald-50 px-2.5 py-1 text-xs font-medium text-emerald-700 dark:border-emerald-400 dark:bg-emerald-950/60 dark:text-emerald-300"
+                  >
+                    <span>#{tag}</span>
+                    <button
+                      type="button"
+                      onClick={() => handleRemoveTag(tag)}
+                      aria-label={`移除標籤 ${tag}`}
+                      className="ml-0.5 text-emerald-600 hover:text-emerald-900 dark:text-emerald-300 dark:hover:text-white"
+                    >
+                      ×
+                    </button>
+                  </span>
+                ))}
+              </div>
+            )}
+
+            <input
+              id="tx-tag-input"
+              type="text"
+              placeholder={
+                tags.length >= MAX_TAGS_PER_TRANSACTION
+                  ? '已達標籤上限'
+                  : '輸入標籤後按 Enter 或逗號新增...'
+              }
+              disabled={tags.length >= MAX_TAGS_PER_TRANSACTION}
+              value={tagInput}
+              onChange={(e) => handleTagInputChange(e.target.value)}
+              onKeyDown={(e) => {
+                if ((e.key === 'Enter' || e.key === ',' || e.key === '，') && !e.nativeEvent.isComposing) {
+                  e.preventDefault();
+                  handleAddTag(tagInput);
+                }
+              }}
+              className="w-full rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm text-slate-900 placeholder:text-slate-400 outline-none focus:border-emerald-500 disabled:bg-slate-50 disabled:opacity-60 dark:border-slate-700 dark:bg-slate-800 dark:text-slate-100 dark:placeholder:text-slate-500 dark:disabled:bg-slate-800/50"
+            />
+
+            {recentTags.length > 0 && (
+              <div className="mt-2 flex flex-wrap items-center gap-1.5" aria-label="最近使用標籤">
+                {recentTags.slice(0, 8).map((recentTag) => {
+                  const alreadySelected = tags.some(
+                    (t) => t.toLowerCase() === recentTag.toLowerCase(),
+                  );
+                  return (
+                    <button
+                      key={recentTag}
+                      type="button"
+                      disabled={alreadySelected || tags.length >= MAX_TAGS_PER_TRANSACTION}
+                      onClick={() => handleAddTag(recentTag)}
+                      className={`rounded-full border px-2.5 py-1 text-xs transition-colors ${
+                        alreadySelected
+                          ? 'border-emerald-300 bg-emerald-50/60 text-emerald-600 opacity-60 dark:border-emerald-700 dark:bg-emerald-950/30 dark:text-emerald-400'
+                          : 'border-slate-200 bg-slate-50 text-slate-700 hover:border-emerald-400 hover:bg-emerald-50 hover:text-emerald-700 disabled:cursor-not-allowed disabled:opacity-40 dark:border-slate-700 dark:bg-slate-800 dark:text-slate-200 dark:hover:border-emerald-500 dark:hover:bg-emerald-950/40 dark:hover:text-emerald-300'
+                      }`}
+                    >
+                      #{recentTag}
+                    </button>
+                  );
+                })}
               </div>
             )}
           </div>

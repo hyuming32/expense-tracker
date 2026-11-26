@@ -1,6 +1,6 @@
+import { useMoney } from '../contexts/PrivacyContext';
 import type { AmountColors } from '../db/repository';
 import type { Account, Category, Place, Transaction } from '../db/types';
-import { formatCurrency } from '../domain';
 
 interface TransactionRowProps {
   transaction: Transaction;
@@ -21,6 +21,7 @@ export function TransactionRow({
   onSelect,
   showDate = false,
 }: TransactionRowProps) {
+  const formatMoney = useMoney();
   const category = transaction.categoryId ? categoryMap.get(transaction.categoryId) : undefined;
   const parentCategory = category?.parentId ? categoryMap.get(category.parentId) : undefined;
   const account = accountMap.get(transaction.accountId);
@@ -51,6 +52,7 @@ export function TransactionRow({
   if (transaction.note) {
     subtitleParts.push(transaction.note);
   }
+  const tags = transaction.tags ?? [];
 
   return (
     <button
@@ -74,9 +76,16 @@ export function TransactionRow({
               </span>
             )}
           </div>
-          {subtitleParts.length > 0 && (
-            <div className="truncate text-xs text-slate-500 dark:text-slate-400">
-              {subtitleParts.join(' · ')}
+          {(subtitleParts.length > 0 || tags.length > 0) && (
+            <div className="flex items-center gap-1.5 truncate text-xs text-slate-500 dark:text-slate-400">
+              {subtitleParts.length > 0 && (
+                <span className="truncate">{subtitleParts.join(' · ')}</span>
+              )}
+              {tags.length > 0 && (
+                <span className="shrink-0 text-[11px] text-emerald-600 dark:text-emerald-400">
+                  {tags.map((t) => `#${t}`).join(' ')}
+                </span>
+              )}
             </div>
           )}
         </div>
@@ -94,7 +103,7 @@ export function TransactionRow({
               : undefined
         }
       >
-        {formatCurrency(transaction.amount)}
+        {formatMoney(transaction.amount)}
       </span>
     </button>
   );

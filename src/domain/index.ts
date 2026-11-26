@@ -50,10 +50,12 @@ export type { TransactionValidationInput } from './validation';
 export {
   formatCurrency,
   formatDateWithWeekday,
+  formatDisplayCurrency,
   formatMonthLabel,
   getCurrentMonthString,
   getCurrentTimeString,
   getTodayDateString,
+  HIDDEN_AMOUNT_TEXT,
   shiftMonth,
 } from './format';
 export { formatInvoiceNote, isInvoiceRightQr, parseInvoiceQr } from './invoice';
@@ -111,3 +113,39 @@ export type {
   LotteryPrize,
   MatchPeriodResult,
 } from './lottery';
+export { computeBudgetStatus, getBudgetAlertLevel } from './budget';
+export type {
+  BudgetAlertLevel,
+  BudgetStatusItem,
+  BudgetStatusResult,
+  CategoryBudgetStatusItem,
+} from './budget';
+export { parseQuickText } from './quickText';
+export type { QuickTextContext, QuickTextResult } from './quickText';
+export {
+  collectRecentTags,
+  DEFAULT_RECENT_TAGS_LIMIT,
+  MAX_TAGS_PER_TRANSACTION,
+  normalizeTag,
+  normalizeTags,
+  summarizeAllTags,
+  summarizeByTag,
+  TAG_MAX_LENGTH,
+} from './tags';
+export type { TagDateRange, TagOverviewItem, TagSummary } from './tags';
+export {
+  collectActiveDays,
+  computeMonthHabitStats,
+  computeStreak,
+  findFirstRecordDay,
+  findMissingDays,
+  shiftDate,
+} from './habit';
+export type { MonthHabitStats, StreakResult } from './habit';
+export {
+  DEFAULT_HOME_SECTION_KEYS,
+  HOME_SECTION_META,
+  parseHomeLayoutJson,
+  resolveHomeLayout,
+} from './homeLayout';
+export type { HomeLayoutItem, HomeSectionKey, HomeSectionMeta } from './homeLayout';

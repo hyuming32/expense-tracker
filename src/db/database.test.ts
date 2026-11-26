@@ -2,6 +2,8 @@ import 'fake-indexeddb/auto';
 import Dexie from 'dexie';
 import { describe, expect, it } from 'vitest';
 import { planCsvImport } from '../domain/csvImport';
+import { DEFAULT_HOME_SECTION_KEYS } from '../domain/homeLayout';
+import { hashPin } from '../lib/pinLock';
 import { ExpenseDatabase, META_KEYS, ensureSeeded } from './database';
 import {
   archivePlace,
@@ -24,14 +26,19 @@ import {
   resetAmountColors,
   restoreBackupData,
   saveAmountColors,
+  saveBudget,
+  saveHomeLayout,
   saveLotteryDraw,
   saveNotePreset,
+  savePinRecord,
   savePlace,
   saveRecurringRule,
   saveShortcut,
   saveTransaction,
   setAutoAddNotePresets,
   setAutoSelectLastPlace,
+  setHideAmountsDefault,
+  setNoSpendDay,
   skipRecurringOccurrence,
   softDeleteLotteryDraw,
   softDeleteNotePreset,
@@ -121,7 +128,7 @@ describe('JSON 備份匯出與還原', () => {
     ]);
 
     const backup = await exportBackupData(sourceDb);
-    expect(backup.schemaVersion).toBe(9);
+    expect(backup.schemaVersion).toBe(11);
     expect(backup.transactions).toHaveLength(2);
     expect(backup.transactions.some((t) => t.id === 'tx-deleted' && t.deleted)).toBe(true);
     expect(backup.transactions.find((t) => t.id === 'tx-active')?.invoiceNo).toBe('AB12345678');
@@ -651,7 +658,7 @@ describe('常用備註與自動學習（v5）', () => {
     await softDeleteNotePreset(deletedPreset.id, srcDb);
 
     const backup = await exportBackupData(srcDb);
-    expect(backup.schemaVersion).toBe(9);
+    expect(backup.schemaVersion).toBe(11);
     expect(backup.notePresets).toHaveLength(2);
 
     const dstDb = new ExpenseDatabase(`test-notepreset-backup-dst-${Date.now()}`);
@@ -1241,7 +1248,7 @@ describe('地點與時間資料庫邏輯（v8）', () => {
 
     const place = await savePlace({ name: '公館夜市', icon: '🏮', sellerIds: ['87654321'] }, v8Db);
     const backup = await exportBackupData(v8Db);
-    expect(backup.schemaVersion).toBe(9);
+    expect(backup.schemaVersion).toBe(11);
     expect(backup.places).toHaveLength(1);
 
     const parsed = parseBackupPayload(JSON.parse(JSON.stringify(backup)));
@@ -1304,5 +1311,300 @@ describe('發票開獎號碼資料庫邏輯（v9）', () => {
 
     await testDb.delete();
     await restoreDb.delete();
+  });
+});
+
+describe('這天沒花錢標記資料庫邏輯（v11）', () => {
+  it('setNoSpendDay 使用固定 id 寫入 outbox、取消時軟刪除，且 JSON 備份含 noSpendDays 並可還原舊版備份', async () => {
+    const testDb = new ExpenseDatabase(`test-nospend-v11-${Date.now()}`);
+    await ensureSeeded(testDb);
+
+    const marked = await setNoSpendDay('2026-11-24', true, testDb);
+    const unmarked = await setNoSpendDay('2026-11-25', true, testDb);
+    expect(marked?.id).toBe('nospend-2026-11-24');
+    expect(unmarked?.id).toBe('nospend-2026-11-25');
+    expect((await testDb.outbox.get('noSpendDays:nospend-2026-11-24'))?.recordId).toBe(
+      'nospend-2026-11-24',
+    );
+
+    // 取消標記會軟刪除並寫入 outbox
+    const cancelled = await setNoSpendDay('2026-11-25', false, testDb);
+    expect(cancelled).toBeNull();
+    const deletedRow = await testDb.noSpendDays.get('nospend-2026-11-25');
+    expect(deletedRow?.deleted).toBe(true);
+
+    // JSON 備份含 noSpendDays（含軟刪除紀錄）
+    const backup = await exportBackupData(testDb);
+    expect(backup.noSpendDays).toHaveLength(2);
+
+    const parsed = parseBackupPayload(JSON.parse(JSON.stringify(backup)));
+    const restoreDb = new ExpenseDatabase(`test-nospend-restore-${Date.now()}`);
+    await ensureSeeded(restoreDb);
+    const summary = await restoreBackupData(parsed, restoreDb);
+    expect(summary.noSpendDays).toBe(2);
+    expect((await restoreDb.noSpendDays.get('nospend-2026-11-24'))?.deleted).toBe(false);
+    expect((await restoreDb.noSpendDays.get('nospend-2026-11-25'))?.deleted).toBe(true);
+
+    // 舊版備份（沒有 noSpendDays 欄位）也能正常還原
+    const legacyRaw = JSON.parse(JSON.stringify(backup)) as Record<string, unknown>;
+    delete legacyRaw.noSpendDays;
+    const legacyParsed = parseBackupPayload(legacyRaw);
+    expect(legacyParsed.noSpendDays).toEqual([]);
+    const legacyRestoreDb = new ExpenseDatabase(`test-nospend-legacy-${Date.now()}`);
+    await ensureSeeded(legacyRestoreDb);
+    const legacySummary = await restoreBackupData(legacyParsed, legacyRestoreDb);
+    expect(legacySummary.noSpendDays).toBe(0);
+
+    await testDb.delete();
+    await restoreDb.delete();
+    await legacyRestoreDb.delete();
+  });
+});
+
+describe('本機隱私與 ui.* 設定隔離（不進 JSON 備份與同步）', () => {
+  it('首頁版面、密碼鎖雜湊與預設隱藏金額不會放進 JSON 備份，也不會排入 outbox 同步', async () => {
+    const testDb = new ExpenseDatabase(`test-privacy-meta-${Date.now()}`);
+    await ensureSeeded(testDb);
+    const outboxBefore = await testDb.outbox.count();
+
+    await saveHomeLayout(
+      DEFAULT_HOME_SECTION_KEYS.map((key, idx) => ({ key, visible: idx % 2 === 0 })),
+      testDb,
+    );
+    const pinRecord = await hashPin('2580');
+    await savePinRecord(pinRecord, testDb);
+    await setHideAmountsDefault(true, testDb);
+
+    // 確認 outbox 未新增任何同步項目
+    expect(await testDb.outbox.count()).toBe(outboxBefore);
+
+    // 確認 JSON 備份中不含任何 ui.* meta 鍵值與 PIN 雜湊／salt
+    const backup = await exportBackupData(testDb);
+    const uiMetaKeys = (backup.meta ?? []).filter((entry) => entry.key.startsWith('ui.'));
+    expect(uiMetaKeys).toEqual([]);
+
+    const serialized = JSON.stringify(backup);
+    expect(serialized).not.toContain(META_KEYS.UI_HOME_LAYOUT);
+    expect(serialized).not.toContain(META_KEYS.UI_PIN_HASH);
+    expect(serialized).not.toContain(META_KEYS.UI_HIDE_AMOUNTS_DEFAULT);
+    expect(serialized).not.toContain(pinRecord.hash);
+    expect(serialized).not.toContain(pinRecord.salt);
+
+    await testDb.delete();
+  });
+});
+
+describe('每月預算資料庫邏輯（v10）', () => {
+  it('saveBudget 使用固定 id 寫入 outbox、設 0 會軟刪除，且 JSON 備份含 budgets 並可還原舊版備份', async () => {
+    const testDb = new ExpenseDatabase(`test-budget-v10-${Date.now()}`);
+    await ensureSeeded(testDb);
+
+    const totalBudget = await saveBudget({ categoryId: null, amount: 30000 }, testDb);
+    const foodBudget = await saveBudget({ categoryId: 'seed-cat-food', amount: 8000 }, testDb);
+    expect(totalBudget?.id).toBe('budget-total');
+    expect(foodBudget?.id).toBe('budget-seed-cat-food');
+
+    expect((await testDb.outbox.get('budgets:budget-total'))?.recordId).toBe('budget-total');
+    expect((await testDb.outbox.get('budgets:budget-seed-cat-food'))?.recordId).toBe(
+      'budget-seed-cat-food',
+    );
+
+    // 設 0 會軟刪除並寫入 outbox
+    const deletedResult = await saveBudget({ categoryId: 'seed-cat-food', amount: 0 }, testDb);
+    expect(deletedResult).toBeNull();
+    const deletedRow = await testDb.budgets.get('budget-seed-cat-food');
+    expect(deletedRow?.deleted).toBe(true);
+
+    // JSON 備份含 budgets（含軟刪除紀錄）
+    const backup = await exportBackupData(testDb);
+    expect(backup.budgets).toHaveLength(2);
+
+    const parsed = parseBackupPayload(JSON.parse(JSON.stringify(backup)));
+    const restoreDb = new ExpenseDatabase(`test-budget-restore-${Date.now()}`);
+    await ensureSeeded(restoreDb);
+    const summary = await restoreBackupData(parsed, restoreDb);
+    expect(summary.budgets).toBe(2);
+    expect((await restoreDb.budgets.get('budget-total'))?.amount).toBe(30000);
+
+    // 舊版備份（沒有 budgets 欄位）也能正常還原
+    const legacyRaw = JSON.parse(JSON.stringify(backup)) as Record<string, unknown>;
+    delete legacyRaw.budgets;
+    const legacyParsed = parseBackupPayload(legacyRaw);
+    expect(legacyParsed.budgets).toEqual([]);
+    const legacyRestoreDb = new ExpenseDatabase(`test-budget-legacy-${Date.now()}`);
+    await ensureSeeded(legacyRestoreDb);
+    const legacySummary = await restoreBackupData(legacyParsed, legacyRestoreDb);
+    expect(legacySummary.budgets).toBe(0);
+
+    await testDb.delete();
+    await restoreDb.delete();
+    await legacyRestoreDb.delete();
+  });
+});
+
+describe('本機隱私與 ui.* 設定隔離（不進 JSON 備份與同步）', () => {
+  it('首頁版面、密碼鎖雜湊與預設隱藏金額不會放進 JSON 備份，也不會排入 outbox 同步', async () => {
+    const testDb = new ExpenseDatabase(`test-privacy-meta-${Date.now()}`);
+    await ensureSeeded(testDb);
+    const outboxBefore = await testDb.outbox.count();
+
+    await saveHomeLayout(
+      DEFAULT_HOME_SECTION_KEYS.map((key, idx) => ({ key, visible: idx % 2 === 0 })),
+      testDb,
+    );
+    const pinRecord = await hashPin('2580');
+    await savePinRecord(pinRecord, testDb);
+    await setHideAmountsDefault(true, testDb);
+
+    // 確認 outbox 未新增任何同步項目
+    expect(await testDb.outbox.count()).toBe(outboxBefore);
+
+    // 確認 JSON 備份中不含任何 ui.* meta 鍵值與 PIN 雜湊／salt
+    const backup = await exportBackupData(testDb);
+    const uiMetaKeys = (backup.meta ?? []).filter((entry) => entry.key.startsWith('ui.'));
+    expect(uiMetaKeys).toEqual([]);
+
+    const serialized = JSON.stringify(backup);
+    expect(serialized).not.toContain(META_KEYS.UI_HOME_LAYOUT);
+    expect(serialized).not.toContain(META_KEYS.UI_PIN_HASH);
+    expect(serialized).not.toContain(META_KEYS.UI_HIDE_AMOUNTS_DEFAULT);
+    expect(serialized).not.toContain(pinRecord.hash);
+    expect(serialized).not.toContain(pinRecord.salt);
+
+    await testDb.delete();
+  });
+});
+
+describe('交易標籤（tags）資料庫與備份相容性', () => {
+  it('交易儲存標籤後可正常讀取與備份還原，舊交易（無 tags）讀取與備份還原亦正常', async () => {
+    const testDb = new ExpenseDatabase(`test-tags-${Date.now()}`);
+    await ensureSeeded(testDb);
+
+    // 寫入一筆無 tags 的舊格式交易
+    await testDb.transactions.add({
+      id: 'tx-legacy-no-tags',
+      kind: 'expense',
+      date: '2026-11-01',
+      amount: 100,
+      accountId: 'seed-acc-cash',
+      toAccountId: null,
+      categoryId: 'seed-cat-food',
+      note: '舊交易',
+      updatedAt: 1000,
+      deviceId: 'dev-old',
+      deleted: false,
+    });
+
+    const taggedTx = await saveTransaction(
+      {
+        kind: 'expense',
+        date: '2026-11-26',
+        amount: 1200,
+        accountId: 'seed-acc-cash',
+        toAccountId: null,
+        categoryId: 'seed-cat-food',
+        note: '拉麵',
+        tags: ['#日本旅遊', '可報帳', '日本旅遊'],
+      },
+      testDb,
+    );
+
+    expect(taggedTx.tags).toEqual(['日本旅遊', '可報帳']);
+    expect((await testDb.transactions.get('tx-legacy-no-tags'))?.tags).toBeUndefined();
+
+    const backup = await exportBackupData(testDb);
+    const parsed = parseBackupPayload(JSON.parse(JSON.stringify(backup)));
+    const restoreDb = new ExpenseDatabase(`test-tags-restore-${Date.now()}`);
+    await ensureSeeded(restoreDb);
+    await restoreBackupData(parsed, restoreDb);
+
+    const restoredTagged = await restoreDb.transactions.get(taggedTx.id);
+    const restoredLegacy = await restoreDb.transactions.get('tx-legacy-no-tags');
+    expect(restoredTagged?.tags).toEqual(['日本旅遊', '可報帳']);
+    expect(restoredLegacy?.note).toBe('舊交易');
+    expect(restoredLegacy?.tags).toBeUndefined();
+
+    await testDb.delete();
+    await restoreDb.delete();
+  });
+});
+
+describe('這天沒花錢標記資料庫邏輯（v11）', () => {
+  it('setNoSpendDay 使用固定 id 寫入 outbox、取消時軟刪除，且 JSON 備份含 noSpendDays 並可還原舊版備份', async () => {
+    const testDb = new ExpenseDatabase(`test-nospend-v11-${Date.now()}`);
+    await ensureSeeded(testDb);
+
+    const marked = await setNoSpendDay('2026-11-24', true, testDb);
+    const unmarked = await setNoSpendDay('2026-11-25', true, testDb);
+    expect(marked?.id).toBe('nospend-2026-11-24');
+    expect(unmarked?.id).toBe('nospend-2026-11-25');
+    expect((await testDb.outbox.get('noSpendDays:nospend-2026-11-24'))?.recordId).toBe(
+      'nospend-2026-11-24',
+    );
+
+    // 取消標記會軟刪除並寫入 outbox
+    const cancelled = await setNoSpendDay('2026-11-25', false, testDb);
+    expect(cancelled).toBeNull();
+    const deletedRow = await testDb.noSpendDays.get('nospend-2026-11-25');
+    expect(deletedRow?.deleted).toBe(true);
+
+    // JSON 備份含 noSpendDays（含軟刪除紀錄）
+    const backup = await exportBackupData(testDb);
+    expect(backup.noSpendDays).toHaveLength(2);
+
+    const parsed = parseBackupPayload(JSON.parse(JSON.stringify(backup)));
+    const restoreDb = new ExpenseDatabase(`test-nospend-restore-${Date.now()}`);
+    await ensureSeeded(restoreDb);
+    const summary = await restoreBackupData(parsed, restoreDb);
+    expect(summary.noSpendDays).toBe(2);
+    expect((await restoreDb.noSpendDays.get('nospend-2026-11-24'))?.deleted).toBe(false);
+    expect((await restoreDb.noSpendDays.get('nospend-2026-11-25'))?.deleted).toBe(true);
+
+    // 舊版備份（沒有 noSpendDays 欄位）也能正常還原
+    const legacyRaw = JSON.parse(JSON.stringify(backup)) as Record<string, unknown>;
+    delete legacyRaw.noSpendDays;
+    const legacyParsed = parseBackupPayload(legacyRaw);
+    expect(legacyParsed.noSpendDays).toEqual([]);
+    const legacyRestoreDb = new ExpenseDatabase(`test-nospend-legacy-${Date.now()}`);
+    await ensureSeeded(legacyRestoreDb);
+    const legacySummary = await restoreBackupData(legacyParsed, legacyRestoreDb);
+    expect(legacySummary.noSpendDays).toBe(0);
+
+    await testDb.delete();
+    await restoreDb.delete();
+    await legacyRestoreDb.delete();
+  });
+});
+
+describe('本機隱私與 ui.* 設定隔離（不進 JSON 備份與同步）', () => {
+  it('首頁版面、密碼鎖雜湊與預設隱藏金額不會放進 JSON 備份，也不會排入 outbox 同步', async () => {
+    const testDb = new ExpenseDatabase(`test-privacy-meta-${Date.now()}`);
+    await ensureSeeded(testDb);
+    const outboxBefore = await testDb.outbox.count();
+
+    await saveHomeLayout(
+      DEFAULT_HOME_SECTION_KEYS.map((key, idx) => ({ key, visible: idx % 2 === 0 })),
+      testDb,
+    );
+    const pinRecord = await hashPin('2580');
+    await savePinRecord(pinRecord, testDb);
+    await setHideAmountsDefault(true, testDb);
+
+    // 確認 outbox 未新增任何同步項目
+    expect(await testDb.outbox.count()).toBe(outboxBefore);
+
+    // 確認 JSON 備份中不含任何 ui.* meta 鍵值與 PIN 雜湊／salt
+    const backup = await exportBackupData(testDb);
+    const uiMetaKeys = (backup.meta ?? []).filter((entry) => entry.key.startsWith('ui.'));
+    expect(uiMetaKeys).toEqual([]);
+
+    const serialized = JSON.stringify(backup);
+    expect(serialized).not.toContain(META_KEYS.UI_HOME_LAYOUT);
+    expect(serialized).not.toContain(META_KEYS.UI_PIN_HASH);
+    expect(serialized).not.toContain(META_KEYS.UI_HIDE_AMOUNTS_DEFAULT);
+    expect(serialized).not.toContain(pinRecord.hash);
+    expect(serialized).not.toContain(pinRecord.salt);
+
+    await testDb.delete();
   });
 });

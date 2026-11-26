@@ -3,8 +3,10 @@ import { db, type ExpenseDatabase, META_KEYS } from '../db/database';
 import type {
   Account,
   BaseRecord,
+  Budget,
   Category,
   LotteryDraw,
+  NoSpendDay,
   NotePreset,
   OutboxEntry,
   Place,
@@ -28,6 +30,8 @@ export interface SyncRecordsPayload {
   shortcuts?: Shortcut[];
   places?: Place[];
   lotteryDraws?: LotteryDraw[];
+  budgets?: Budget[];
+  noSpendDays?: NoSpendDay[];
 }
 
 export interface ChangeBatchFile {
@@ -130,6 +134,8 @@ async function applyRemoteRecords(
       database.shortcuts,
       database.places,
       database.lotteryDraws,
+      database.budgets,
+      database.noSpendDays,
       database.meta,
     ],
     async () => {
@@ -142,6 +148,8 @@ async function applyRemoteRecords(
         mergeTableRecords(database.shortcuts, records.shortcuts ?? []),
         mergeTableRecords(database.places, records.places ?? []),
         mergeTableRecords(database.lotteryDraws, records.lotteryDraws ?? []),
+        mergeTableRecords(database.budgets, records.budgets ?? []),
+        mergeTableRecords(database.noSpendDays, records.noSpendDays ?? []),
       ]);
 
       for (const item of seenUpdates) {
@@ -167,6 +175,8 @@ async function buildOutboxRecords(
   const shortcutIds: string[] = [];
   const placeIds: string[] = [];
   const lotteryDrawIds: string[] = [];
+  const budgetIds: string[] = [];
+  const noSpendDayIds: string[] = [];
 
   for (const entry of entries) {
     if (entry.table === 'accounts') {
@@ -183,6 +193,10 @@ async function buildOutboxRecords(
       placeIds.push(entry.recordId);
     } else if (entry.table === 'lotteryDraws') {
       lotteryDrawIds.push(entry.recordId);
+    } else if (entry.table === 'budgets') {
+      budgetIds.push(entry.recordId);
+    } else if (entry.table === 'noSpendDays') {
+      noSpendDayIds.push(entry.recordId);
     } else {
       transactionIds.push(entry.recordId);
     }
@@ -197,6 +211,8 @@ async function buildOutboxRecords(
     shortcutsRaw,
     placesRaw,
     lotteryDrawsRaw,
+    budgetsRaw,
+    noSpendDaysRaw,
   ] = await Promise.all([
     accountIds.length > 0
       ? database.accounts.bulkGet(accountIds)
@@ -222,6 +238,12 @@ async function buildOutboxRecords(
     lotteryDrawIds.length > 0
       ? database.lotteryDraws.bulkGet(lotteryDrawIds)
       : Promise.resolve<Array<LotteryDraw | undefined>>([]),
+    budgetIds.length > 0
+      ? database.budgets.bulkGet(budgetIds)
+      : Promise.resolve<Array<Budget | undefined>>([]),
+    noSpendDayIds.length > 0
+      ? database.noSpendDays.bulkGet(noSpendDayIds)
+      : Promise.resolve<Array<NoSpendDay | undefined>>([]),
   ]);
 
   const accounts: Account[] = [];
@@ -272,6 +294,18 @@ async function buildOutboxRecords(
       lotteryDraws.push(item);
     }
   }
+  const budgets: Budget[] = [];
+  for (const item of budgetsRaw) {
+    if (item) {
+      budgets.push(item);
+    }
+  }
+  const noSpendDays: NoSpendDay[] = [];
+  for (const item of noSpendDaysRaw) {
+    if (item) {
+      noSpendDays.push(item);
+    }
+  }
 
   return {
     accounts,
@@ -282,6 +316,8 @@ async function buildOutboxRecords(
     shortcuts,
     places,
     lotteryDraws,
+    budgets,
+    noSpendDays,
   };
 }
 
@@ -386,6 +422,8 @@ export async function syncOnce(options: SyncOnceOptions): Promise<SyncOnceResult
       shortcuts,
       places,
       lotteryDraws,
+      budgets,
+      noSpendDays,
       allMeta,
     ] = await Promise.all([
       database.accounts.toArray(),
@@ -396,6 +434,8 @@ export async function syncOnce(options: SyncOnceOptions): Promise<SyncOnceResult
       database.shortcuts.toArray(),
       database.places.toArray(),
       database.lotteryDraws.toArray(),
+      database.budgets.toArray(),
+      database.noSpendDays.toArray(),
       database.meta.toArray(),
     ]);
 
@@ -427,6 +467,8 @@ export async function syncOnce(options: SyncOnceOptions): Promise<SyncOnceResult
         shortcuts,
         places,
         lotteryDraws,
+        budgets,
+        noSpendDays,
       },
     };
     const snapshotJson = JSON.stringify(snapshot);

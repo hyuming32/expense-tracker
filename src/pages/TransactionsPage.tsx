@@ -1,9 +1,11 @@
 import { useEffect, useMemo, useState } from 'react';
+import { Link } from 'react-router-dom';
+import { useMoney } from '../contexts/PrivacyContext';
 import { TransactionRow } from '../components/TransactionRow';
 import type { AmountColors } from '../db/repository';
 import type { Account, Category, Place, Transaction } from '../db/types';
 import {
-  formatCurrency,
+  collectRecentTags,
   formatDateWithWeekday,
   formatMonthLabel,
   getCurrentMonthString,
@@ -38,11 +40,13 @@ export function TransactionsPage({
   initialAccountId = '',
   onBack,
 }: TransactionsPageProps) {
+  const formatMoney = useMoney();
   const [month, setMonth] = useState(getCurrentMonthString);
   const [searchText, setSearchText] = useState('');
   const [selectedCategoryId, setSelectedCategoryId] = useState('');
   const [selectedAccountId, setSelectedAccountId] = useState(initialAccountId);
   const [selectedPlaceId, setSelectedPlaceId] = useState('');
+  const [selectedTag, setSelectedTag] = useState('');
 
   useEffect(() => {
     setSelectedAccountId(initialAccountId);
@@ -52,6 +56,8 @@ export function TransactionsPage({
     return categories.filter((c) => !c.archived);
   }, [categories]);
 
+  const availableTags = useMemo(() => collectRecentTags(transactions, 100), [transactions]);
+
   const filteredTransactions = useMemo(() => {
     const keyword = searchText.trim().toLowerCase();
 
@@ -59,8 +65,23 @@ export function TransactionsPage({
       if (!tx.date.startsWith(month)) {
         return false;
       }
-      if (keyword && !(tx.note ?? '').toLowerCase().includes(keyword)) {
-        return false;
+      if (keyword) {
+        const txTags = tx.tags ?? [];
+        if (keyword.startsWith('#')) {
+          const tagKeyword = keyword.slice(1).trim();
+          const matchesTag = tagKeyword
+            ? txTags.some((t) => t.toLowerCase().includes(tagKeyword))
+            : txTags.length > 0;
+          if (!matchesTag) {
+            return false;
+          }
+        } else {
+          const matchesNote = (tx.note ?? '').toLowerCase().includes(keyword);
+          const matchesTag = txTags.some((t) => t.toLowerCase().includes(keyword));
+          if (!matchesNote && !matchesTag) {
+            return false;
+          }
+        }
       }
       if (selectedCategoryId) {
         // 若選取的是父分類，同時比對其子分類
@@ -83,6 +104,12 @@ export function TransactionsPage({
           return false;
         }
       }
+      if (selectedTag) {
+        const targetTag = selectedTag.toLowerCase();
+        if (!(tx.tags ?? []).some((t) => t.toLowerCase() === targetTag)) {
+          return false;
+        }
+      }
       return true;
     });
   }, [
@@ -92,6 +119,7 @@ export function TransactionsPage({
     selectedCategoryId,
     selectedAccountId,
     selectedPlaceId,
+    selectedTag,
     categoryMap,
   ]);
 
@@ -113,6 +141,19 @@ export function TransactionsPage({
               {accountMap.get(selectedAccountId)?.name ?? '帳戶明細'}
             </span>
           )}
+        </div>
+      )}
+
+      {/* 補帳日曆入口 */}
+      {!onBack && (
+        <div className="flex justify-end">
+          <Link
+            to="/calendar"
+            className="inline-flex items-center gap-1.5 rounded-xl border border-slate-200 bg-white px-3 py-1.5 text-xs font-medium text-slate-700 transition-colors hover:border-emerald-300 hover:text-emerald-700 dark:border-slate-800 dark:bg-slate-900 dark:text-slate-200 dark:hover:border-emerald-700 dark:hover:text-emerald-300"
+          >
+            <span aria-hidden="true">📅</span>
+            <span>補帳日曆 →</span>
+          </Link>
         </div>
       )}
 
@@ -143,13 +184,13 @@ export function TransactionsPage({
       <div className="space-y-2 rounded-2xl border border-slate-200 bg-white p-3 dark:border-slate-800 dark:bg-slate-900">
         <input
           type="search"
-          placeholder="搜尋備註..."
+          placeholder="搜尋備註或 #標籤..."
           value={searchText}
           onChange={(e) => setSearchText(e.target.value)}
           className="w-full rounded-xl border border-slate-200 bg-slate-50 px-3 py-2 text-sm text-slate-900 outline-none focus:border-emerald-500 focus:bg-white dark:border-slate-700 dark:bg-slate-800 dark:text-slate-100"
         />
 
-        <div className="grid grid-cols-3 gap-2">
+        <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
           <select
             aria-label="篩選分類"
             value={selectedCategoryId}
@@ -191,6 +232,20 @@ export function TransactionsPage({
               </option>
             ))}
           </select>
+
+          <select
+            aria-label="篩選標籤"
+            value={selectedTag}
+            onChange={(e) => setSelectedTag(e.target.value)}
+            className="w-full rounded-xl border border-slate-200 bg-white px-2.5 py-2 text-xs text-slate-800 outline-none focus:border-emerald-500 dark:border-slate-700 dark:bg-slate-800 dark:text-slate-200"
+          >
+            <option value="">全部標籤</option>
+            {availableTags.map((tag) => (
+              <option key={tag} value={tag}>
+                #{tag}
+              </option>
+            ))}
+          </select>
         </div>
       </div>
 
@@ -213,12 +268,12 @@ export function TransactionsPage({
                 <div className="flex items-center gap-3 tabular-nums">
                   {group.incomeTotal > 0 && (
                     <span style={{ color: amountColors.income }}>
-                      收 {formatCurrency(group.incomeTotal)}
+                      收 {formatMoney(group.incomeTotal)}
                     </span>
                   )}
                   {group.expenseTotal > 0 && (
                     <span style={{ color: amountColors.expense }}>
-                      支 {formatCurrency(group.expenseTotal)}
+                      支 {formatMoney(group.expenseTotal)}
                     </span>
                   )}
                 </div>
