@@ -433,7 +433,7 @@ export function TransactionsPage({
             placeholder="搜尋備註、#標籤、分類、地點、帳戶、發票或金額..."
             value={searchText}
             onChange={(e) => setSearchText(e.target.value)}
-            className="min-w-0 flex-1 rounded-xl border border-slate-200 bg-slate-50 px-3 py-2 text-sm text-slate-900 outline-none focus:border-emerald-500 focus:bg-white dark:border-slate-700 dark:bg-slate-800 dark:text-slate-100"
+            className="min-w-0 flex-1 rounded-xl border border-slate-200 bg-slate-50 px-3 py-2 text-sm text-slate-900 outline-none focus:border-emerald-500 focus:bg-white dark:border-slate-700 dark:bg-slate-800 dark:text-slate-100 dark:focus:bg-slate-900"
           />
           <button
             type="button"

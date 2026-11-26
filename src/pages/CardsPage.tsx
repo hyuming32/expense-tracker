@@ -242,7 +242,7 @@ export function CardsPage({ cards }: CardsPageProps) {
               maxLength={12}
               autoCapitalize="characters"
               autoCorrect="off"
-              className="w-full rounded-xl border border-slate-200 bg-slate-50 px-3 py-2 font-mono text-sm text-slate-900 focus:border-emerald-500 focus:bg-white focus:outline-none dark:border-slate-700 dark:bg-slate-800 dark:text-slate-100"
+              className="w-full rounded-xl border border-slate-200 bg-slate-50 px-3 py-2 font-mono text-sm text-slate-900 focus:border-emerald-500 focus:bg-white focus:outline-none dark:border-slate-700 dark:bg-slate-800 dark:text-slate-100 dark:focus:bg-slate-900"
             />
             {carrierError && (
               <p className="mt-1 text-xs text-red-600 dark:text-red-400">
@@ -315,7 +315,7 @@ export function CardsPage({ cards }: CardsPageProps) {
               }}
               placeholder="例如：全聯福利卡"
               maxLength={MEMBER_CARD_NAME_MAX_LENGTH}
-              className="w-full rounded-xl border border-slate-200 bg-slate-50 px-3 py-2 text-sm text-slate-900 focus:border-emerald-500 focus:bg-white focus:outline-none dark:border-slate-700 dark:bg-slate-800 dark:text-slate-100"
+              className="w-full rounded-xl border border-slate-200 bg-slate-50 px-3 py-2 text-sm text-slate-900 focus:border-emerald-500 focus:bg-white focus:outline-none dark:border-slate-700 dark:bg-slate-800 dark:text-slate-100 dark:focus:bg-slate-900"
             />
           </div>
 
