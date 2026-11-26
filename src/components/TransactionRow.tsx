@@ -1,11 +1,12 @@
 import type { AmountColors } from '../db/repository';
-import type { Account, Category, Transaction } from '../db/types';
+import type { Account, Category, Place, Transaction } from '../db/types';
 import { formatCurrency } from '../domain';
 
 interface TransactionRowProps {
   transaction: Transaction;
   categoryMap: ReadonlyMap<string, Category>;
   accountMap: ReadonlyMap<string, Account>;
+  placeMap?: ReadonlyMap<string, Place>;
   amountColors: AmountColors;
   onSelect: (tx: Transaction) => void;
   showDate?: boolean;
@@ -15,6 +16,7 @@ export function TransactionRow({
   transaction,
   categoryMap,
   accountMap,
+  placeMap,
   amountColors,
   onSelect,
   showDate = false,
@@ -23,6 +25,7 @@ export function TransactionRow({
   const parentCategory = category?.parentId ? categoryMap.get(category.parentId) : undefined;
   const account = accountMap.get(transaction.accountId);
   const toAccount = transaction.toAccountId ? accountMap.get(transaction.toAccountId) : undefined;
+  const place = transaction.placeId ? placeMap?.get(transaction.placeId) : undefined;
 
   const icon = transaction.kind === 'transfer' ? '🔄' : (category?.icon ?? '📝');
   const title =
@@ -35,6 +38,12 @@ export function TransactionRow({
   const subtitleParts: string[] = [];
   if (showDate) {
     subtitleParts.push(transaction.date);
+  }
+  if (transaction.time) {
+    subtitleParts.push(transaction.time);
+  }
+  if (place) {
+    subtitleParts.push(place.name);
   }
   if (transaction.kind !== 'transfer' && account) {
     subtitleParts.push(account.name);
@@ -57,7 +66,14 @@ export function TransactionRow({
           {icon}
         </span>
         <div className="min-w-0">
-          <div className="truncate text-sm font-medium text-slate-900 dark:text-slate-100">{title}</div>
+          <div className="flex items-center gap-1 truncate text-sm font-medium text-slate-900 dark:text-slate-100">
+            <span className="truncate">{title}</span>
+            {transaction.recurringId && (
+              <span className="shrink-0 text-xs" title="週期性收支" aria-label="週期性收支">
+                🔁
+              </span>
+            )}
+          </div>
           {subtitleParts.length > 0 && (
             <div className="truncate text-xs text-slate-500 dark:text-slate-400">
               {subtitleParts.join(' · ')}

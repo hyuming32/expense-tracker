@@ -1,4 +1,5 @@
 import type { Account, Transaction } from '../db/types';
+import { compareTransactionsByDateTimeDesc } from './places';
 
 export interface MonthSummaryResult {
   income: number;
@@ -96,7 +97,7 @@ export function groupByDay(transactions: readonly Transaction[]): DayGroup[] {
 
   const groups = Array.from(map.values()).sort((a, b) => b.date.localeCompare(a.date));
   for (const group of groups) {
-    group.transactions.sort((a, b) => b.updatedAt - a.updatedAt);
+    group.transactions.sort(compareTransactionsByDateTimeDesc);
   }
 
   return groups;

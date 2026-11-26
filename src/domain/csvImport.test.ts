@@ -128,11 +128,13 @@ describe('planCsvImport', () => {
         rowNumber: 2,
         kind: 'expense',
         date: '2026-11-20',
+        time: null,
         amount: 185,
         accountName: '現金',
         toAccountName: null,
         categoryName: '飲食',
         subCategoryName: '午餐',
+        placeName: null,
         note: '牛肉麵, 加蛋\n"特大碗"',
         invoiceNo: 'AB12345678',
       },
@@ -140,11 +142,13 @@ describe('planCsvImport', () => {
         rowNumber: 4,
         kind: 'income',
         date: '2026-11-19',
+        time: null,
         amount: 50000,
         accountName: '銀行帳戶',
         toAccountName: null,
         categoryName: '薪資',
         subCategoryName: '',
+        placeName: null,
         note: null,
         invoiceNo: null,
       },
@@ -152,11 +156,13 @@ describe('planCsvImport', () => {
         rowNumber: 5,
         kind: 'transfer',
         date: '2026-11-18',
+        time: null,
         amount: 3000,
         accountName: '銀行帳戶',
         toAccountName: '現金',
         categoryName: '',
         subCategoryName: '',
+        placeName: null,
         note: '領現',
         invoiceNo: null,
       },
@@ -293,5 +299,69 @@ describe('planCsvImport', () => {
       { rowNumber: 3, reason: '日期格式錯誤（需為 YYYY-MM-DD）' },
       { rowNumber: 4, reason: '類型未知（需為 支出／收入／轉帳）' },
     ]);
+  });
+
+  it('CSV 新格式含時間與地點來回一致，未知地點列入將新建清單', () => {
+    const places = [
+      {
+        id: 'pl-1',
+        name: '公司附近',
+        icon: '📍',
+        useCount: 2,
+        lastUsedAt: 1000,
+        sortOrder: 1,
+        archived: false,
+        updatedAt: 1000,
+        deviceId: 'dev-1',
+        deleted: false,
+      },
+    ];
+    const txs: Transaction[] = [
+      {
+        id: 'tx-place-1',
+        kind: 'expense',
+        date: '2026-11-26',
+        time: '12:30',
+        amount: 150,
+        accountId: 'acc-cash',
+        toAccountId: null,
+        categoryId: 'cat-lunch',
+        placeId: 'pl-1',
+        note: '便當',
+        updatedAt: 1000,
+        deviceId: 'dev-1',
+        deleted: false,
+      },
+    ];
+
+    const exported = toCsv(txs, baseCategories, baseAccounts, places);
+    const roundtripPlan = planCsvImport(exported, {
+      transactions: [],
+      categories: baseCategories,
+      accounts: baseAccounts,
+      places,
+    });
+    expect(roundtripPlan.errors).toEqual([]);
+    expect(roundtripPlan.newPlaces).toEqual([]);
+    expect(roundtripPlan.items[0]).toMatchObject({
+      date: '2026-11-26',
+      time: '12:30',
+      placeName: '公司附近',
+      amount: 150,
+    });
+
+    const withNewPlaceCsv = [
+      '日期,時間,類型,金額,分類,子分類,帳戶,轉入帳戶,地點,備註,發票號碼',
+      '2026-11-26,18:45,支出,220,飲食,午餐,現金,,新地點店,晚餐,',
+      '2026-11-26,19:00,支出,80,飲食,午餐,現金,,新地點店,飲料,',
+    ].join('\n');
+    const newPlacePlan = planCsvImport(withNewPlaceCsv, {
+      transactions: [],
+      categories: baseCategories,
+      accounts: baseAccounts,
+      places,
+    });
+    expect(newPlacePlan.errors).toEqual([]);
+    expect(newPlacePlan.newPlaces).toEqual(['新地點店']);
   });
 });

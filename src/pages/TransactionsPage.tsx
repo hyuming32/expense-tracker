@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useState } from 'react';
 import { TransactionRow } from '../components/TransactionRow';
 import type { AmountColors } from '../db/repository';
-import type { Account, Category, Transaction } from '../db/types';
+import type { Account, Category, Place, Transaction } from '../db/types';
 import {
   formatCurrency,
   formatDateWithWeekday,
@@ -15,8 +15,10 @@ interface TransactionsPageProps {
   transactions: readonly Transaction[];
   accounts: readonly Account[];
   categories: readonly Category[];
+  places: readonly Place[];
   accountMap: ReadonlyMap<string, Account>;
   categoryMap: ReadonlyMap<string, Category>;
+  placeMap: ReadonlyMap<string, Place>;
   amountColors: AmountColors;
   onEditTransaction: (tx: Transaction) => void;
   initialAccountId?: string;
@@ -27,8 +29,10 @@ export function TransactionsPage({
   transactions,
   accounts,
   categories,
+  places,
   accountMap,
   categoryMap,
+  placeMap,
   amountColors,
   onEditTransaction,
   initialAccountId = '',
@@ -38,6 +42,7 @@ export function TransactionsPage({
   const [searchText, setSearchText] = useState('');
   const [selectedCategoryId, setSelectedCategoryId] = useState('');
   const [selectedAccountId, setSelectedAccountId] = useState(initialAccountId);
+  const [selectedPlaceId, setSelectedPlaceId] = useState('');
 
   useEffect(() => {
     setSelectedAccountId(initialAccountId);
@@ -73,9 +78,22 @@ export function TransactionsPage({
           return false;
         }
       }
+      if (selectedPlaceId) {
+        if (tx.placeId !== selectedPlaceId) {
+          return false;
+        }
+      }
       return true;
     });
-  }, [transactions, month, searchText, selectedCategoryId, selectedAccountId, categoryMap]);
+  }, [
+    transactions,
+    month,
+    searchText,
+    selectedCategoryId,
+    selectedAccountId,
+    selectedPlaceId,
+    categoryMap,
+  ]);
 
   const dayGroups = useMemo(() => groupByDay(filteredTransactions), [filteredTransactions]);
 
@@ -131,7 +149,7 @@ export function TransactionsPage({
           className="w-full rounded-xl border border-slate-200 bg-slate-50 px-3 py-2 text-sm text-slate-900 outline-none focus:border-emerald-500 focus:bg-white dark:border-slate-700 dark:bg-slate-800 dark:text-slate-100"
         />
 
-        <div className="grid grid-cols-2 gap-2">
+        <div className="grid grid-cols-3 gap-2">
           <select
             aria-label="篩選分類"
             value={selectedCategoryId}
@@ -156,6 +174,20 @@ export function TransactionsPage({
             {accounts.map((acc) => (
               <option key={acc.id} value={acc.id}>
                 {acc.name}
+              </option>
+            ))}
+          </select>
+
+          <select
+            aria-label="篩選地點"
+            value={selectedPlaceId}
+            onChange={(e) => setSelectedPlaceId(e.target.value)}
+            className="w-full rounded-xl border border-slate-200 bg-white px-2.5 py-2 text-xs text-slate-800 outline-none focus:border-emerald-500 dark:border-slate-700 dark:bg-slate-800 dark:text-slate-200"
+          >
+            <option value="">全部地點</option>
+            {places.map((place) => (
+              <option key={place.id} value={place.id}>
+                {place.icon} {place.name}
               </option>
             ))}
           </select>
@@ -199,6 +231,7 @@ export function TransactionsPage({
                     transaction={tx}
                     accountMap={accountMap}
                     categoryMap={categoryMap}
+                    placeMap={placeMap}
                     amountColors={amountColors}
                     onSelect={onEditTransaction}
                   />

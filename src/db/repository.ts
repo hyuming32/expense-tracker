@@ -1,5 +1,8 @@
 import { mergeBackup } from '../domain/backup';
 import type { CsvImportPlan } from '../domain/csvImport';
+import { buildRecurringTransactionId, dueOccurrences } from '../domain/recurring';
+import { getTodayDateString } from '../domain/format';
+import { isValidSellerId, normalizePlaceName } from '../domain/places';
 import type { PeriodKind } from '../domain/reports';
 import { db, type ExpenseDatabase, META_KEYS } from './database';
 import { getDeviceId } from './deviceId';
@@ -8,9 +11,14 @@ import type {
   AccountType,
   Category,
   CategoryKind,
+  LotteryDraw,
   MetaEntry,
   NotePreset,
   OutboxEntry,
+  Place,
+  RecurringFrequency,
+  RecurringRule,
+  Shortcut,
   SyncTableName,
   Transaction,
   TransactionKind,
@@ -56,10 +64,12 @@ export interface SaveTransactionInput {
   id?: string;
   kind: TransactionKind;
   date: string;
+  time?: string | null;
   amount: number;
   accountId: string;
   toAccountId: string | null;
   categoryId: string | null;
+  placeId?: string | null;
   note: string | null;
   invoiceNo?: string | null;
 }
@@ -119,6 +129,10 @@ export interface BackupPayload {
   categories: Category[];
   transactions: Transaction[];
   notePresets?: NotePreset[];
+  recurringRules?: RecurringRule[];
+  shortcuts?: Shortcut[];
+  places?: Place[];
+  lotteryDraws?: LotteryDraw[];
   meta?: MetaEntry[];
 }
 
@@ -127,6 +141,10 @@ export interface RestoreSummary {
   categories: number;
   transactions: number;
   notePresets: number;
+  recurringRules: number;
+  shortcuts: number;
+  places: number;
+  lotteryDraws: number;
 }
 
 export interface AmountColors {
@@ -402,7 +420,7 @@ export async function swapNotePresetSortOrder(
 }
 
 /**
- * 儲存或更新一筆交易紀錄，並同步更新最後使用的帳戶與分類設定。
+ * 儲存或更新一筆交易紀錄，並同步更新最後使用的帳戶、分類、地點與使用統計。
  */
 export async function saveTransaction(
   input: SaveTransactionInput,
@@ -413,15 +431,19 @@ export async function saveTransaction(
   const normalizedInvoiceNo = input.invoiceNo?.trim()
     ? input.invoiceNo.trim().toUpperCase()
     : undefined;
+  const normalizedTime = input.time?.trim() ? input.time.trim() : null;
+  const normalizedPlaceId = input.placeId?.trim() ? input.placeId.trim() : null;
 
   const record: Transaction = {
     id: input.id ?? uuidv7(),
     kind: input.kind,
     date: input.date,
+    time: normalizedTime,
     amount: input.amount,
     accountId: input.accountId,
     toAccountId: input.kind === 'transfer' ? input.toAccountId : null,
     categoryId: input.kind === 'transfer' ? null : input.categoryId,
+    placeId: normalizedPlaceId,
     note: input.note?.trim() ? input.note.trim() : null,
     ...(normalizedInvoiceNo ? { invoiceNo: normalizedInvoiceNo } : {}),
     updatedAt: now,
@@ -431,10 +453,13 @@ export async function saveTransaction(
 
   await database.transaction(
     'rw',
-    database.transactions,
-    database.notePresets,
-    database.meta,
-    database.outbox,
+    [
+      database.transactions,
+      database.notePresets,
+      database.places,
+      database.meta,
+      database.outbox,
+    ],
     async () => {
       if (normalizedInvoiceNo) {
         const duplicate = await database.transactions
@@ -454,6 +479,21 @@ export async function saveTransaction(
         await database.meta.put({ key: META_KEYS.LAST_EXPENSE_CATEGORY_ID, value: record.categoryId });
       } else if (record.kind === 'income' && record.categoryId) {
         await database.meta.put({ key: META_KEYS.LAST_INCOME_CATEGORY_ID, value: record.categoryId });
+      }
+
+      if (normalizedPlaceId) {
+        const place = await database.places.get(normalizedPlaceId);
+        if (place && !place.deleted) {
+          await database.places.put({
+            ...place,
+            useCount: place.useCount + 1,
+            lastUsedAt: now,
+            updatedAt: now,
+            deviceId,
+          });
+          await database.outbox.put(createOutboxEntry('places', place.id, now));
+          await database.meta.put({ key: META_KEYS.LAST_PLACE_ID, value: place.id });
+        }
       }
 
       if ((record.kind === 'expense' || record.kind === 'income') && record.note) {
@@ -805,11 +845,25 @@ export async function swapAccountSortOrder(
  * 匯出所有資料表紀錄（包含已軟刪除紀錄）與資料庫版本號。
  */
 export async function exportBackupData(database: ExpenseDatabase = db): Promise<BackupPayload> {
-  const [accounts, categories, transactions, notePresets, meta] = await Promise.all([
+  const [
+    accounts,
+    categories,
+    transactions,
+    notePresets,
+    recurringRules,
+    shortcuts,
+    places,
+    lotteryDraws,
+    meta,
+  ] = await Promise.all([
     database.accounts.toArray(),
     database.categories.toArray(),
     database.transactions.toArray(),
     database.notePresets.toArray(),
+    database.recurringRules.toArray(),
+    database.shortcuts.toArray(),
+    database.places.toArray(),
+    database.lotteryDraws.toArray(),
     database.meta.toArray(),
   ]);
 
@@ -820,6 +874,10 @@ export async function exportBackupData(database: ExpenseDatabase = db): Promise<
     categories,
     transactions,
     notePresets,
+    recurringRules,
+    shortcuts,
+    places,
+    lotteryDraws,
     meta,
   };
 }
@@ -848,6 +906,12 @@ export function parseBackupPayload(raw: unknown): BackupPayload {
     categories: obj.categories as Category[],
     transactions: obj.transactions as Transaction[],
     notePresets: Array.isArray(obj.notePresets) ? (obj.notePresets as NotePreset[]) : [],
+    recurringRules: Array.isArray(obj.recurringRules)
+      ? (obj.recurringRules as RecurringRule[])
+      : [],
+    shortcuts: Array.isArray(obj.shortcuts) ? (obj.shortcuts as Shortcut[]) : [],
+    places: Array.isArray(obj.places) ? (obj.places as Place[]) : [],
+    lotteryDraws: Array.isArray(obj.lotteryDraws) ? (obj.lotteryDraws as LotteryDraw[]) : [],
     meta: Array.isArray(obj.meta) ? (obj.meta as MetaEntry[]) : undefined,
   };
 }
@@ -861,33 +925,63 @@ export async function restoreBackupData(
 ): Promise<RestoreSummary> {
   const now = Date.now();
   const incomingPresets = payload.notePresets ?? [];
+  const incomingRecurringRules = payload.recurringRules ?? [];
+  const incomingShortcuts = payload.shortcuts ?? [];
+  const incomingPlaces = payload.places ?? [];
+  const incomingLotteryDraws = payload.lotteryDraws ?? [];
 
   await database.transaction(
     'rw',
-    database.accounts,
-    database.categories,
-    database.transactions,
-    database.notePresets,
-    database.outbox,
+    [
+      database.accounts,
+      database.categories,
+      database.transactions,
+      database.notePresets,
+      database.recurringRules,
+      database.shortcuts,
+      database.places,
+      database.lotteryDraws,
+      database.outbox,
+    ],
     async () => {
-      const [existingAccounts, existingCategories, existingTransactions, existingPresets] =
-        await Promise.all([
-          database.accounts.toArray(),
-          database.categories.toArray(),
-          database.transactions.toArray(),
-          database.notePresets.toArray(),
-        ]);
+      const [
+        existingAccounts,
+        existingCategories,
+        existingTransactions,
+        existingPresets,
+        existingRecurringRules,
+        existingShortcuts,
+        existingPlaces,
+        existingLotteryDraws,
+      ] = await Promise.all([
+        database.accounts.toArray(),
+        database.categories.toArray(),
+        database.transactions.toArray(),
+        database.notePresets.toArray(),
+        database.recurringRules.toArray(),
+        database.shortcuts.toArray(),
+        database.places.toArray(),
+        database.lotteryDraws.toArray(),
+      ]);
 
       const mergedAccounts = mergeBackup(existingAccounts, payload.accounts);
       const mergedCategories = mergeBackup(existingCategories, payload.categories);
       const mergedTransactions = mergeBackup(existingTransactions, payload.transactions);
       const mergedPresets = mergeBackup(existingPresets, incomingPresets);
+      const mergedRecurringRules = mergeBackup(existingRecurringRules, incomingRecurringRules);
+      const mergedShortcuts = mergeBackup(existingShortcuts, incomingShortcuts);
+      const mergedPlaces = mergeBackup(existingPlaces, incomingPlaces);
+      const mergedLotteryDraws = mergeBackup(existingLotteryDraws, incomingLotteryDraws);
 
       const outboxEntries: OutboxEntry[] = [
         ...payload.accounts.map((item) => createOutboxEntry('accounts', item.id, now)),
         ...payload.categories.map((item) => createOutboxEntry('categories', item.id, now)),
         ...payload.transactions.map((item) => createOutboxEntry('transactions', item.id, now)),
         ...incomingPresets.map((item) => createOutboxEntry('notePresets', item.id, now)),
+        ...incomingRecurringRules.map((item) => createOutboxEntry('recurringRules', item.id, now)),
+        ...incomingShortcuts.map((item) => createOutboxEntry('shortcuts', item.id, now)),
+        ...incomingPlaces.map((item) => createOutboxEntry('places', item.id, now)),
+        ...incomingLotteryDraws.map((item) => createOutboxEntry('lotteryDraws', item.id, now)),
       ];
 
       await Promise.all([
@@ -895,6 +989,10 @@ export async function restoreBackupData(
         database.categories.bulkPut(mergedCategories),
         database.transactions.bulkPut(mergedTransactions),
         database.notePresets.bulkPut(mergedPresets),
+        database.recurringRules.bulkPut(mergedRecurringRules),
+        database.shortcuts.bulkPut(mergedShortcuts),
+        database.places.bulkPut(mergedPlaces),
+        database.lotteryDraws.bulkPut(mergedLotteryDraws),
         outboxEntries.length > 0 ? database.outbox.bulkPut(outboxEntries) : Promise.resolve(),
       ]);
     },
@@ -907,6 +1005,10 @@ export async function restoreBackupData(
     categories: payload.categories.length,
     transactions: payload.transactions.length,
     notePresets: incomingPresets.length,
+    recurringRules: incomingRecurringRules.length,
+    shortcuts: incomingShortcuts.length,
+    places: incomingPlaces.length,
+    lotteryDraws: incomingLotteryDraws.length,
   };
 }
 
@@ -914,10 +1016,11 @@ export interface CsvImportResult {
   importedCount: number;
   createdAccountsCount: number;
   createdCategoriesCount: number;
+  createdPlacesCount: number;
 }
 
 /**
- * 執行 CSV 匯入計畫：建立缺少的帳戶與分類，並寫入交易紀錄與 outbox 以便同步。
+ * 執行 CSV 匯入計畫：建立缺少的帳戶、分類與地點，並寫入交易紀錄與 outbox 以便同步。
  */
 export async function importCsvPlan(
   plan: CsvImportPlan,
@@ -928,6 +1031,7 @@ export async function importCsvPlan(
       importedCount: 0,
       createdAccountsCount: 0,
       createdCategoriesCount: 0,
+      createdPlacesCount: 0,
     };
   }
 
@@ -935,17 +1039,16 @@ export async function importCsvPlan(
   const deviceId = getDeviceId();
   let createdAccountsCount = 0;
   let createdCategoriesCount = 0;
+  let createdPlacesCount = 0;
 
   await database.transaction(
     'rw',
-    database.accounts,
-    database.categories,
-    database.transactions,
-    database.outbox,
+    [database.accounts, database.categories, database.places, database.transactions, database.outbox],
     async () => {
-      const [existingAccounts, existingCategories] = await Promise.all([
+      const [existingAccounts, existingCategories, existingPlaces] = await Promise.all([
         database.accounts.filter((a) => !a.deleted).toArray(),
         database.categories.filter((c) => !c.deleted).toArray(),
+        database.places.filter((p) => !p.deleted).toArray(),
       ]);
 
       const accountByName = new Map(existingAccounts.map((a) => [a.name.trim(), a]));
@@ -1062,6 +1165,35 @@ export async function importCsvPlan(
         createdCategoriesCount += 1;
       }
 
+      const placeByName = new Map(existingPlaces.map((p) => [p.name.trim(), p]));
+      let nextPlaceSortOrder =
+        existingPlaces.reduce((max, item) => Math.max(max, item.sortOrder), 0) + 1;
+      const placesToPut: Place[] = [];
+
+      for (const rawName of plan.newPlaces ?? []) {
+        const name = normalizePlaceName(rawName);
+        if (!name || placeByName.has(name)) {
+          continue;
+        }
+        const record: Place = {
+          id: uuidv7(),
+          name,
+          icon: '📍',
+          useCount: 0,
+          lastUsedAt: 0,
+          sortOrder: nextPlaceSortOrder,
+          archived: false,
+          updatedAt: now,
+          deviceId,
+          deleted: false,
+        };
+        nextPlaceSortOrder += 1;
+        placeByName.set(name, record);
+        placesToPut.push(record);
+        outboxEntries.push(createOutboxEntry('places', record.id, now));
+        createdPlacesCount += 1;
+      }
+
       const transactionsToPut: Transaction[] = [];
 
       for (const item of plan.items) {
@@ -1095,14 +1227,18 @@ export async function importCsvPlan(
           }
         }
 
+        const place = item.placeName ? placeByName.get(item.placeName) : undefined;
+
         const txRecord: Transaction = {
           id: uuidv7(),
           kind: item.kind,
           date: item.date,
+          time: item.time ?? null,
           amount: item.amount,
           accountId: account.id,
           toAccountId,
           categoryId,
+          placeId: place?.id ?? null,
           note: item.note,
           ...(item.invoiceNo ? { invoiceNo: item.invoiceNo } : {}),
           updatedAt: now,
@@ -1117,6 +1253,7 @@ export async function importCsvPlan(
       await Promise.all([
         accountsToPut.length > 0 ? database.accounts.bulkPut(accountsToPut) : Promise.resolve(),
         categoriesToPut.length > 0 ? database.categories.bulkPut(categoriesToPut) : Promise.resolve(),
+        placesToPut.length > 0 ? database.places.bulkPut(placesToPut) : Promise.resolve(),
         database.transactions.bulkPut(transactionsToPut),
         database.outbox.bulkPut(outboxEntries),
       ]);
@@ -1129,5 +1266,1005 @@ export async function importCsvPlan(
     importedCount: plan.items.length,
     createdAccountsCount,
     createdCategoriesCount,
+    createdPlacesCount,
   };
+}
+
+export interface SaveRecurringRuleInput {
+  id?: string;
+  kind: TransactionKind;
+  amount: number;
+  accountId: string;
+  toAccountId: string | null;
+  categoryId: string | null;
+  note: string | null;
+  frequency: RecurringFrequency;
+  dayOfMonth: number;
+  weekday: number;
+  monthOfYear: number;
+  startDate: string;
+  endDate: string | null;
+  paused?: boolean;
+  autoPost: boolean;
+}
+
+export interface PendingRecurringOccurrence {
+  rule: RecurringRule;
+  occurrenceDate: string;
+  transactionId: string;
+}
+
+/**
+ * 新增或更新週期性收支規則（修改規則不影響已產生的歷史交易）。
+ */
+export async function saveRecurringRule(
+  input: SaveRecurringRuleInput,
+  database: ExpenseDatabase = db,
+): Promise<RecurringRule> {
+  const now = Date.now();
+  const deviceId = getDeviceId();
+  const existing = input.id ? await database.recurringRules.get(input.id) : undefined;
+
+  const record: RecurringRule = {
+    id: input.id ?? uuidv7(),
+    kind: input.kind,
+    amount: Math.trunc(input.amount),
+    accountId: input.accountId,
+    toAccountId: input.kind === 'transfer' ? input.toAccountId : null,
+    categoryId: input.kind === 'transfer' ? null : input.categoryId,
+    note: input.note?.trim() ? input.note.trim() : null,
+    frequency: input.frequency,
+    dayOfMonth: Math.max(1, Math.min(31, Math.trunc(input.dayOfMonth))),
+    weekday: ((Math.trunc(input.weekday) % 7) + 7) % 7,
+    monthOfYear: Math.max(1, Math.min(12, Math.trunc(input.monthOfYear))),
+    startDate: input.startDate,
+    endDate: input.endDate?.trim() ? input.endDate.trim() : null,
+    paused: input.paused ?? existing?.paused ?? false,
+    autoPost: input.autoPost,
+    updatedAt: now,
+    deviceId,
+    deleted: false,
+  };
+
+  await database.transaction('rw', database.recurringRules, database.outbox, async () => {
+    await database.recurringRules.put(record);
+    await database.outbox.put(createOutboxEntry('recurringRules', record.id, now));
+  });
+
+  notifyLocalMutation(database);
+  return record;
+}
+
+/**
+ * 暫停或恢復週期性收支規則。
+ */
+export async function pauseRecurringRule(
+  id: string,
+  paused: boolean,
+  database: ExpenseDatabase = db,
+): Promise<void> {
+  const now = Date.now();
+  const deviceId = getDeviceId();
+  let updated = false;
+
+  await database.transaction('rw', database.recurringRules, database.outbox, async () => {
+    const existing = await database.recurringRules.get(id);
+    if (!existing || existing.deleted) {
+      return;
+    }
+    await database.recurringRules.put({
+      ...existing,
+      paused,
+      updatedAt: now,
+      deviceId,
+    });
+    await database.outbox.put(createOutboxEntry('recurringRules', id, now));
+    updated = true;
+  });
+
+  if (updated) {
+    notifyLocalMutation(database);
+  }
+}
+
+/**
+ * 結束週期性收支規則（設定 endDate，之後不再產生新期數）。
+ */
+export async function endRecurringRule(
+  id: string,
+  endDate: string = getTodayDateString(),
+  database: ExpenseDatabase = db,
+): Promise<void> {
+  const now = Date.now();
+  const deviceId = getDeviceId();
+  let updated = false;
+
+  await database.transaction('rw', database.recurringRules, database.outbox, async () => {
+    const existing = await database.recurringRules.get(id);
+    if (!existing || existing.deleted) {
+      return;
+    }
+    await database.recurringRules.put({
+      ...existing,
+      endDate,
+      updatedAt: now,
+      deviceId,
+    });
+    await database.outbox.put(createOutboxEntry('recurringRules', id, now));
+    updated = true;
+  });
+
+  if (updated) {
+    notifyLocalMutation(database);
+  }
+}
+
+/**
+ * 軟刪除週期性收支規則（設定 deleted = true）。
+ */
+export async function softDeleteRecurringRule(
+  id: string,
+  database: ExpenseDatabase = db,
+): Promise<void> {
+  const now = Date.now();
+  const deviceId = getDeviceId();
+  let updated = false;
+
+  await database.transaction('rw', database.recurringRules, database.outbox, async () => {
+    const existing = await database.recurringRules.get(id);
+    if (!existing) {
+      return;
+    }
+    await database.recurringRules.put({
+      ...existing,
+      deleted: true,
+      updatedAt: now,
+      deviceId,
+    });
+    await database.outbox.put(createOutboxEntry('recurringRules', id, now));
+    updated = true;
+  });
+
+  if (updated) {
+    notifyLocalMutation(database);
+  }
+}
+
+function buildTransactionFromRule(
+  rule: RecurringRule,
+  occurrenceDate: string,
+  deleted: boolean,
+  now: number,
+  deviceId: string,
+): Transaction {
+  return {
+    id: buildRecurringTransactionId(rule.id, occurrenceDate),
+    kind: rule.kind,
+    date: occurrenceDate,
+    amount: rule.amount,
+    accountId: rule.accountId,
+    toAccountId: rule.kind === 'transfer' ? rule.toAccountId : null,
+    categoryId: rule.kind === 'transfer' ? null : rule.categoryId,
+    note: rule.note,
+    recurringId: rule.id,
+    occurrenceDate,
+    updatedAt: now,
+    deviceId,
+    deleted,
+  };
+}
+
+/**
+ * 執行所有自動入帳週期規則的到期產生與補產生（使用決定性 id 避免多裝置重複或重建已刪除項目）。
+ */
+export async function processRecurringRules(
+  today: string = getTodayDateString(),
+  database: ExpenseDatabase = db,
+): Promise<Transaction[]> {
+  const now = Date.now();
+  const deviceId = getDeviceId();
+  const createdTransactions: Transaction[] = [];
+
+  await database.transaction(
+    'rw',
+    database.recurringRules,
+    database.transactions,
+    database.outbox,
+    database.meta,
+    async () => {
+      const [allRules, lastCheckedMeta] = await Promise.all([
+        database.recurringRules.toArray(),
+        database.meta.get(META_KEYS.RECURRING_LAST_CHECKED_DATE),
+      ]);
+
+      const lastCheckedDate = lastCheckedMeta?.value ?? null;
+      const activeAutoRules = allRules.filter(
+        (rule) => !rule.deleted && !rule.paused && rule.autoPost,
+      );
+
+      const candidates: Array<{ rule: RecurringRule; occurrenceDate: string; txId: string }> = [];
+
+      for (const rule of activeAutoRules) {
+        const existingRuleTxCount = await database.transactions
+          .where('recurringId')
+          .equals(rule.id)
+          .count();
+        const effectiveLastChecked = existingRuleTxCount > 0 ? lastCheckedDate : null;
+        const dates = dueOccurrences(rule, effectiveLastChecked, today);
+        for (const occurrenceDate of dates) {
+          candidates.push({
+            rule,
+            occurrenceDate,
+            txId: buildRecurringTransactionId(rule.id, occurrenceDate),
+          });
+        }
+      }
+
+      if (candidates.length > 0) {
+        const candidateIds = candidates.map((c) => c.txId);
+        const existingRows = await database.transactions.bulkGet(candidateIds);
+        const existingIdSet = new Set<string>();
+        for (const row of existingRows) {
+          if (row) {
+            existingIdSet.add(row.id);
+          }
+        }
+
+        const outboxEntries: OutboxEntry[] = [];
+        const seenCandidateIds = new Set<string>();
+
+        for (const item of candidates) {
+          if (existingIdSet.has(item.txId) || seenCandidateIds.has(item.txId)) {
+            continue;
+          }
+          seenCandidateIds.add(item.txId);
+          const tx = buildTransactionFromRule(item.rule, item.occurrenceDate, false, now, deviceId);
+          createdTransactions.push(tx);
+          outboxEntries.push(createOutboxEntry('transactions', tx.id, now));
+        }
+
+        if (createdTransactions.length > 0) {
+          await database.transactions.bulkPut(createdTransactions);
+          await database.outbox.bulkPut(outboxEntries);
+        }
+      }
+
+      if (!lastCheckedDate || lastCheckedDate < today) {
+        await database.meta.put({
+          key: META_KEYS.RECURRING_LAST_CHECKED_DATE,
+          value: today,
+        });
+      }
+    },
+  );
+
+  if (createdTransactions.length > 0) {
+    notifyLocalMutation(database);
+  }
+
+  return createdTransactions;
+}
+
+/**
+ * 查詢所有 autoPost=false 且尚未入帳或略過的到期項目，供首頁顯示「待確認」卡片。
+ */
+export async function getPendingRecurringOccurrences(
+  today: string = getTodayDateString(),
+  database: ExpenseDatabase = db,
+): Promise<PendingRecurringOccurrence[]> {
+  const allRules = await database.recurringRules.toArray();
+  const manualRules = allRules.filter((rule) => !rule.deleted && !rule.paused && !rule.autoPost);
+  if (manualRules.length === 0) {
+    return [];
+  }
+
+  const candidates: PendingRecurringOccurrence[] = [];
+  for (const rule of manualRules) {
+    const dates = dueOccurrences(rule, null, today);
+    for (const occurrenceDate of dates) {
+      candidates.push({
+        rule,
+        occurrenceDate,
+        transactionId: buildRecurringTransactionId(rule.id, occurrenceDate),
+      });
+    }
+  }
+
+  if (candidates.length === 0) {
+    return [];
+  }
+
+  const existingRows = await database.transactions.bulkGet(
+    candidates.map((item) => item.transactionId),
+  );
+  const existingIdSet = new Set<string>();
+  for (const row of existingRows) {
+    if (row) {
+      existingIdSet.add(row.id);
+    }
+  }
+
+  return candidates
+    .filter((item) => !existingIdSet.has(item.transactionId))
+    .sort((a, b) => a.occurrenceDate.localeCompare(b.occurrenceDate));
+}
+
+/**
+ * 將待確認週期項目正式入帳（以決定性 id 寫入交易）。
+ */
+export async function confirmRecurringOccurrence(
+  rule: RecurringRule,
+  occurrenceDate: string,
+  database: ExpenseDatabase = db,
+): Promise<Transaction> {
+  const now = Date.now();
+  const deviceId = getDeviceId();
+  const tx = buildTransactionFromRule(rule, occurrenceDate, false, now, deviceId);
+
+  await database.transaction('rw', database.transactions, database.outbox, async () => {
+    const existing = await database.transactions.get(tx.id);
+    if (existing) {
+      return;
+    }
+    await database.transactions.put(tx);
+    await database.outbox.put(createOutboxEntry('transactions', tx.id, now));
+  });
+
+  notifyLocalMutation(database);
+  return tx;
+}
+
+/**
+ * 略過該期待確認週期項目（寫入 deleted=true 的佔位交易，避免重複提示並可同步）。
+ */
+export async function skipRecurringOccurrence(
+  rule: RecurringRule,
+  occurrenceDate: string,
+  database: ExpenseDatabase = db,
+): Promise<Transaction> {
+  const now = Date.now();
+  const deviceId = getDeviceId();
+  const placeholder = buildTransactionFromRule(rule, occurrenceDate, true, now, deviceId);
+
+  await database.transaction('rw', database.transactions, database.outbox, async () => {
+    const existing = await database.transactions.get(placeholder.id);
+    if (existing) {
+      return;
+    }
+    await database.transactions.put(placeholder);
+    await database.outbox.put(createOutboxEntry('transactions', placeholder.id, now));
+  });
+
+  notifyLocalMutation(database);
+  return placeholder;
+}
+
+export interface SaveShortcutInput {
+  id?: string;
+  label: string;
+  icon: string;
+  kind: TransactionKind;
+  amount: number | null;
+  accountId: string;
+  toAccountId: string | null;
+  categoryId: string | null;
+  note: string | null;
+  sortOrder?: number;
+}
+
+/**
+ * 新增或更新首頁捷徑（並寫入 outbox 以供同步）。
+ */
+export async function saveShortcut(
+  input: SaveShortcutInput,
+  database: ExpenseDatabase = db,
+): Promise<Shortcut> {
+  const label = input.label.trim();
+  if (!label) {
+    throw new Error('請輸入捷徑名稱');
+  }
+  if (!input.accountId) {
+    throw new Error('請選擇帳戶');
+  }
+  if (input.kind === 'transfer') {
+    if (!input.toAccountId || input.toAccountId === input.accountId) {
+      throw new Error('請選擇不同的轉入帳戶');
+    }
+  } else if (!input.categoryId) {
+    throw new Error('請選擇分類');
+  }
+
+  let normalizedAmount: number | null = null;
+  if (input.amount !== null) {
+    const rounded = Math.round(input.amount);
+    if (!Number.isFinite(input.amount) || rounded <= 0) {
+      throw new Error('金額需為正整數');
+    }
+    normalizedAmount = rounded;
+  }
+
+  const now = Date.now();
+  const deviceId = getDeviceId();
+  let record!: Shortcut;
+
+  await database.transaction('rw', database.shortcuts, database.outbox, async () => {
+    const existing = input.id ? await database.shortcuts.get(input.id) : undefined;
+    let sortOrder = input.sortOrder ?? existing?.sortOrder;
+    if (sortOrder === undefined) {
+      const allActive = await database.shortcuts.filter((s) => !s.deleted).toArray();
+      sortOrder = allActive.reduce((max, item) => Math.max(max, item.sortOrder), 0) + 1;
+    }
+
+    record = {
+      id: input.id ?? uuidv7(),
+      label,
+      icon: input.icon.trim() || '⚡',
+      kind: input.kind,
+      amount: normalizedAmount,
+      accountId: input.accountId,
+      toAccountId: input.kind === 'transfer' ? input.toAccountId : null,
+      categoryId: input.kind === 'transfer' ? null : input.categoryId,
+      note: input.note?.trim() ? input.note.trim() : null,
+      sortOrder,
+      updatedAt: now,
+      deviceId,
+      deleted: false,
+    };
+
+    await database.shortcuts.put(record);
+    await database.outbox.put(createOutboxEntry('shortcuts', record.id, now));
+  });
+
+  notifyLocalMutation(database);
+  return record;
+}
+
+/**
+ * 軟刪除首頁捷徑（設定 deleted = true）。
+ */
+export async function softDeleteShortcut(
+  id: string,
+  database: ExpenseDatabase = db,
+): Promise<void> {
+  const now = Date.now();
+  const deviceId = getDeviceId();
+  let updated = false;
+
+  await database.transaction('rw', database.shortcuts, database.outbox, async () => {
+    const existing = await database.shortcuts.get(id);
+    if (!existing) {
+      return;
+    }
+    await database.shortcuts.put({
+      ...existing,
+      deleted: true,
+      updatedAt: now,
+      deviceId,
+    });
+    await database.outbox.put(createOutboxEntry('shortcuts', id, now));
+    updated = true;
+  });
+
+  if (updated) {
+    notifyLocalMutation(database);
+  }
+}
+
+/**
+ * 交換兩個首頁捷徑的排序順序。
+ */
+export async function swapShortcutSortOrder(
+  idA: string,
+  idB: string,
+  database: ExpenseDatabase = db,
+): Promise<void> {
+  const now = Date.now();
+  const deviceId = getDeviceId();
+  let updated = false;
+
+  await database.transaction('rw', database.shortcuts, database.outbox, async () => {
+    const [a, b] = await Promise.all([database.shortcuts.get(idA), database.shortcuts.get(idB)]);
+    if (!a || !b) {
+      return;
+    }
+    const orderA = a.sortOrder === b.sortOrder ? a.sortOrder : b.sortOrder;
+    const orderB = a.sortOrder === b.sortOrder ? b.sortOrder + 1 : a.sortOrder;
+
+    await database.shortcuts.bulkPut([
+      { ...a, sortOrder: orderA, updatedAt: now, deviceId },
+      { ...b, sortOrder: orderB, updatedAt: now, deviceId },
+    ]);
+    await database.outbox.bulkPut([
+      createOutboxEntry('shortcuts', a.id, now),
+      createOutboxEntry('shortcuts', b.id, now),
+    ]);
+    updated = true;
+  });
+
+  if (updated) {
+    notifyLocalMutation(database);
+  }
+}
+
+/**
+ * 依捷徑一鍵寫入今日交易紀錄（僅限已設定固定金額的捷徑）。
+ */
+export async function recordShortcutTransaction(
+  shortcut: Shortcut,
+  date: string = getTodayDateString(),
+  database: ExpenseDatabase = db,
+): Promise<Transaction> {
+  if (shortcut.amount === null || shortcut.amount <= 0) {
+    throw new Error('此捷徑未設定固定金額，請先輸入金額');
+  }
+
+  return saveTransaction(
+    {
+      kind: shortcut.kind,
+      date,
+      amount: shortcut.amount,
+      accountId: shortcut.accountId,
+      toAccountId: shortcut.kind === 'transfer' ? shortcut.toAccountId : null,
+      categoryId: shortcut.kind === 'transfer' ? null : shortcut.categoryId,
+      note: shortcut.note,
+    },
+    database,
+  );
+}
+
+export class DuplicatePlaceNameError extends Error {
+  constructor() {
+    super('已存在相同名稱的地點');
+    this.name = 'DuplicatePlaceNameError';
+  }
+}
+
+export class DuplicateSellerIdError extends Error {
+  readonly existingPlace: Place;
+
+  constructor(sellerId: string, existingPlace: Place) {
+    super(`統一編號 ${sellerId} 已綁定至「${existingPlace.name}」`);
+    this.name = 'DuplicateSellerIdError';
+    this.existingPlace = existingPlace;
+  }
+}
+
+export interface SavePlaceInput {
+  id?: string;
+  name: string;
+  icon?: string;
+  sortOrder?: number;
+  archived?: boolean;
+  useCount?: number;
+  lastUsedAt?: number;
+  sellerIds?: string[];
+}
+
+export type SyncSchedule = 'daily' | 'weekly' | 'none';
+
+/**
+ * 讀取本機定時同步頻率設定（預設 daily）。
+ */
+export async function getSyncSchedule(database: ExpenseDatabase = db): Promise<SyncSchedule> {
+  const entry = await database.meta.get(META_KEYS.SYNC_SCHEDULE);
+  if (entry?.value === 'weekly' || entry?.value === 'none' || entry?.value === 'daily') {
+    return entry.value;
+  }
+  return 'daily';
+}
+
+/**
+ * 儲存本機定時同步頻率設定至 meta（不寫入 outbox）。
+ */
+export async function setSyncSchedule(
+  schedule: SyncSchedule,
+  database: ExpenseDatabase = db,
+): Promise<void> {
+  await database.meta.put({
+    key: META_KEYS.SYNC_SCHEDULE,
+    value: schedule,
+  });
+}
+
+/**
+ * 讀取是否啟用「新增記帳時自動帶入上次的地點」本機設定（預設關閉）。
+ */
+export async function getAutoSelectLastPlace(database: ExpenseDatabase = db): Promise<boolean> {
+  const entry = await database.meta.get(META_KEYS.AUTO_SELECT_LAST_PLACE);
+  return entry?.value === 'true';
+}
+
+/**
+ * 儲存「新增記帳時自動帶入上次的地點」設定至本機 meta（不寫入 outbox）。
+ */
+export async function setAutoSelectLastPlace(
+  enabled: boolean,
+  database: ExpenseDatabase = db,
+): Promise<void> {
+  await database.meta.put({
+    key: META_KEYS.AUTO_SELECT_LAST_PLACE,
+    value: enabled ? 'true' : 'false',
+  });
+}
+
+function normalizeSellerIds(sellerIds: readonly string[] | undefined): string[] | undefined {
+  if (sellerIds === undefined) {
+    return undefined;
+  }
+  const seen = new Set<string>();
+  const result: string[] = [];
+  for (const raw of sellerIds) {
+    const trimmed = raw.trim();
+    if (!trimmed) {
+      continue;
+    }
+    if (!isValidSellerId(trimmed)) {
+      throw new Error(`統一編號「${trimmed}」格式不正確，需為 8 位數字`);
+    }
+    if (!seen.has(trimmed)) {
+      seen.add(trimmed);
+      result.push(trimmed);
+    }
+  }
+  return result;
+}
+
+/**
+ * 新增或更新地點（名稱不可重複、最長 30 字，統編不可與其他地點重複）。
+ */
+export async function savePlace(
+  input: SavePlaceInput,
+  database: ExpenseDatabase = db,
+): Promise<Place> {
+  const normalizedName = normalizePlaceName(input.name);
+  if (!normalizedName) {
+    throw new Error('請輸入地點名稱');
+  }
+  const normalizedSellers = normalizeSellerIds(input.sellerIds);
+  const now = Date.now();
+  const deviceId = getDeviceId();
+
+  let record!: Place;
+
+  await database.transaction('rw', database.places, database.outbox, async () => {
+    const allActive = await database.places.filter((p) => !p.deleted).toArray();
+
+    const duplicateName = allActive.find(
+      (p) => p.id !== input.id && p.name.trim() === normalizedName,
+    );
+    if (duplicateName) {
+      throw new DuplicatePlaceNameError();
+    }
+
+    const existing = input.id ? await database.places.get(input.id) : undefined;
+    const effectiveSellerIds = normalizedSellers ?? existing?.sellerIds;
+
+    if (effectiveSellerIds && effectiveSellerIds.length > 0) {
+      for (const sid of effectiveSellerIds) {
+        const conflict = allActive.find(
+          (p) => p.id !== (input.id ?? existing?.id) && (p.sellerIds ?? []).includes(sid),
+        );
+        if (conflict) {
+          throw new DuplicateSellerIdError(sid, conflict);
+        }
+      }
+    }
+
+    let sortOrder = input.sortOrder ?? existing?.sortOrder;
+    if (sortOrder === undefined) {
+      sortOrder = allActive.reduce((max, item) => Math.max(max, item.sortOrder), 0) + 1;
+    }
+
+    record = {
+      id: input.id ?? uuidv7(),
+      name: normalizedName,
+      icon: input.icon?.trim() || existing?.icon || '📍',
+      useCount: input.useCount ?? existing?.useCount ?? 0,
+      lastUsedAt: input.lastUsedAt ?? existing?.lastUsedAt ?? 0,
+      sortOrder,
+      archived: input.archived ?? existing?.archived ?? false,
+      ...(effectiveSellerIds && effectiveSellerIds.length > 0
+        ? { sellerIds: effectiveSellerIds }
+        : {}),
+      updatedAt: now,
+      deviceId,
+      deleted: false,
+    };
+
+    await database.places.put(record);
+    await database.outbox.put(createOutboxEntry('places', record.id, now));
+  });
+
+  notifyLocalMutation(database);
+  return record;
+}
+
+/**
+ * 停用或啟用地點。
+ */
+export async function archivePlace(
+  id: string,
+  archived: boolean,
+  database: ExpenseDatabase = db,
+): Promise<void> {
+  const now = Date.now();
+  const deviceId = getDeviceId();
+  let updated = false;
+
+  await database.transaction('rw', database.places, database.outbox, async () => {
+    const existing = await database.places.get(id);
+    if (!existing) {
+      return;
+    }
+    await database.places.put({
+      ...existing,
+      archived,
+      updatedAt: now,
+      deviceId,
+    });
+    await database.outbox.put(createOutboxEntry('places', id, now));
+    updated = true;
+  });
+
+  if (updated) {
+    notifyLocalMutation(database);
+  }
+}
+
+/**
+ * 軟刪除地點（若已有未刪除交易使用則拒絕刪除，僅可停用）。
+ */
+export async function softDeletePlace(
+  id: string,
+  database: ExpenseDatabase = db,
+): Promise<void> {
+  const now = Date.now();
+  const deviceId = getDeviceId();
+  let updated = false;
+
+  await database.transaction(
+    'rw',
+    database.places,
+    database.transactions,
+    database.outbox,
+    async () => {
+      const existing = await database.places.get(id);
+      if (!existing) {
+        return;
+      }
+
+      const usedTxCount = await database.transactions
+        .filter((tx) => !tx.deleted && tx.placeId === id)
+        .count();
+      if (usedTxCount > 0) {
+        throw new Error('此地點已有交易紀錄使用，僅可停用');
+      }
+
+      await database.places.put({
+        ...existing,
+        deleted: true,
+        updatedAt: now,
+        deviceId,
+      });
+      await database.outbox.put(createOutboxEntry('places', id, now));
+      updated = true;
+    },
+  );
+
+  if (updated) {
+    notifyLocalMutation(database);
+  }
+}
+
+/**
+ * 交換兩個地點的排序順序。
+ */
+export async function swapPlaceSortOrder(
+  idA: string,
+  idB: string,
+  database: ExpenseDatabase = db,
+): Promise<void> {
+  const now = Date.now();
+  const deviceId = getDeviceId();
+  let updated = false;
+
+  await database.transaction('rw', database.places, database.outbox, async () => {
+    const [a, b] = await Promise.all([database.places.get(idA), database.places.get(idB)]);
+    if (!a || !b) {
+      return;
+    }
+    const orderA = a.sortOrder === b.sortOrder ? a.sortOrder : b.sortOrder;
+    const orderB = a.sortOrder === b.sortOrder ? b.sortOrder + 1 : a.sortOrder;
+
+    await database.places.bulkPut([
+      { ...a, sortOrder: orderA, updatedAt: now, deviceId },
+      { ...b, sortOrder: orderB, updatedAt: now, deviceId },
+    ]);
+    await database.outbox.bulkPut([
+      createOutboxEntry('places', a.id, now),
+      createOutboxEntry('places', b.id, now),
+    ]);
+    updated = true;
+  });
+
+  if (updated) {
+    notifyLocalMutation(database);
+  }
+}
+
+/**
+ * 將賣方統一編號綁定（或移轉綁定）至指定地點；一個統編同時只會屬於一個地點。
+ */
+export async function bindSellerIdToPlace(
+  placeId: string,
+  sellerId: string,
+  database: ExpenseDatabase = db,
+): Promise<Place> {
+  const normalizedSellerId = sellerId.trim();
+  if (!isValidSellerId(normalizedSellerId)) {
+    throw new Error('統一編號格式不正確，需為 8 位數字');
+  }
+
+  const now = Date.now();
+  const deviceId = getDeviceId();
+  let updatedTarget!: Place;
+
+  await database.transaction('rw', database.places, database.outbox, async () => {
+    const target = await database.places.get(placeId);
+    if (!target || target.deleted) {
+      throw new Error('找不到指定的地點');
+    }
+
+    const allActive = await database.places.filter((p) => !p.deleted).toArray();
+    const placesToPut: Place[] = [];
+    const outboxEntries: OutboxEntry[] = [];
+
+    for (const place of allActive) {
+      if (place.id === placeId) {
+        continue;
+      }
+      const sellers = place.sellerIds ?? [];
+      if (sellers.includes(normalizedSellerId)) {
+        const nextSellers = sellers.filter((s) => s !== normalizedSellerId);
+        const updatedOther: Place = {
+          ...place,
+          updatedAt: now,
+          deviceId,
+        };
+        if (nextSellers.length > 0) {
+          updatedOther.sellerIds = nextSellers;
+        } else {
+          delete updatedOther.sellerIds;
+        }
+        placesToPut.push(updatedOther);
+        outboxEntries.push(createOutboxEntry('places', place.id, now));
+      }
+    }
+
+    const targetSellers = target.sellerIds ?? [];
+    if (!targetSellers.includes(normalizedSellerId)) {
+      updatedTarget = {
+        ...target,
+        sellerIds: [...targetSellers, normalizedSellerId],
+        updatedAt: now,
+        deviceId,
+      };
+      placesToPut.push(updatedTarget);
+      outboxEntries.push(createOutboxEntry('places', target.id, now));
+    } else {
+      updatedTarget = target;
+    }
+
+    if (placesToPut.length > 0) {
+      await database.places.bulkPut(placesToPut);
+      await database.outbox.bulkPut(outboxEntries);
+    }
+  });
+
+  notifyLocalMutation(database);
+  return updatedTarget;
+}
+
+export interface SaveLotteryDrawInput {
+  period: string;
+  special: string;
+  grand: string;
+  first: readonly string[];
+  extraSixth: readonly string[];
+}
+
+const LOTTERY_PERIOD_PATTERN = /^\d{4}-(01|03|05|07|09|11)$/;
+
+/**
+ * 產生決定性的發票開獎期別識別碼（draw-YYYY-MM），避免雙裝置重複建立。
+ */
+export function buildLotteryDrawId(period: string): string {
+  return `draw-${period}`;
+}
+
+/**
+ * 儲存或更新指定期別的統一發票開獎號碼，並排入 outbox 同步。
+ */
+export async function saveLotteryDraw(
+  input: SaveLotteryDrawInput,
+  database: ExpenseDatabase = db,
+): Promise<LotteryDraw> {
+  const period = input.period.trim();
+  if (!LOTTERY_PERIOD_PATTERN.test(period)) {
+    throw new Error('期別格式不正確，需為單數月起始 YYYY-MM（例如 2026-09）');
+  }
+
+  const special = input.special.trim();
+  const grand = input.grand.trim();
+  const first = input.first.map((n) => n.trim()).filter((n) => n.length > 0);
+  const extraSixth = input.extraSixth.map((n) => n.trim()).filter((n) => n.length > 0);
+
+  if (!/^\d{8}$/.test(special)) {
+    throw new Error('特別獎需為 8 碼數字');
+  }
+  if (!/^\d{8}$/.test(grand)) {
+    throw new Error('特獎需為 8 碼數字');
+  }
+  if (first.length === 0 || first.some((n) => !/^\d{8}$/.test(n))) {
+    throw new Error('頭獎至少需 1 組，且每組需為 8 碼數字');
+  }
+  if (extraSixth.some((n) => !/^\d{3}$/.test(n))) {
+    throw new Error('增開六獎每組需為 3 碼數字');
+  }
+
+  const now = Date.now();
+  const deviceId = getDeviceId();
+  const id = buildLotteryDrawId(period);
+
+  const record: LotteryDraw = {
+    id,
+    period,
+    special,
+    grand,
+    first,
+    extraSixth,
+    updatedAt: now,
+    deviceId,
+    deleted: false,
+  };
+
+  await database.transaction('rw', database.lotteryDraws, database.outbox, async () => {
+    await database.lotteryDraws.put(record);
+    await database.outbox.put(createOutboxEntry('lotteryDraws', id, now));
+  });
+
+  notifyLocalMutation(database);
+  return record;
+}
+
+/**
+ * 軟刪除指定期別的統一發票開獎號碼，並排入 outbox 同步。
+ */
+export async function softDeleteLotteryDraw(
+  periodOrId: string,
+  database: ExpenseDatabase = db,
+): Promise<void> {
+  const id = periodOrId.startsWith('draw-') ? periodOrId : buildLotteryDrawId(periodOrId);
+  const now = Date.now();
+  const deviceId = getDeviceId();
+  let updated = false;
+
+  await database.transaction('rw', database.lotteryDraws, database.outbox, async () => {
+    const existing = await database.lotteryDraws.get(id);
+    if (!existing || existing.deleted) {
+      return;
+    }
+    await database.lotteryDraws.put({
+      ...existing,
+      updatedAt: now,
+      deviceId,
+      deleted: true,
+    });
+    await database.outbox.put(createOutboxEntry('lotteryDraws', id, now));
+    updated = true;
+  });
+
+  if (updated) {
+    notifyLocalMutation(database);
+  }
 }

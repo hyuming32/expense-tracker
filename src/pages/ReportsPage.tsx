@@ -1,4 +1,5 @@
 import { Fragment, useEffect, useMemo, useState } from 'react';
+import { Link } from 'react-router-dom';
 import {
   Bar,
   CartesianGrid,
@@ -14,7 +15,7 @@ import {
   YAxis,
 } from 'recharts';
 import { saveReportPeriodKind, type AmountColors } from '../db/repository';
-import type { Category, Transaction } from '../db/types';
+import type { Category, Place, Transaction } from '../db/types';
 import {
   categoryBreakdownInRange,
   categoryCompare,
@@ -25,6 +26,7 @@ import {
   periodRange,
   periodSummary,
   periodTrend,
+  placeBreakdownInRange,
   sameLastYear,
   shiftPeriod,
   type CompareResult,
@@ -35,6 +37,7 @@ import { useReportPeriodKind } from '../hooks/useExpenseData';
 interface ReportsPageProps {
   transactions: readonly Transaction[];
   categories: readonly Category[];
+  places: readonly Place[];
   amountColors: AmountColors;
 }
 
@@ -119,7 +122,7 @@ function renderCompareLine(
   );
 }
 
-export function ReportsPage({ transactions, categories, amountColors }: ReportsPageProps) {
+export function ReportsPage({ transactions, categories, places, amountColors }: ReportsPageProps) {
   const savedKind = useReportPeriodKind();
   const [periodKind, setPeriodKind] = useState<PeriodKind>(savedKind);
   const [anchor, setAnchor] = useState<string>(getTodayDateString);
@@ -196,6 +199,11 @@ export function ReportsPage({ transactions, categories, amountColors }: ReportsP
     [transactions, categories, currentRange],
   );
 
+  const placeBreakdown = useMemo(
+    () => placeBreakdownInRange(transactions, places, currentRange, 10),
+    [transactions, places, currentRange],
+  );
+
   const totalExpense = useMemo(
     () => breakdown.reduce((sum, item) => sum + item.amount, 0),
     [breakdown],
@@ -241,6 +249,14 @@ export function ReportsPage({ transactions, categories, amountColors }: ReportsP
 
   return (
     <div className="space-y-4 pb-24">
+      <div className="flex items-center justify-end">
+        <Link
+          to="/lottery"
+          className="rounded-xl border border-slate-200 bg-white px-3 py-1.5 text-xs font-medium text-slate-700 hover:bg-slate-50 dark:border-slate-800 dark:bg-slate-900 dark:text-slate-200 dark:hover:bg-slate-800"
+        >
+          🎟️ 發票兌獎
+        </Link>
+      </div>
       {/* 期間模式分段按鈕：月｜季｜年 */}
       <div
         role="tablist"
@@ -412,6 +428,55 @@ export function ReportsPage({ transactions, categories, amountColors }: ReportsP
                 </div>
               ))}
             </div>
+          </div>
+        )}
+      </section>
+
+      {/* 2.5 地點支出排行（前 10 名） */}
+      <section className="rounded-2xl border border-slate-200 bg-white p-4 dark:border-slate-800 dark:bg-slate-900">
+        <div className="mb-3 flex items-center justify-between">
+          <h2 className="text-sm font-semibold text-slate-900 dark:text-slate-100">地點支出排行</h2>
+          <span className="text-xs text-slate-400 dark:text-slate-500">前 10 名・不含轉帳</span>
+        </div>
+
+        {placeBreakdown.length === 0 ? (
+          <div className="py-8 text-center text-sm text-slate-500 dark:text-slate-400">
+            這段期間還沒有支出紀錄
+          </div>
+        ) : (
+          <div className="space-y-2.5">
+            {placeBreakdown.map((item, idx) => (
+              <div key={item.placeId} className="space-y-1">
+                <div className="flex items-center justify-between gap-2 text-sm">
+                  <div className="flex min-w-0 items-center gap-2">
+                    <span className="w-4 shrink-0 text-xs font-semibold tabular-nums text-slate-400">
+                      {idx + 1}
+                    </span>
+                    <span className="shrink-0">{item.icon}</span>
+                    <span className="truncate font-medium text-slate-800 dark:text-slate-200">
+                      {item.name}
+                    </span>
+                  </div>
+                  <div className="shrink-0 text-right tabular-nums">
+                    <span className="font-semibold text-slate-900 dark:text-slate-100">
+                      {formatCurrency(item.amount)}
+                    </span>
+                    <span className="ml-2 text-xs text-slate-500 dark:text-slate-400">
+                      {item.percentage.toFixed(1)}%
+                    </span>
+                  </div>
+                </div>
+                <div className="h-1.5 w-full overflow-hidden rounded-full bg-slate-100 dark:bg-slate-800">
+                  <div
+                    className="h-full rounded-full"
+                    style={{
+                      width: `${Math.min(100, Math.max(2, item.percentage))}%`,
+                      backgroundColor: PIE_COLORS[idx % PIE_COLORS.length],
+                    }}
+                  />
+                </div>
+              </div>
+            ))}
           </div>
         )}
       </section>

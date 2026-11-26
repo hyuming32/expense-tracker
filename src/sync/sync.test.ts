@@ -2,11 +2,20 @@ import 'fake-indexeddb/auto';
 import { afterEach, describe, expect, it } from 'vitest';
 import { ExpenseDatabase, META_KEYS, ensureSeeded } from '../db/database';
 import {
+  bindSellerIdToPlace,
+  getPendingRecurringOccurrences,
+  processRecurringRules,
   saveAccount,
   saveCategory,
+  saveLotteryDraw,
   saveNotePreset,
+  savePlace,
+  saveRecurringRule,
+  saveShortcut,
   saveTransaction,
+  skipRecurringOccurrence,
   softDeleteNotePreset,
+  softDeleteShortcut,
   softDeleteTransaction,
 } from '../db/repository';
 import type { Transaction } from '../db/types';
@@ -376,5 +385,214 @@ describe('syncOnce 雙裝置與快照同步', () => {
     expect((await dbB.notePresets.get(presetA.id))?.deleted).toBe(false);
     expect((await dbB.notePresets.get(presetB.id))?.deleted).toBe(true);
     expect(await dbB.outbox.count()).toBe(0);
+  });
+
+  it('兩台裝置各自依同一週期規則產生交易後同步，因決定性 id 不會重複產生', async () => {
+    const drive = new MemoryDriveStore();
+    const dbA = createTestDb('recurring-sync-a');
+    const dbB = createTestDb('recurring-sync-b');
+
+    const rule = await saveRecurringRule(
+      {
+        kind: 'expense',
+        amount: 12000,
+        accountId: 'seed-acc-bank',
+        toAccountId: null,
+        categoryId: 'seed-cat-housing',
+        note: '房租',
+        frequency: 'monthly',
+        dayOfMonth: 5,
+        weekday: 1,
+        monthOfYear: 1,
+        startDate: '2026-11-01',
+        endDate: null,
+        paused: false,
+        autoPost: true,
+      },
+      dbA,
+    );
+
+    // 先將規則同步給 B
+    await syncOnce({ database: dbA, driveStore: drive, deviceId: 'device-a' });
+    await syncOnce({ database: dbB, driveStore: drive, deviceId: 'device-b' });
+
+    // A 與 B 各自在 2026-11-05 產生當期交易
+    await processRecurringRules('2026-11-05', dbA);
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    await processRecurringRules('2026-11-05', dbB);
+
+    await syncOnce({ database: dbA, driveStore: drive, deviceId: 'device-a' });
+    await syncOnce({ database: dbB, driveStore: drive, deviceId: 'device-b' });
+    await syncOnce({ database: dbA, driveStore: drive, deviceId: 'device-a' });
+
+    const aTxs = await dbA.transactions.filter((t) => !t.deleted).toArray();
+    const bTxs = await dbB.transactions.filter((t) => !t.deleted).toArray();
+
+    expect(aTxs).toHaveLength(1);
+    expect(bTxs).toHaveLength(1);
+    expect(aTxs[0]?.id).toBe(`rec-${rule.id}-2026-11-05`);
+    expect(bTxs[0]?.id).toBe(`rec-${rule.id}-2026-11-05`);
+  });
+
+  it('裝置 A 略過待確認週期項目後同步到裝置 B，B 不會再顯示該期待確認', async () => {
+    const drive = new MemoryDriveStore();
+    const dbA = createTestDb('recurring-skip-a');
+    const dbB = createTestDb('recurring-skip-b');
+
+    const rule = await saveRecurringRule(
+      {
+        kind: 'expense',
+        amount: 500,
+        accountId: 'seed-acc-cash',
+        toAccountId: null,
+        categoryId: 'seed-cat-daily',
+        note: '管理費',
+        frequency: 'monthly',
+        dayOfMonth: 10,
+        weekday: 1,
+        monthOfYear: 1,
+        startDate: '2026-11-01',
+        endDate: null,
+        paused: false,
+        autoPost: false,
+      },
+      dbA,
+    );
+
+    await skipRecurringOccurrence(rule, '2026-11-10', dbA);
+
+    await syncOnce({ database: dbA, driveStore: drive, deviceId: 'device-a' });
+    await syncOnce({ database: dbB, driveStore: drive, deviceId: 'device-b' });
+
+    const pendingOnB = await getPendingRecurringOccurrences('2026-11-26', dbB);
+    expect(pendingOnB).toHaveLength(0);
+  });
+
+  it('首頁捷徑（shortcuts）的新增、更新與軟刪除會在兩裝置同步後完全一致', async () => {
+    const drive = new MemoryDriveStore();
+    const dbA = createTestDb('shortcut-a');
+    const dbB = createTestDb('shortcut-b');
+
+    const s1 = await saveShortcut(
+      {
+        label: '早餐',
+        icon: '🥐',
+        kind: 'expense',
+        amount: 60,
+        accountId: 'seed-acc-cash',
+        toAccountId: null,
+        categoryId: 'seed-cat-food-breakfast',
+        note: null,
+      },
+      dbA,
+    );
+    const s2 = await saveShortcut(
+      {
+        label: '咖啡',
+        icon: '☕',
+        kind: 'expense',
+        amount: null,
+        accountId: 'seed-acc-credit',
+        toAccountId: null,
+        categoryId: 'seed-cat-food-snack',
+        note: '拿鐵',
+      },
+      dbA,
+    );
+
+    await syncOnce({ database: dbA, driveStore: drive, deviceId: 'device-a' });
+    await syncOnce({ database: dbB, driveStore: drive, deviceId: 'device-b' });
+
+    expect((await dbB.shortcuts.get(s1.id))?.amount).toBe(60);
+    expect((await dbB.shortcuts.get(s2.id))?.label).toBe('咖啡');
+
+    await softDeleteShortcut(s2.id, dbB);
+    await syncOnce({ database: dbB, driveStore: drive, deviceId: 'device-b' });
+    await syncOnce({ database: dbA, driveStore: drive, deviceId: 'device-a' });
+
+    expect((await dbA.shortcuts.get(s2.id))?.deleted).toBe(true);
+    expect((await dbA.shortcuts.get(s1.id))?.deleted).toBe(false);
+  });
+
+  it('地點清單與統編綁定／移轉會在兩裝置同步後完全一致', async () => {
+    const drive = new MemoryDriveStore();
+    const dbA = createTestDb('place-a');
+    const dbB = createTestDb('place-b');
+
+    const p1 = await savePlace({ name: '公司附近', sellerIds: ['12345678'] }, dbA);
+    const p2 = await savePlace({ name: '住家巷口', icon: '🏠' }, dbA);
+
+    await saveTransaction(
+      {
+        kind: 'expense',
+        date: '2026-11-26',
+        time: '12:30',
+        amount: 150,
+        accountId: 'seed-acc-cash',
+        toAccountId: null,
+        categoryId: 'seed-cat-food-lunch',
+        placeId: p1.id,
+        note: '午餐',
+      },
+      dbA,
+    );
+
+    await syncOnce({ database: dbA, driveStore: drive, deviceId: 'device-a' });
+    await syncOnce({ database: dbB, driveStore: drive, deviceId: 'device-b' });
+
+    const bP1 = await dbB.places.get(p1.id);
+    const bP2 = await dbB.places.get(p2.id);
+    expect(bP1?.name).toBe('公司附近');
+    expect(bP1?.useCount).toBe(1);
+    expect(bP1?.sellerIds).toEqual(['12345678']);
+    expect(bP2?.name).toBe('住家巷口');
+
+    // 裝置 B 將統編移轉綁定至 p2，同步回裝置 A 後兩邊一致
+    await bindSellerIdToPlace(p2.id, '12345678', dbB);
+    await syncOnce({ database: dbB, driveStore: drive, deviceId: 'device-b' });
+    await syncOnce({ database: dbA, driveStore: drive, deviceId: 'device-a' });
+
+    expect((await dbA.places.get(p1.id))?.sellerIds ?? []).toEqual([]);
+    expect((await dbA.places.get(p2.id))?.sellerIds).toEqual(['12345678']);
+  });
+
+  it('兩台裝置輸入同一期 lotteryDraws 會以固定 id 互相覆蓋而非重複', async () => {
+    const drive = new MemoryDriveStore();
+    const dbA = createTestDb('lottery-a');
+    const dbB = createTestDb('lottery-b');
+
+    await saveLotteryDraw(
+      {
+        period: '2026-09',
+        special: '11111111',
+        grand: '22222222',
+        first: ['33333333', '44444444', '55555555'],
+        extraSixth: [],
+      },
+      dbA,
+    );
+    await syncOnce({ database: dbA, driveStore: drive, deviceId: 'device-a' });
+    await syncOnce({ database: dbB, driveStore: drive, deviceId: 'device-b' });
+
+    expect((await dbB.lotteryDraws.get('draw-2026-09'))?.special).toBe('11111111');
+
+    // 裝置 B 修改同一期並同步回 A
+    await saveLotteryDraw(
+      {
+        period: '2026-09',
+        special: '99999999',
+        grand: '22222222',
+        first: ['33333333', '44444444', '55555555'],
+        extraSixth: ['777'],
+      },
+      dbB,
+    );
+    await syncOnce({ database: dbB, driveStore: drive, deviceId: 'device-b' });
+    await syncOnce({ database: dbA, driveStore: drive, deviceId: 'device-a' });
+
+    expect(await dbA.lotteryDraws.count()).toBe(1);
+    const drawOnA = await dbA.lotteryDraws.get('draw-2026-09');
+    expect(drawOnA?.special).toBe('99999999');
+    expect(drawOnA?.extraSixth).toEqual(['777']);
   });
 });

@@ -4,22 +4,43 @@ import { describe, expect, it } from 'vitest';
 import { planCsvImport } from '../domain/csvImport';
 import { ExpenseDatabase, META_KEYS, ensureSeeded } from './database';
 import {
+  archivePlace,
+  bindSellerIdToPlace,
+  confirmRecurringOccurrence,
   DEFAULT_AMOUNT_COLORS,
   DuplicateInvoiceError,
   DuplicateNotePresetError,
+  DuplicatePlaceNameError,
+  DuplicateSellerIdError,
   exportBackupData,
   getAmountColors,
   getAutoAddNotePresets,
+  getAutoSelectLastPlace,
+  getPendingRecurringOccurrences,
   importCsvPlan,
+  parseBackupPayload,
+  processRecurringRules,
+  recordShortcutTransaction,
   resetAmountColors,
   restoreBackupData,
   saveAmountColors,
+  saveLotteryDraw,
   saveNotePreset,
+  savePlace,
+  saveRecurringRule,
+  saveShortcut,
   saveTransaction,
   setAutoAddNotePresets,
+  setAutoSelectLastPlace,
+  skipRecurringOccurrence,
+  softDeleteLotteryDraw,
   softDeleteNotePreset,
+  softDeletePlace,
+  softDeleteShortcut,
   softDeleteTransaction,
   swapNotePresetSortOrder,
+  swapPlaceSortOrder,
+  swapShortcutSortOrder,
 } from './repository';
 
 describe('ensureSeeded', () => {
@@ -100,7 +121,7 @@ describe('JSON 備份匯出與還原', () => {
     ]);
 
     const backup = await exportBackupData(sourceDb);
-    expect(backup.schemaVersion).toBe(5);
+    expect(backup.schemaVersion).toBe(9);
     expect(backup.transactions).toHaveLength(2);
     expect(backup.transactions.some((t) => t.id === 'tx-deleted' && t.deleted)).toBe(true);
     expect(backup.transactions.find((t) => t.id === 'tx-active')?.invoiceNo).toBe('AB12345678');
@@ -630,7 +651,7 @@ describe('常用備註與自動學習（v5）', () => {
     await softDeleteNotePreset(deletedPreset.id, srcDb);
 
     const backup = await exportBackupData(srcDb);
-    expect(backup.schemaVersion).toBe(5);
+    expect(backup.schemaVersion).toBe(9);
     expect(backup.notePresets).toHaveLength(2);
 
     const dstDb = new ExpenseDatabase(`test-notepreset-backup-dst-${Date.now()}`);
@@ -708,6 +729,7 @@ describe('CSV 匯入寫入資料庫與 outbox', () => {
       importedCount: 2,
       createdAccountsCount: 1,
       createdCategoriesCount: 2,
+      createdPlacesCount: 0,
     });
 
     const allAccounts = await testDb.accounts.toArray();
@@ -742,5 +764,545 @@ describe('CSV 匯入寫入資料庫與 outbox', () => {
     expect(outbox.filter((o) => o.table === 'transactions')).toHaveLength(2);
 
     await testDb.delete();
+  });
+});
+
+describe('週期性收支資料庫邏輯（v6）', () => {
+  it('刪除某期自動產生的交易後，再次執行 processRecurringRules 不會重新產生', async () => {
+    const testDb = new ExpenseDatabase(`test-recurring-delete-${Date.now()}`);
+    await ensureSeeded(testDb);
+
+    const rule = await saveRecurringRule(
+      {
+        kind: 'expense',
+        amount: 15000,
+        accountId: 'seed-acc-bank',
+        toAccountId: null,
+        categoryId: 'seed-cat-housing',
+        note: '房租',
+        frequency: 'monthly',
+        dayOfMonth: 5,
+        weekday: 1,
+        monthOfYear: 1,
+        startDate: '2026-10-01',
+        endDate: null,
+        paused: false,
+        autoPost: true,
+      },
+      testDb,
+    );
+
+    await processRecurringRules('2026-11-26', testDb);
+    const octTxId = `rec-${rule.id}-2026-10-05`;
+    const novTxId = `rec-${rule.id}-2026-11-05`;
+    expect(await testDb.transactions.get(octTxId)).toBeDefined();
+    expect(await testDb.transactions.get(novTxId)).toBeDefined();
+
+    // 使用者刪除 10 月那一期
+    await softDeleteTransaction(octTxId, testDb);
+    expect((await testDb.transactions.get(octTxId))?.deleted).toBe(true);
+
+    // 再次執行檢查（即使跨日）也不應重建已被軟刪除的 10 月那期
+    const createdAgain = await processRecurringRules('2026-11-27', testDb);
+    expect(createdAgain).toHaveLength(0);
+    expect((await testDb.transactions.get(octTxId))?.deleted).toBe(true);
+
+    await testDb.delete();
+  });
+
+  it('autoPost=false 的到期項目可入帳或略過，略過後不再出現於待確認清單', async () => {
+    const testDb = new ExpenseDatabase(`test-recurring-manual-${Date.now()}`);
+    await ensureSeeded(testDb);
+
+    const rule = await saveRecurringRule(
+      {
+        kind: 'income',
+        amount: 60000,
+        accountId: 'seed-acc-bank',
+        toAccountId: null,
+        categoryId: 'seed-cat-income-salary',
+        note: '薪資',
+        frequency: 'monthly',
+        dayOfMonth: 10,
+        weekday: 1,
+        monthOfYear: 1,
+        startDate: '2026-10-01',
+        endDate: null,
+        paused: false,
+        autoPost: false,
+      },
+      testDb,
+    );
+
+    const pending1 = await getPendingRecurringOccurrences('2026-11-26', testDb);
+    expect(pending1.map((p) => p.occurrenceDate)).toEqual(['2026-10-10', '2026-11-10']);
+
+    // 入帳 10 月、略過 11 月
+    await confirmRecurringOccurrence(rule, '2026-10-10', testDb);
+    await skipRecurringOccurrence(rule, '2026-11-10', testDb);
+
+    const pending2 = await getPendingRecurringOccurrences('2026-11-26', testDb);
+    expect(pending2).toHaveLength(0);
+
+    const octTx = await testDb.transactions.get(`rec-${rule.id}-2026-10-10`);
+    const novTx = await testDb.transactions.get(`rec-${rule.id}-2026-11-10`);
+    expect(octTx?.deleted).toBe(false);
+    expect(octTx?.amount).toBe(60000);
+    expect(novTx?.deleted).toBe(true);
+
+    await testDb.delete();
+  });
+
+  it('修改規則金額不會更改已產生的既有交易，只影響之後的期數', async () => {
+    const testDb = new ExpenseDatabase(`test-recurring-edit-${Date.now()}`);
+    await ensureSeeded(testDb);
+
+    const rule = await saveRecurringRule(
+      {
+        kind: 'expense',
+        amount: 390,
+        accountId: 'seed-acc-credit',
+        toAccountId: null,
+        categoryId: 'seed-cat-entertainment',
+        note: '串流訂閱',
+        frequency: 'monthly',
+        dayOfMonth: 15,
+        weekday: 1,
+        monthOfYear: 1,
+        startDate: '2026-10-01',
+        endDate: null,
+        paused: false,
+        autoPost: true,
+      },
+      testDb,
+    );
+
+    await processRecurringRules('2026-10-20', testDb);
+    const octTxId = `rec-${rule.id}-2026-10-15`;
+    expect((await testDb.transactions.get(octTxId))?.amount).toBe(390);
+
+    // 漲價為 450
+    await saveRecurringRule(
+      {
+        id: rule.id,
+        kind: 'expense',
+        amount: 450,
+        accountId: 'seed-acc-credit',
+        toAccountId: null,
+        categoryId: 'seed-cat-entertainment',
+        note: '串流訂閱',
+        frequency: 'monthly',
+        dayOfMonth: 15,
+        weekday: 1,
+        monthOfYear: 1,
+        startDate: '2026-10-01',
+        endDate: null,
+        paused: false,
+        autoPost: true,
+      },
+      testDb,
+    );
+
+    await processRecurringRules('2026-11-20', testDb);
+    expect((await testDb.transactions.get(octTxId))?.amount).toBe(390);
+    expect((await testDb.transactions.get(`rec-${rule.id}-2026-11-15`))?.amount).toBe(450);
+
+    await testDb.delete();
+  });
+
+  it('JSON 備份含 recurringRules 且還原正確，舊資料庫（v5）升級至 v6 不影響既有資料', async () => {
+    const dbName = `test-migrate-v5-to-v6-${Date.now()}`;
+    const v5Db = new Dexie(dbName);
+    v5Db.version(5).stores({
+      accounts: 'id, updatedAt, deleted, sortOrder',
+      categories: 'id, kind, parentId, updatedAt, deleted, sortOrder',
+      transactions: 'id, kind, date, accountId, toAccountId, categoryId, invoiceNo, updatedAt, deleted',
+      notePresets: 'id, categoryId, useCount, lastUsedAt, sortOrder, updatedAt, deleted',
+      meta: 'key',
+      outbox: 'key, table, recordId, updatedAt',
+    });
+
+    await v5Db.table('transactions').add({
+      id: 'tx-v5-keep',
+      kind: 'expense',
+      date: '2026-11-10',
+      amount: 250,
+      accountId: 'seed-acc-cash',
+      toAccountId: null,
+      categoryId: 'seed-cat-food',
+      note: 'v5 既有交易',
+      updatedAt: 2000,
+      deviceId: 'dev-v5',
+      deleted: false,
+    });
+    v5Db.close();
+
+    const v6Db = new ExpenseDatabase(dbName);
+    await ensureSeeded(v6Db);
+    expect((await v6Db.transactions.get('tx-v5-keep'))?.amount).toBe(250);
+
+    const rule = await saveRecurringRule(
+      {
+        kind: 'expense',
+        amount: 1200,
+        accountId: 'seed-acc-bank',
+        toAccountId: null,
+        categoryId: 'seed-cat-daily',
+        note: '電信費',
+        frequency: 'monthly',
+        dayOfMonth: 20,
+        weekday: 1,
+        monthOfYear: 1,
+        startDate: '2026-11-01',
+        endDate: null,
+        paused: false,
+        autoPost: true,
+      },
+      v6Db,
+    );
+
+    const backup = await exportBackupData(v6Db);
+    expect(backup.recurringRules).toHaveLength(1);
+    const parsed = parseBackupPayload(JSON.parse(JSON.stringify(backup)));
+
+    const restoreDb = new ExpenseDatabase(`test-restore-v6-${Date.now()}`);
+    await ensureSeeded(restoreDb);
+    const summary = await restoreBackupData(parsed, restoreDb);
+    expect(summary.recurringRules).toBe(1);
+    expect((await restoreDb.recurringRules.get(rule.id))?.note).toBe('電信費');
+
+    await v6Db.delete();
+    await restoreDb.delete();
+  });
+});
+
+describe('首頁捷徑資料庫邏輯（v7）', () => {
+  it('有金額的捷徑一鍵記帳會寫入正確欄位與 outbox，復原時會軟刪除該筆交易', async () => {
+    const testDb = new ExpenseDatabase(`test-shortcut-one-tap-${Date.now()}`);
+    await ensureSeeded(testDb);
+
+    const shortcut = await saveShortcut(
+      {
+        label: '早餐',
+        icon: '🥐',
+        kind: 'expense',
+        amount: 60,
+        accountId: 'seed-acc-cash',
+        toAccountId: null,
+        categoryId: 'seed-cat-food-breakfast',
+        note: '蛋餅紅茶',
+      },
+      testDb,
+    );
+
+    const tx = await recordShortcutTransaction(shortcut, '2026-11-26', testDb);
+    expect(tx.kind).toBe('expense');
+    expect(tx.amount).toBe(60);
+    expect(tx.date).toBe('2026-11-26');
+    expect(tx.accountId).toBe('seed-acc-cash');
+    expect(tx.categoryId).toBe('seed-cat-food-breakfast');
+    expect(tx.note).toBe('蛋餅紅茶');
+
+    const txOutbox = await testDb.outbox.get(`transactions:${tx.id}`);
+    expect(txOutbox).toBeDefined();
+    expect(txOutbox?.table).toBe('transactions');
+
+    // 復原（軟刪除）
+    await softDeleteTransaction(tx.id, testDb);
+    const deletedTx = await testDb.transactions.get(tx.id);
+    expect(deletedTx?.deleted).toBe(true);
+
+    await testDb.delete();
+  });
+
+  it('無金額捷徑不可直接寫入交易', async () => {
+    const testDb = new ExpenseDatabase(`test-shortcut-no-amount-${Date.now()}`);
+    await ensureSeeded(testDb);
+
+    const shortcut = await saveShortcut(
+      {
+        label: '午餐',
+        icon: '🍱',
+        kind: 'expense',
+        amount: null,
+        accountId: 'seed-acc-cash',
+        toAccountId: null,
+        categoryId: 'seed-cat-food-lunch',
+        note: null,
+      },
+      testDb,
+    );
+
+    await expect(recordShortcutTransaction(shortcut, '2026-11-26', testDb)).rejects.toThrow();
+    expect(await testDb.transactions.count()).toBe(0);
+
+    await testDb.delete();
+  });
+
+  it('捷徑排序交換、軟刪除、JSON 備份還原與 v6 升級至 v7 保留既有資料', async () => {
+    const dbName = `test-migrate-v6-to-v7-${Date.now()}`;
+    const v6Db = new Dexie(dbName);
+    v6Db.version(6).stores({
+      accounts: 'id, updatedAt, deleted, sortOrder',
+      categories: 'id, kind, parentId, updatedAt, deleted, sortOrder',
+      transactions:
+        'id, kind, date, accountId, toAccountId, categoryId, invoiceNo, recurringId, occurrenceDate, updatedAt, deleted',
+      notePresets: 'id, categoryId, useCount, lastUsedAt, sortOrder, updatedAt, deleted',
+      recurringRules: 'id, frequency, paused, startDate, endDate, updatedAt, deleted',
+      meta: 'key',
+      outbox: 'key, table, recordId, updatedAt',
+    });
+
+    await v6Db.table('transactions').add({
+      id: 'tx-v6-keep',
+      kind: 'expense',
+      date: '2026-11-15',
+      amount: 180,
+      accountId: 'seed-acc-cash',
+      toAccountId: null,
+      categoryId: 'seed-cat-food',
+      note: 'v6 既有交易',
+      updatedAt: 2000,
+      deviceId: 'dev-v6',
+      deleted: false,
+    });
+    v6Db.close();
+
+    const v7Db = new ExpenseDatabase(dbName);
+    await ensureSeeded(v7Db);
+    expect((await v7Db.transactions.get('tx-v6-keep'))?.amount).toBe(180);
+
+    const s1 = await saveShortcut(
+      {
+        label: '捷運',
+        icon: '🚇',
+        kind: 'expense',
+        amount: 25,
+        accountId: 'seed-acc-cash',
+        toAccountId: null,
+        categoryId: 'seed-cat-transport',
+        note: null,
+      },
+      v7Db,
+    );
+    const s2 = await saveShortcut(
+      {
+        label: '咖啡',
+        icon: '☕',
+        kind: 'expense',
+        amount: null,
+        accountId: 'seed-acc-credit',
+        toAccountId: null,
+        categoryId: 'seed-cat-food-snack',
+        note: '美式',
+      },
+      v7Db,
+    );
+
+    await swapShortcutSortOrder(s1.id, s2.id, v7Db);
+    const sorted = await v7Db.shortcuts.orderBy('sortOrder').toArray();
+    expect(sorted.map((s) => s.id)).toEqual([s2.id, s1.id]);
+
+    await softDeleteShortcut(s2.id, v7Db);
+
+    const backup = await exportBackupData(v7Db);
+    expect(backup.shortcuts).toHaveLength(2);
+    const parsed = parseBackupPayload(JSON.parse(JSON.stringify(backup)));
+
+    const restoreDb = new ExpenseDatabase(`test-restore-v7-${Date.now()}`);
+    await ensureSeeded(restoreDb);
+    const summary = await restoreBackupData(parsed, restoreDb);
+    expect(summary.shortcuts).toBe(2);
+    expect((await restoreDb.shortcuts.get(s1.id))?.label).toBe('捷運');
+    expect((await restoreDb.shortcuts.get(s2.id))?.deleted).toBe(true);
+
+    await v7Db.delete();
+    await restoreDb.delete();
+  });
+});
+
+describe('地點與時間資料庫邏輯（v8）', () => {
+  it('同名地點不可重複，已使用地點不可刪除只能停用，儲存交易累加 useCount 並更新 lastUsedAt', async () => {
+    const testDb = new ExpenseDatabase(`test-place-crud-${Date.now()}`);
+    await ensureSeeded(testDb);
+
+    // 預設不建立任何地點
+    expect(await testDb.places.count()).toBe(0);
+
+    const p1 = await savePlace({ name: '公司附近' }, testDb);
+    expect(p1.icon).toBe('📍');
+    expect(p1.useCount).toBe(0);
+
+    await expect(savePlace({ name: '  公司附近  ' }, testDb)).rejects.toBeInstanceOf(
+      DuplicatePlaceNameError,
+    );
+
+    const p2 = await savePlace({ name: '住家巷口', icon: '🏠' }, testDb);
+    await swapPlaceSortOrder(p1.id, p2.id, testDb);
+    const sorted = await testDb.places.orderBy('sortOrder').toArray();
+    expect(sorted.map((p) => p.id)).toEqual([p2.id, p1.id]);
+
+    // 儲存交易選取 p1，useCount + 1 且更新 lastUsedAt
+    await saveTransaction(
+      {
+        kind: 'expense',
+        date: '2026-11-26',
+        time: '12:30',
+        amount: 120,
+        accountId: 'seed-acc-cash',
+        toAccountId: null,
+        categoryId: 'seed-cat-food-lunch',
+        placeId: p1.id,
+        note: '便當',
+      },
+      testDb,
+    );
+
+    const updatedP1 = await testDb.places.get(p1.id);
+    expect(updatedP1?.useCount).toBe(1);
+    expect(updatedP1?.lastUsedAt).toBeGreaterThan(0);
+
+    // 已使用地點不可刪除，只能停用
+    await expect(softDeletePlace(p1.id, testDb)).rejects.toThrow();
+    await archivePlace(p1.id, true, testDb);
+    expect((await testDb.places.get(p1.id))?.archived).toBe(true);
+
+    // 未被交易使用的地點可刪除
+    await softDeletePlace(p2.id, testDb);
+    expect((await testDb.places.get(p2.id))?.deleted).toBe(true);
+
+    // 本機設定 autoSelectLastPlace 預設關閉
+    expect(await getAutoSelectLastPlace(testDb)).toBe(false);
+    await setAutoSelectLastPlace(true, testDb);
+    expect(await getAutoSelectLastPlace(testDb)).toBe(true);
+
+    await testDb.delete();
+  });
+
+  it('賣方統編首次綁定、不可同時綁兩個地點、改選後移轉綁定', async () => {
+    const testDb = new ExpenseDatabase(`test-place-seller-${Date.now()}`);
+    await ensureSeeded(testDb);
+
+    const p1 = await savePlace({ name: '7-11 門市' }, testDb);
+    const p2 = await savePlace({ name: '全家門市' }, testDb);
+
+    await bindSellerIdToPlace(p1.id, '12345678', testDb);
+    expect((await testDb.places.get(p1.id))?.sellerIds).toEqual(['12345678']);
+
+    // savePlace 不可將同一統編綁定到另一個地點
+    await expect(
+      savePlace({ id: p2.id, name: '全家門市', sellerIds: ['12345678'] }, testDb),
+    ).rejects.toBeInstanceOf(DuplicateSellerIdError);
+
+    // bindSellerIdToPlace 移轉綁定至 p2，並從 p1 移除
+    await bindSellerIdToPlace(p2.id, '12345678', testDb);
+    expect((await testDb.places.get(p1.id))?.sellerIds ?? []).toEqual([]);
+    expect((await testDb.places.get(p2.id))?.sellerIds).toEqual(['12345678']);
+
+    await testDb.delete();
+  });
+
+  it('JSON 備份還原含 places，且 v7 升級至 v8 保留既有交易（time 與 placeId 為空）', async () => {
+    const dbName = `test-migrate-v7-to-v8-${Date.now()}`;
+    const v7Db = new Dexie(dbName);
+    v7Db.version(7).stores({
+      accounts: 'id, updatedAt, deleted, sortOrder',
+      categories: 'id, kind, parentId, updatedAt, deleted, sortOrder',
+      transactions:
+        'id, kind, date, accountId, toAccountId, categoryId, invoiceNo, recurringId, occurrenceDate, updatedAt, deleted',
+      notePresets: 'id, categoryId, useCount, lastUsedAt, sortOrder, updatedAt, deleted',
+      recurringRules: 'id, frequency, paused, startDate, endDate, updatedAt, deleted',
+      shortcuts: 'id, sortOrder, updatedAt, deleted',
+      meta: 'key',
+      outbox: 'key, table, recordId, updatedAt',
+    });
+
+    await v7Db.table('transactions').add({
+      id: 'tx-v7-keep',
+      kind: 'expense',
+      date: '2026-11-20',
+      amount: 250,
+      accountId: 'seed-acc-cash',
+      toAccountId: null,
+      categoryId: 'seed-cat-food',
+      note: 'v7 既有交易',
+      updatedAt: 3000,
+      deviceId: 'dev-v7',
+      deleted: false,
+    });
+    v7Db.close();
+
+    const v8Db = new ExpenseDatabase(dbName);
+    await ensureSeeded(v8Db);
+    const oldTx = await v8Db.transactions.get('tx-v7-keep');
+    expect(oldTx?.amount).toBe(250);
+    expect(oldTx?.time).toBeUndefined();
+    expect(oldTx?.placeId).toBeUndefined();
+
+    const place = await savePlace({ name: '公館夜市', icon: '🏮', sellerIds: ['87654321'] }, v8Db);
+    const backup = await exportBackupData(v8Db);
+    expect(backup.schemaVersion).toBe(9);
+    expect(backup.places).toHaveLength(1);
+
+    const parsed = parseBackupPayload(JSON.parse(JSON.stringify(backup)));
+    const restoreDb = new ExpenseDatabase(`test-restore-v8-${Date.now()}`);
+    await ensureSeeded(restoreDb);
+    const summary = await restoreBackupData(parsed, restoreDb);
+    expect(summary.places).toBe(1);
+    const restoredPlace = await restoreDb.places.get(place.id);
+    expect(restoredPlace?.name).toBe('公館夜市');
+    expect(restoredPlace?.sellerIds).toEqual(['87654321']);
+
+    await v8Db.delete();
+    await restoreDb.delete();
+  });
+});
+
+describe('發票開獎號碼資料庫邏輯（v9）', () => {
+  it('saveLotteryDraw 使用固定 id draw-YYYY-MM 覆寫同期資料並寫入 outbox，且備份還原支援 lotteryDraws', async () => {
+    const testDb = new ExpenseDatabase(`test-lottery-v9-${Date.now()}`);
+    await ensureSeeded(testDb);
+
+    const saved = await saveLotteryDraw(
+      {
+        period: '2026-09',
+        special: '12345678',
+        grand: '87654321',
+        first: ['11111111', '22222222', '33333333'],
+        extraSixth: ['999'],
+      },
+      testDb,
+    );
+    expect(saved.id).toBe('draw-2026-09');
+    expect((await testDb.outbox.get('lotteryDraws:draw-2026-09'))?.recordId).toBe('draw-2026-09');
+
+    await saveLotteryDraw(
+      {
+        period: '2026-09',
+        special: '00000001',
+        grand: '87654321',
+        first: ['11111111', '22222222', '33333333'],
+        extraSixth: [],
+      },
+      testDb,
+    );
+    expect(await testDb.lotteryDraws.count()).toBe(1);
+    expect((await testDb.lotteryDraws.get('draw-2026-09'))?.special).toBe('00000001');
+
+    const backup = await exportBackupData(testDb);
+    expect(backup.lotteryDraws).toHaveLength(1);
+
+    const parsed = parseBackupPayload(JSON.parse(JSON.stringify(backup)));
+    const restoreDb = new ExpenseDatabase(`test-lottery-restore-${Date.now()}`);
+    await ensureSeeded(restoreDb);
+    const summary = await restoreBackupData(parsed, restoreDb);
+    expect(summary.lotteryDraws).toBe(1);
+    expect((await restoreDb.lotteryDraws.get('draw-2026-09'))?.special).toBe('00000001');
+
+    await softDeleteLotteryDraw('2026-09', testDb);
+    expect((await testDb.lotteryDraws.get('draw-2026-09'))?.deleted).toBe(true);
+
+    await testDb.delete();
+    await restoreDb.delete();
   });
 });

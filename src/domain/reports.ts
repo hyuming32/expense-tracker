@@ -1,4 +1,4 @@
-import type { Category, Transaction } from '../db/types';
+import type { Category, Place, Transaction } from '../db/types';
 import { shiftMonth } from './format';
 
 export type PeriodKind = 'month' | 'quarter' | 'year';
@@ -59,6 +59,14 @@ export interface PeriodTrendItem {
 
 export interface CategoryBreakdownItem {
   categoryId: string;
+  name: string;
+  icon: string;
+  amount: number;
+  percentage: number;
+}
+
+export interface PlaceBreakdownItem {
+  placeId: string;
   name: string;
   icon: string;
   amount: number;
@@ -297,6 +305,59 @@ export function categoryBreakdown(
 ): CategoryBreakdownItem[] {
   const range = periodRange('month', `${month}-01`);
   return categoryBreakdownInRange(transactions, categories, range);
+}
+
+/**
+ * 依地點彙總指定期間的支出（排除轉帳與已刪除）。
+ * 有指定地點的項目依金額由大到小取前 limit 名（預設 10 名）；
+ * 「未指定地點」若存在則固定排在所有有指定地點的項目之後，且不佔前 limit 名名額。
+ */
+export function placeBreakdownInRange(
+  transactions: readonly Transaction[],
+  places: readonly Place[],
+  range: Pick<PeriodRange, 'start' | 'end'>,
+  limit = 10,
+): PlaceBreakdownItem[] {
+  const placeMap = new Map(places.map((p) => [p.id, p]));
+  const totals = new Map<string, { placeId: string; name: string; icon: string; amount: number }>();
+  let totalExpense = 0;
+
+  for (const tx of transactions) {
+    if (
+      tx.deleted ||
+      tx.kind !== 'expense' ||
+      tx.date < range.start ||
+      tx.date > range.end
+    ) {
+      continue;
+    }
+
+    const place = tx.placeId ? placeMap.get(tx.placeId) : undefined;
+    const key = place?.id ?? 'unspecified';
+    const name = place?.name ?? '未指定地點';
+    const icon = place?.icon ?? '📍';
+
+    const existing = totals.get(key);
+    if (existing) {
+      existing.amount += tx.amount;
+    } else {
+      totals.set(key, { placeId: key, name, icon, amount: tx.amount });
+    }
+    totalExpense += tx.amount;
+  }
+
+  const unspecified = totals.get('unspecified');
+  const specified = Array.from(totals.values())
+    .filter((item) => item.placeId !== 'unspecified')
+    .sort((a, b) => b.amount - a.amount)
+    .slice(0, Math.max(0, Math.trunc(limit)));
+
+  const ordered = unspecified ? [...specified, unspecified] : specified;
+
+  return ordered.map((item) => ({
+    ...item,
+    percentage: totalExpense > 0 ? Math.round((item.amount / totalExpense) * 1000) / 10 : 0,
+  }));
 }
 
 /**

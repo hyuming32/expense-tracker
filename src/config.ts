@@ -8,3 +8,5 @@ export const GOOGLE_DRIVE_SCOPE = 'https://www.googleapis.com/auth/drive.appdata
 export function isGoogleClientConfigured(): boolean {
   return GOOGLE_CLIENT_ID.trim().length > 0 && GOOGLE_CLIENT_ID.endsWith('.apps.googleusercontent.com');
 }
+/** 「備份到 Drive」用：只能存取本 App 自己建立的可見檔案（非敏感權限）。 */
+export const GOOGLE_DRIVE_FILE_SCOPE = 'https://www.googleapis.com/auth/drive.file';

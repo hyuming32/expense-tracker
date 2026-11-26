@@ -1,14 +1,25 @@
-import type { Account, AccountType, Category, CategoryKind, Transaction, TransactionKind } from '../db/types';
+import type {
+  Account,
+  AccountType,
+  Category,
+  CategoryKind,
+  Place,
+  Transaction,
+  TransactionKind,
+} from '../db/types';
+import { normalizePlaceName } from './places';
 
 export interface CsvImportItem {
   rowNumber: number;
   kind: TransactionKind;
   date: string;
+  time: string | null;
   amount: number;
   accountName: string;
   toAccountName: string | null;
   categoryName: string;
   subCategoryName: string;
+  placeName: string | null;
   note: string | null;
   invoiceNo: string | null;
 }
@@ -33,6 +44,7 @@ export interface CsvImportPlan {
   items: CsvImportItem[];
   newAccounts: CsvNewAccount[];
   newCategories: CsvNewCategory[];
+  newPlaces: string[];
   skippedDuplicates: number;
   errors: CsvImportError[];
   totalRows: number;
@@ -42,6 +54,7 @@ export interface CsvImportExistingData {
   transactions: readonly Transaction[];
   categories: readonly Category[];
   accounts: readonly Account[];
+  places?: readonly Place[];
 }
 
 interface ParsedCsvRow {
@@ -150,6 +163,10 @@ function isValidDateString(value: string): boolean {
   );
 }
 
+function isValidTimeString(value: string): boolean {
+  return /^([01]\d|2[0-3]):[0-5]\d$/.test(value);
+}
+
 function buildDuplicateSignature(
   date: string,
   kind: TransactionKind,
@@ -201,10 +218,12 @@ export function planCsvImport(csvText: string, existing: CsvImportExistingData):
 
   const activeAccounts = existing.accounts.filter((a) => !a.deleted);
   const activeCategories = existing.categories.filter((c) => !c.deleted);
+  const activePlaces = (existing.places ?? []).filter((p) => !p.deleted);
   const accountById = new Map(existing.accounts.map((a) => [a.id, a]));
   const categoryById = new Map(existing.categories.map((c) => [c.id, c]));
 
   const existingAccountNames = new Set(activeAccounts.map((a) => a.name.trim()));
+  const existingPlaceNames = new Set(activePlaces.map((p) => p.name.trim()));
   const existingParentMap = new Map<string, Category>();
   const existingChildKeys = new Set<string>();
 
@@ -282,6 +301,8 @@ export function planCsvImport(csvText: string, existing: CsvImportExistingData):
   const newAccountNames = new Set<string>();
   const newCategories: CsvNewCategory[] = [];
   const newCategoryKeys = new Set<string>();
+  const newPlaces: string[] = [];
+  const newPlaceNames = new Set<string>();
   const errors: CsvImportError[] = [];
   let skippedDuplicates = 0;
 
@@ -289,6 +310,13 @@ export function planCsvImport(csvText: string, existing: CsvImportExistingData):
     if (!existingAccountNames.has(name) && !newAccountNames.has(name)) {
       newAccountNames.add(name);
       newAccounts.push({ name, type: 'cash' });
+    }
+  };
+
+  const ensurePlace = (name: string) => {
+    if (!existingPlaceNames.has(name) && !newPlaceNames.has(name)) {
+      newPlaceNames.add(name);
+      newPlaces.push(name);
     }
   };
 
@@ -316,6 +344,13 @@ export function planCsvImport(csvText: string, existing: CsvImportExistingData):
       errors.push({ rowNumber: row.lineNumber, reason: '日期格式錯誤（需為 YYYY-MM-DD）' });
       continue;
     }
+
+    const rawTime = getCell(row.cells, '時間').trim();
+    if (rawTime && !isValidTimeString(rawTime)) {
+      errors.push({ rowNumber: row.lineNumber, reason: '時間格式錯誤（需為 HH:mm）' });
+      continue;
+    }
+    const time = rawTime || null;
 
     const kindLabel = getCell(row.cells, '類型').trim();
     const kind = LABEL_TO_KIND[kindLabel];
@@ -361,6 +396,8 @@ export function planCsvImport(csvText: string, existing: CsvImportExistingData):
       subCategoryName = getCell(row.cells, '子分類').trim();
     }
 
+    const rawPlaceName = normalizePlaceName(getCell(row.cells, '地點'));
+    const placeName = rawPlaceName || null;
     const rawNote = getCell(row.cells, '備註').trim();
     const note = rawNote || null;
     const rawInvoice = getCell(row.cells, '發票號碼').trim().toUpperCase();
@@ -394,16 +431,21 @@ export function planCsvImport(csvText: string, existing: CsvImportExistingData):
     if (kind !== 'transfer') {
       ensureCategory(kind, categoryName, subCategoryName);
     }
+    if (placeName) {
+      ensurePlace(placeName);
+    }
 
     items.push({
       rowNumber: row.lineNumber,
       kind,
       date,
+      time,
       amount,
       accountName,
       toAccountName,
       categoryName,
       subCategoryName,
+      placeName,
       note,
       invoiceNo,
     });
@@ -413,6 +455,7 @@ export function planCsvImport(csvText: string, existing: CsvImportExistingData):
     items,
     newAccounts,
     newCategories,
+    newPlaces,
     skippedDuplicates,
     errors,
     totalRows: dataRows.length,

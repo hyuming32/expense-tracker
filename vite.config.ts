@@ -19,6 +19,19 @@ export default defineConfig({
         display: 'standalone',
         theme_color: '#0f172a',
         background_color: '#ffffff',
+        share_target: {
+          action: './share-target',
+          method: 'POST',
+          enctype: 'multipart/form-data',
+          params: {
+            files: [
+              {
+                name: 'image',
+                accept: ['image/*'],
+              },
+            ],
+          },
+        },
         icons: [
           {
             src: 'icon-192.png',
@@ -41,6 +54,7 @@ export default defineConfig({
       },
       workbox: {
         globPatterns: ['**/*.{js,css,html,ico,png,svg}'],
+        importScripts: ['share-target-sw.js'],
       },
     }),
   ],

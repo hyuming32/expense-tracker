@@ -1,34 +1,60 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import {
   type AmountColors,
+  bindSellerIdToPlace,
   DuplicateInvoiceError,
   DuplicateNotePresetError,
+  DuplicatePlaceNameError,
   findActiveTransactionByInvoiceNo,
   saveNotePreset,
+  savePlace,
   saveTransaction,
   softDeleteNotePreset,
   softDeleteTransaction,
 } from '../db/repository';
-import type { Account, Category, NotePreset, Transaction, TransactionKind } from '../db/types';
+import type { Account, Category, NotePreset, Place, Transaction, TransactionKind } from '../db/types';
 import {
+  appendCalcToken,
+  evaluateExpression,
+  findPlaceBySellerId,
   formatInvoiceNote,
+  getCurrentTimeString,
   getTodayDateString,
+  hasCalcOperator,
+  isValidSellerId,
+  PLACE_NAME_MAX_LENGTH,
+  resolveAmountExpression,
   selectQuickNotePresets,
+  selectQuickPlaces,
   validateTransaction,
   type ParsedInvoice,
 } from '../domain';
 import type { LastUsedMeta } from '../hooks/useExpenseData';
+import { AmountCalculatorKeypad } from './AmountCalculatorKeypad';
 import { InvoiceScannerModal } from './InvoiceScannerModal';
+
+export interface TransactionDraft {
+  kind: TransactionKind;
+  amount: number | null;
+  accountId: string;
+  toAccountId: string | null;
+  categoryId: string | null;
+  note: string | null;
+}
 
 interface TransactionSheetProps {
   open: boolean;
   editingTransaction: Transaction | null;
+  initialDraft?: TransactionDraft | null;
   accounts: readonly Account[];
   categories: readonly Category[];
+  places: readonly Place[];
+  autoSelectLastPlace: boolean;
   lastUsed: LastUsedMeta;
   amountColors: AmountColors;
   notePresets: readonly NotePreset[];
   onClose: () => void;
+  onSaved?: (tx: Transaction) => void;
 }
 
 const KIND_TABS: Array<{ value: TransactionKind; label: string }> = [
@@ -40,24 +66,44 @@ const KIND_TABS: Array<{ value: TransactionKind; label: string }> = [
 export function TransactionSheet({
   open,
   editingTransaction,
+  initialDraft,
   accounts,
   categories,
+  places,
+  autoSelectLastPlace,
   lastUsed,
   amountColors,
   notePresets,
   onClose,
+  onSaved,
 }: TransactionSheetProps) {
-  const amountInputRef = useRef<HTMLInputElement>(null);
+  const amountDisplayRef = useRef<HTMLDivElement>(null);
   const longPressTimerRef = useRef<number | null>(null);
   const longPressTriggeredRef = useRef(false);
+  const placesRef = useRef(places);
+  placesRef.current = places;
 
   const [kind, setKind] = useState<TransactionKind>('expense');
-  const [amountText, setAmountText] = useState('');
+  const [amountExpr, setAmountExpr] = useState('');
+  const [keypadOpen, setKeypadOpen] = useState(true);
   const [accountId, setAccountId] = useState('');
   const [toAccountId, setToAccountId] = useState('');
   const [categoryId, setCategoryId] = useState<string | null>(null);
   const [expandedParentId, setExpandedParentId] = useState<string | null>(null);
   const [date, setDate] = useState(getTodayDateString);
+  const [time, setTime] = useState('');
+  const [placeId, setPlaceId] = useState<string | null>(null);
+  const [placeQuery, setPlaceQuery] = useState('');
+  const [addingPlace, setAddingPlace] = useState(false);
+  const [newPlaceName, setNewPlaceName] = useState('');
+  const [placeError, setPlaceError] = useState<string | null>(null);
+  const [scannedSellerId, setScannedSellerId] = useState<string | null>(null);
+  const [autoMatchedPlaceId, setAutoMatchedPlaceId] = useState<string | null>(null);
+  const [sellerBindPrompt, setSellerBindPrompt] = useState(false);
+  const [sellerRebindCandidate, setSellerRebindCandidate] = useState<{
+    placeId: string;
+    placeName: string;
+  } | null>(null);
   const [note, setNote] = useState('');
   const [invoiceNo, setInvoiceNo] = useState<string | null>(null);
   const [scannerOpen, setScannerOpen] = useState(false);
@@ -101,6 +147,16 @@ export function TransactionSheet({
     [notePresets, categories, kind, categoryId, note],
   );
 
+  const quickPlaces = useMemo(
+    () => selectQuickPlaces({ places, query: placeQuery }),
+    [places, placeQuery],
+  );
+
+  const selectedPlace = useMemo(
+    () => (placeId ? places.find((p) => p.id === placeId && !p.deleted) : undefined),
+    [places, placeId],
+  );
+
   // 開啟面板或切換編輯對象時初始化表單
   useEffect(() => {
     if (!open) {
@@ -114,20 +170,68 @@ export function TransactionSheet({
     setSubmitting(false);
     setDeletingPreset(null);
     setPresetMessage(null);
+    setPlaceQuery('');
+    setAddingPlace(false);
+    setNewPlaceName('');
+    setPlaceError(null);
+    setScannedSellerId(null);
+    setAutoMatchedPlaceId(null);
+    setSellerBindPrompt(false);
+    setSellerRebindCandidate(null);
+
+    const resolveDefaultPlaceId = (): string | null => {
+      if (!autoSelectLastPlace || !lastUsed.lastPlaceId) {
+        return null;
+      }
+      const valid = placesRef.current.find(
+        (p) => p.id === lastUsed.lastPlaceId && !p.deleted && !p.archived,
+      );
+      return valid?.id ?? null;
+    };
 
     if (editingTransaction) {
       setKind(editingTransaction.kind);
-      setAmountText(String(editingTransaction.amount));
+      setAmountExpr(String(editingTransaction.amount));
+      setKeypadOpen(false);
       setAccountId(editingTransaction.accountId);
       setToAccountId(editingTransaction.toAccountId ?? '');
       setCategoryId(editingTransaction.categoryId);
       setDate(editingTransaction.date);
+      setTime(editingTransaction.time ?? '');
+      setPlaceId(editingTransaction.placeId ?? null);
       setNote(editingTransaction.note ?? '');
       setInvoiceNo(editingTransaction.invoiceNo ?? null);
 
       if (editingTransaction.categoryId) {
         const currentCat = categories.find((c) => c.id === editingTransaction.categoryId);
         setExpandedParentId(currentCat?.parentId ?? currentCat?.id ?? null);
+      } else {
+        setExpandedParentId(null);
+      }
+    } else if (initialDraft) {
+      const validAcc = accounts.some((a) => a.id === initialDraft.accountId)
+        ? initialDraft.accountId
+        : (accounts[0]?.id ?? '');
+      const validToAcc =
+        initialDraft.toAccountId && accounts.some((a) => a.id === initialDraft.toAccountId)
+          ? initialDraft.toAccountId
+          : (accounts.find((a) => a.id !== validAcc)?.id ?? '');
+
+      setKind(initialDraft.kind);
+      setAmountExpr(initialDraft.amount !== null && initialDraft.amount > 0 ? String(initialDraft.amount) : '');
+      setKeypadOpen(true);
+      setAccountId(validAcc);
+      setToAccountId(validToAcc);
+      setCategoryId(initialDraft.kind === 'transfer' ? null : initialDraft.categoryId);
+      setDate(getTodayDateString());
+      setTime(getCurrentTimeString());
+      setPlaceId(resolveDefaultPlaceId());
+      setNote(initialDraft.note ?? '');
+      setInvoiceNo(null);
+
+      if (initialDraft.kind !== 'transfer' && initialDraft.categoryId) {
+        const cat = categories.find((c) => c.id === initialDraft.categoryId);
+        setExpandedParentId(cat?.parentId ?? null);
       } else {
         setExpandedParentId(null);
       }
@@ -139,10 +243,13 @@ export function TransactionSheet({
       const otherAcc = accounts.find((a) => a.id !== defaultAcc)?.id ?? '';
 
       setKind('expense');
-      setAmountText('');
+      setAmountExpr('');
+      setKeypadOpen(true);
       setAccountId(defaultAcc);
       setToAccountId(otherAcc);
       setDate(getTodayDateString());
+      setTime(getCurrentTimeString());
+      setPlaceId(resolveDefaultPlaceId());
       setNote('');
       setInvoiceNo(null);
 
@@ -160,10 +267,70 @@ export function TransactionSheet({
     }
 
     const timer = window.setTimeout(() => {
-      amountInputRef.current?.focus();
+      amountDisplayRef.current?.focus();
     }, 30);
     return () => window.clearTimeout(timer);
-  }, [open, editingTransaction, accounts, categories, lastUsed]);
+  }, [open, editingTransaction, initialDraft, accounts, categories, lastUsed, autoSelectLastPlace]);
+
+  // 電腦實體鍵盤支援（焦點不在備註／日期／下拉選單時接收數字與四則運算鍵）
+  useEffect(() => {
+    if (!open || scannerOpen) {
+      return;
+    }
+
+    function handleKeyDown(e: KeyboardEvent) {
+      const activeTag = document.activeElement?.tagName;
+      if (activeTag === 'INPUT' || activeTag === 'TEXTAREA' || activeTag === 'SELECT') {
+        return;
+      }
+
+      if (/^[0-9]$/.test(e.key) || e.key === '.') {
+        e.preventDefault();
+        setAmountExpr((prev) => appendCalcToken(prev, e.key));
+        return;
+      }
+
+      const opMap: Record<string, string> = {
+        '+': '＋',
+        '-': '−',
+        '*': '×',
+        '/': '÷',
+      };
+      const mappedOp = opMap[e.key];
+      if (mappedOp) {
+        e.preventDefault();
+        setAmountExpr((prev) => appendCalcToken(prev, mappedOp));
+        return;
+      }
+
+      if (e.key === 'Backspace') {
+        e.preventDefault();
+        setAmountExpr((prev) => appendCalcToken(prev, '⌫'));
+        return;
+      }
+
+      if (e.key === 'c' || e.key === 'C' || e.key === 'Delete') {
+        e.preventDefault();
+        setAmountExpr('');
+        return;
+      }
+
+      if (e.key === '=' || (e.key === 'Enter' && hasCalcOperator(amountExpr))) {
+        e.preventDefault();
+        const res = evaluateExpression(amountExpr);
+        if (res.ok) {
+          setAmountExpr(String(res.value));
+        }
+      }
+    }
+
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [open, scannerOpen, amountExpr]);
+
+  const calcPreview = useMemo(() => evaluateExpression(amountExpr), [amountExpr]);
+  const resolvedAmount = useMemo(() => resolveAmountExpression(amountExpr), [amountExpr]);
+  const showCalcPreview = hasCalcOperator(amountExpr);
 
   if (!open) {
     return null;
@@ -212,10 +379,109 @@ export function TransactionSheet({
     setScannerOpen(false);
     setErrors([]);
     setDuplicateMessage(null);
-    setAmountText(String(parsed.amount));
+    setAmountExpr(String(parsed.amount));
     setDate(parsed.date);
+    setTime(getCurrentTimeString());
     setInvoiceNo(parsed.invoiceNo);
     setNote(formatInvoiceNote(parsed));
+
+    const sid = isValidSellerId(parsed.sellerId) ? parsed.sellerId.trim() : null;
+    setScannedSellerId(sid);
+    setSellerRebindCandidate(null);
+    if (sid) {
+      const matched = findPlaceBySellerId(places, sid);
+      if (matched) {
+        setPlaceId(matched.id);
+        setAutoMatchedPlaceId(matched.id);
+        setSellerBindPrompt(false);
+      } else {
+        setAutoMatchedPlaceId(null);
+        setSellerBindPrompt(true);
+      }
+    } else {
+      setAutoMatchedPlaceId(null);
+      setSellerBindPrompt(false);
+    }
+  }
+
+  function handleSelectPlaceChip(place: Place) {
+    setPlaceError(null);
+    if (placeId === place.id) {
+      setPlaceId(null);
+      setSellerRebindCandidate(null);
+      return;
+    }
+
+    setPlaceId(place.id);
+    if (sellerBindPrompt && scannedSellerId) {
+      void bindSellerIdToPlace(place.id, scannedSellerId);
+      setSellerBindPrompt(false);
+      setAutoMatchedPlaceId(place.id);
+      setSellerRebindCandidate(null);
+    } else if (autoMatchedPlaceId && scannedSellerId && place.id !== autoMatchedPlaceId) {
+      setSellerRebindCandidate({ placeId: place.id, placeName: place.name });
+    } else {
+      setSellerRebindCandidate(null);
+    }
+  }
+
+  async function handleCreateQuickPlace() {
+    const trimmed = newPlaceName.trim();
+    if (!trimmed) {
+      setPlaceError('請輸入地點名稱');
+      return;
+    }
+    setPlaceError(null);
+    try {
+      const created = await savePlace({ name: trimmed });
+      setPlaceId(created.id);
+      setAddingPlace(false);
+      setNewPlaceName('');
+      setPlaceQuery('');
+      if (sellerBindPrompt && scannedSellerId) {
+        await bindSellerIdToPlace(created.id, scannedSellerId);
+        setSellerBindPrompt(false);
+        setAutoMatchedPlaceId(created.id);
+        setSellerRebindCandidate(null);
+      } else if (autoMatchedPlaceId && scannedSellerId && created.id !== autoMatchedPlaceId) {
+        setSellerRebindCandidate({ placeId: created.id, placeName: created.name });
+      }
+    } catch (err) {
+      if (err instanceof DuplicatePlaceNameError) {
+        setPlaceError('此地點名稱已存在');
+      } else {
+        setPlaceError(err instanceof Error ? err.message : '新增地點失敗');
+      }
+    }
+  }
+
+  async function handleConfirmRebindSeller() {
+    if (!sellerRebindCandidate || !scannedSellerId) {
+      return;
+    }
+    await bindSellerIdToPlace(sellerRebindCandidate.placeId, scannedSellerId);
+    setAutoMatchedPlaceId(sellerRebindCandidate.placeId);
+    setSellerRebindCandidate(null);
+  }
+
+  function handleCalcEvaluate() {
+    if (!amountExpr) {
+      return;
+    }
+    const res = evaluateExpression(amountExpr);
+    if (res.ok) {
+      setAmountExpr(String(res.value));
+    }
+  }
+
+  function handleCalcDone() {
+    if (amountExpr && hasCalcOperator(amountExpr)) {
+      const res = evaluateExpression(amountExpr);
+      if (res.ok) {
+        setAmountExpr(String(res.value));
+      }
+    }
+    setKeypadOpen(false);
   }
 
   async function handleSubmit(e: React.FormEvent) {
@@ -225,11 +491,17 @@ export function TransactionSheet({
     }
 
     setDuplicateMessage(null);
-    const parsedAmount = Number(amountText.trim());
+    if (!resolvedAmount.ok) {
+      setErrors([resolvedAmount.error]);
+      return;
+    }
+
+    const finalAmount = resolvedAmount.value;
+    setAmountExpr(String(finalAmount));
     const payload = {
       kind,
       date,
-      amount: parsedAmount,
+      amount: finalAmount,
       accountId,
       toAccountId: kind === 'transfer' ? toAccountId || null : null,
       categoryId: kind === 'transfer' ? null : categoryId,
@@ -255,12 +527,15 @@ export function TransactionSheet({
         }
       }
 
-      await saveTransaction({
+      const saved = await saveTransaction({
         id: editingTransaction?.id,
         ...payload,
+        time: time || null,
+        placeId: placeId || null,
         note: note || null,
         invoiceNo: effectiveInvoiceNo,
       });
+      onSaved?.(saved);
       onClose();
     } catch (err) {
       if (err instanceof DuplicateInvoiceError) {
@@ -370,21 +645,33 @@ export function TransactionSheet({
         </div>
 
         <form onSubmit={handleSubmit} className="space-y-4">
-          {/* 金額輸入 */}
+          {/* 金額顯示欄＋自訂計算機鍵盤 */}
           <div>
-            <label htmlFor="tx-amount" className="mb-1 block text-xs font-medium text-slate-500 dark:text-slate-400">
-              金額（NT$）
-            </label>
+            <div className="mb-1 flex items-center justify-between">
+              <span className="text-xs font-medium text-slate-500 dark:text-slate-400">
+                金額（NT$）
+              </span>
+              <button
+                type="button"
+                onClick={() => setKeypadOpen((prev) => !prev)}
+                className="text-xs font-medium text-emerald-600 hover:text-emerald-700 dark:text-emerald-400"
+              >
+                {keypadOpen ? '收起鍵盤' : '展開計算機'}
+              </button>
+            </div>
             <div className="flex items-center gap-2">
-              <input
-                ref={amountInputRef}
-                id="tx-amount"
-                type="text"
-                inputMode="numeric"
-                pattern="[0-9]*"
-                placeholder="0"
-                value={amountText}
-                onChange={(e) => setAmountText(e.target.value.replace(/[^\d]/g, ''))}
+              <div
+                ref={amountDisplayRef}
+                tabIndex={0}
+                role="textbox"
+                aria-label="金額（NT$）"
+                aria-readonly="true"
+                onClick={() => setKeypadOpen(true)}
+                onKeyDown={(e) => {
+                  if (e.key === ' ' || e.key === 'Enter') {
+                    setKeypadOpen(true);
+                  }
+                }}
                 style={
                   kind === 'expense'
                     ? { color: amountColors.expense }
@@ -392,10 +679,31 @@ export function TransactionSheet({
                       ? { color: amountColors.income }
                       : undefined
                 }
-                className={`w-full flex-1 rounded-xl border border-slate-200 bg-slate-50 px-3 py-2.5 text-2xl font-bold tabular-nums outline-none placeholder:text-slate-400 focus:border-emerald-500 focus:bg-white dark:border-slate-700 dark:bg-slate-800 dark:placeholder:text-slate-500 dark:focus:border-emerald-400 dark:focus:bg-slate-800 ${
-                  kind === 'transfer' ? 'text-slate-900 dark:text-slate-100' : ''
-                }`}
-              />
+                className={`flex min-h-[52px] w-full flex-1 cursor-pointer items-center justify-between gap-2 rounded-xl border bg-slate-50 px-3 py-2 outline-none transition-colors focus:border-emerald-500 focus:bg-white dark:bg-slate-800 dark:focus:border-emerald-400 dark:focus:bg-slate-800 ${
+                  keypadOpen
+                    ? 'border-emerald-500 dark:border-emerald-400'
+                    : 'border-slate-200 dark:border-slate-700'
+                } ${kind === 'transfer' ? 'text-slate-900 dark:text-slate-100' : ''}`}
+              >
+                <span
+                  className={`truncate text-2xl font-bold tabular-nums ${
+                    !amountExpr ? 'text-slate-400 dark:text-slate-500' : ''
+                  }`}
+                >
+                  {amountExpr || '0'}
+                </span>
+                {showCalcPreview && (
+                  <span
+                    className={`shrink-0 text-sm font-semibold tabular-nums ${
+                      calcPreview.ok
+                        ? 'text-slate-500 dark:text-slate-400'
+                        : 'text-red-500 dark:text-red-400'
+                    }`}
+                  >
+                    {calcPreview.ok ? `= ${calcPreview.value}` : calcPreview.error}
+                  </span>
+                )}
+              </div>
               {kind === 'expense' && (
                 <button
                   type="button"
@@ -427,6 +735,18 @@ export function TransactionSheet({
                 </button>
               )}
             </div>
+            {amountExpr !== '' && !resolvedAmount.ok && (
+              <div className="mt-1.5 text-xs font-medium text-red-600 dark:text-red-400">
+                {resolvedAmount.error}
+              </div>
+            )}
+            {keypadOpen && (
+              <AmountCalculatorKeypad
+                onToken={(token) => setAmountExpr((prev) => appendCalcToken(prev, token))}
+                onEvaluate={handleCalcEvaluate}
+                onDone={handleCalcDone}
+              />
+            )}
             {kind === 'expense' && invoiceNo && (
               <div className="mt-2 inline-flex items-center gap-1.5 rounded-full bg-emerald-50 px-2.5 py-1 text-xs font-medium text-emerald-700 dark:bg-emerald-950/50 dark:text-emerald-300">
                 <span>發票 {invoiceNo}</span>
@@ -550,15 +870,36 @@ export function TransactionSheet({
             ) : (
               <div>
                 <label htmlFor="tx-date" className="mb-1 block text-xs font-medium text-slate-500 dark:text-slate-400">
-                  日期
+                  日期與時間
                 </label>
-                <input
-                  id="tx-date"
-                  type="date"
-                  value={date}
-                  onChange={(e) => setDate(e.target.value)}
-                  className="w-full rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm text-slate-900 outline-none focus:border-emerald-500 dark:border-slate-700 dark:bg-slate-800 dark:text-slate-100"
-                />
+                <div className="flex items-center gap-1.5">
+                  <input
+                    id="tx-date"
+                    type="date"
+                    value={date}
+                    onChange={(e) => setDate(e.target.value)}
+                    className="min-w-0 flex-1 rounded-xl border border-slate-200 bg-white px-2.5 py-2 text-sm text-slate-900 outline-none focus:border-emerald-500 dark:border-slate-700 dark:bg-slate-800 dark:text-slate-100"
+                  />
+                  <input
+                    id="tx-time"
+                    type="time"
+                    aria-label="時間"
+                    value={time}
+                    onChange={(e) => setTime(e.target.value)}
+                    className="w-[108px] shrink-0 rounded-xl border border-slate-200 bg-white px-2 py-2 text-sm text-slate-900 outline-none focus:border-emerald-500 dark:border-slate-700 dark:bg-slate-800 dark:text-slate-100"
+                  />
+                  {time && (
+                    <button
+                      type="button"
+                      onClick={() => setTime('')}
+                      aria-label="清除時間"
+                      title="清除時間"
+                      className="shrink-0 rounded-lg border border-slate-200 px-2 py-2 text-xs text-slate-500 hover:bg-slate-100 dark:border-slate-700 dark:text-slate-400 dark:hover:bg-slate-800"
+                    >
+                      ✕
+                    </button>
+                  )}
+                </div>
               </div>
             )}
           </div>
@@ -566,17 +907,167 @@ export function TransactionSheet({
           {kind === 'transfer' && (
             <div>
               <label htmlFor="tx-transfer-date" className="mb-1 block text-xs font-medium text-slate-500 dark:text-slate-400">
-                日期
+                日期與時間
               </label>
-              <input
-                id="tx-transfer-date"
-                type="date"
-                value={date}
-                onChange={(e) => setDate(e.target.value)}
-                className="w-full rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm text-slate-900 outline-none focus:border-emerald-500 dark:border-slate-700 dark:bg-slate-800 dark:text-slate-100"
-              />
+              <div className="flex items-center gap-1.5">
+                <input
+                  id="tx-transfer-date"
+                  type="date"
+                  value={date}
+                  onChange={(e) => setDate(e.target.value)}
+                  className="min-w-0 flex-1 rounded-xl border border-slate-200 bg-white px-2.5 py-2 text-sm text-slate-900 outline-none focus:border-emerald-500 dark:border-slate-700 dark:bg-slate-800 dark:text-slate-100"
+                />
+                <input
+                  id="tx-transfer-time"
+                  type="time"
+                  aria-label="時間"
+                  value={time}
+                  onChange={(e) => setTime(e.target.value)}
+                  className="w-[108px] shrink-0 rounded-xl border border-slate-200 bg-white px-2 py-2 text-sm text-slate-900 outline-none focus:border-emerald-500 dark:border-slate-700 dark:bg-slate-800 dark:text-slate-100"
+                />
+                {time && (
+                  <button
+                    type="button"
+                    onClick={() => setTime('')}
+                    aria-label="清除時間"
+                    title="清除時間"
+                    className="shrink-0 rounded-lg border border-slate-200 px-2 py-2 text-xs text-slate-500 hover:bg-slate-100 dark:border-slate-700 dark:text-slate-400 dark:hover:bg-slate-800"
+                  >
+                    ✕
+                  </button>
+                )}
+              </div>
             </div>
           )}
+
+          {/* 地點快選與搜尋 */}
+          <div>
+            <div className="mb-1 flex items-center justify-between">
+              <label htmlFor="tx-place-search" className="text-xs font-medium text-slate-500 dark:text-slate-400">
+                地點（選填）
+              </label>
+              {selectedPlace && (
+                <span className="text-xs font-medium text-emerald-600 dark:text-emerald-400">
+                  已選：{selectedPlace.icon} {selectedPlace.name}
+                </span>
+              )}
+            </div>
+
+            {sellerBindPrompt && scannedSellerId && (
+              <div className="mb-2 flex items-center justify-between gap-2 rounded-xl border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-800 dark:border-amber-800 dark:bg-amber-950/50 dark:text-amber-200">
+                <span>這家店（統編 {scannedSellerId}）是哪裡？</span>
+                <button
+                  type="button"
+                  onClick={() => setSellerBindPrompt(false)}
+                  className="shrink-0 rounded-lg border border-amber-300 bg-white px-2 py-1 text-xs font-medium text-amber-800 hover:bg-amber-100 dark:border-amber-700 dark:bg-amber-900/50 dark:text-amber-100"
+                >
+                  略過
+                </button>
+              </div>
+            )}
+
+            {sellerRebindCandidate && scannedSellerId && (
+              <div className="mb-2 flex items-center justify-between gap-2 rounded-xl border border-emerald-200 bg-emerald-50 px-3 py-2 text-xs text-emerald-800 dark:border-emerald-800 dark:bg-emerald-950/50 dark:text-emerald-200">
+                <span>以後這家店都記成「{sellerRebindCandidate.placeName}」嗎？</span>
+                <div className="flex shrink-0 items-center gap-1.5">
+                  <button
+                    type="button"
+                    onClick={() => void handleConfirmRebindSeller()}
+                    className="rounded-lg bg-emerald-600 px-2.5 py-1 text-xs font-medium text-white hover:bg-emerald-700"
+                  >
+                    是
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setSellerRebindCandidate(null)}
+                    className="rounded-lg border border-emerald-300 bg-white px-2.5 py-1 text-xs text-slate-700 hover:bg-slate-50 dark:border-emerald-700 dark:bg-slate-900 dark:text-slate-200"
+                  >
+                    否
+                  </button>
+                </div>
+              </div>
+            )}
+
+            <input
+              id="tx-place-search"
+              type="text"
+              placeholder="搜尋全部地點..."
+              value={placeQuery}
+              onChange={(e) => setPlaceQuery(e.target.value)}
+              className="w-full rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm text-slate-900 placeholder:text-slate-400 outline-none focus:border-emerald-500 dark:border-slate-700 dark:bg-slate-800 dark:text-slate-100 dark:placeholder:text-slate-500"
+            />
+
+            <div className="mt-2 flex flex-wrap items-center gap-1.5" aria-label="地點快選">
+              {quickPlaces.map((place) => {
+                const isSelected = placeId === place.id;
+                return (
+                  <button
+                    key={place.id}
+                    type="button"
+                    onClick={() => handleSelectPlaceChip(place)}
+                    className={`rounded-full border px-2.5 py-1 text-xs transition-colors ${
+                      isSelected
+                        ? 'border-emerald-500 bg-emerald-50 font-medium text-emerald-700 dark:border-emerald-400 dark:bg-emerald-950/50 dark:text-emerald-300'
+                        : 'border-slate-200 bg-slate-50 text-slate-700 hover:border-emerald-400 hover:bg-emerald-50 hover:text-emerald-700 dark:border-slate-700 dark:bg-slate-800 dark:text-slate-200 dark:hover:border-emerald-500 dark:hover:bg-emerald-950/40 dark:hover:text-emerald-300'
+                    }`}
+                  >
+                    {place.icon} {place.name}
+                  </button>
+                );
+              })}
+              <button
+                type="button"
+                onClick={() => {
+                  setAddingPlace((prev) => !prev);
+                  setPlaceError(null);
+                }}
+                className="rounded-full border border-dashed border-slate-300 px-2.5 py-1 text-xs font-medium text-slate-600 transition-colors hover:border-emerald-500 hover:text-emerald-700 dark:border-slate-600 dark:text-slate-300 dark:hover:border-emerald-400 dark:hover:text-emerald-300"
+              >
+                ＋ 新增地點
+              </button>
+            </div>
+
+            {addingPlace && (
+              <div className="mt-2 flex items-center gap-2">
+                <input
+                  type="text"
+                  aria-label="新地點名稱"
+                  placeholder="輸入地點名稱（最多 30 字）"
+                  maxLength={PLACE_NAME_MAX_LENGTH}
+                  value={newPlaceName}
+                  onChange={(e) => setNewPlaceName(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter') {
+                      e.preventDefault();
+                      void handleCreateQuickPlace();
+                    }
+                  }}
+                  className="min-w-0 flex-1 rounded-xl border border-slate-200 bg-white px-3 py-1.5 text-sm text-slate-900 outline-none focus:border-emerald-500 dark:border-slate-700 dark:bg-slate-800 dark:text-slate-100"
+                />
+                <button
+                  type="button"
+                  onClick={() => void handleCreateQuickPlace()}
+                  className="shrink-0 rounded-xl bg-emerald-600 px-3 py-1.5 text-xs font-medium text-white hover:bg-emerald-700"
+                >
+                  建立
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setAddingPlace(false);
+                    setPlaceError(null);
+                  }}
+                  className="shrink-0 rounded-xl border border-slate-200 px-2.5 py-1.5 text-xs text-slate-600 hover:bg-slate-100 dark:border-slate-700 dark:text-slate-300 dark:hover:bg-slate-800"
+                >
+                  取消
+                </button>
+              </div>
+            )}
+
+            {placeError && (
+              <div className="mt-1 text-xs text-red-600 dark:text-red-400">{placeError}</div>
+            )}
+          </div>
 
           {/* 備註與常用備註快選 */}
           <div>
@@ -728,8 +1219,8 @@ export function TransactionSheet({
 
             <button
               type="submit"
-              disabled={submitting}
-              className="ml-auto flex-1 rounded-xl bg-emerald-600 px-4 py-2.5 text-sm font-semibold text-white shadow-sm hover:bg-emerald-700 disabled:opacity-50 dark:bg-emerald-500 dark:hover:bg-emerald-600"
+              disabled={submitting || !resolvedAmount.ok}
+              className="ml-auto flex-1 rounded-xl bg-emerald-600 px-4 py-2.5 text-sm font-semibold text-white shadow-sm hover:bg-emerald-700 disabled:cursor-not-allowed disabled:opacity-50 dark:bg-emerald-500 dark:hover:bg-emerald-600"
             >
               儲存
             </button>

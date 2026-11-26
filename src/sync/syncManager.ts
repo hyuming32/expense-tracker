@@ -2,7 +2,7 @@ import { useSyncExternalStore } from 'react';
 import { isGoogleClientConfigured } from '../config';
 import { db, META_KEYS } from '../db/database';
 import { getDeviceId } from '../db/deviceId';
-import { subscribeLocalMutation } from '../db/repository';
+import { getSyncSchedule, processRecurringRules } from '../db/repository';
 import {
   clearCachedAccessToken,
   getValidAccessTokenSilently,
@@ -12,8 +12,7 @@ import {
 } from './auth';
 import { DriveApiError, FetchDriveStore } from './driveStore';
 import { syncOnce } from './syncEngine';
-
-const DEBOUNCE_MS = 3000;
+import { createSyncScheduler } from './syncScheduler';
 
 export type SyncStatus = 'disabled' | 'syncing' | 'synced' | 'offline' | 'reauth' | 'error';
 
@@ -26,9 +25,6 @@ export interface SyncState {
 
 const listeners = new Set<() => void>();
 let initialized = false;
-let debounceTimer: ReturnType<typeof setTimeout> | null = null;
-let inFlightSync: Promise<void> | null = null;
-let pendingResync = false;
 
 let state: SyncState = {
   status: isSyncEnabled() && isGoogleClientConfigured() ? 'synced' : 'disabled',
@@ -63,6 +59,32 @@ function isOffline(): boolean {
   return typeof navigator !== 'undefined' && navigator.onLine === false;
 }
 
+/**
+ * 將同步錯誤轉換為使用者易懂的繁體中文說明。
+ */
+export function toFriendlySyncError(err: unknown): string {
+  if (err instanceof DriveApiError) {
+    if (err.status === 403) {
+      return 'Google Drive 拒絕存取';
+    }
+    if (err.status === 429 || (err.status >= 500 && err.status < 600)) {
+      return 'Google 伺服器暫時忙碌，請稍後重試';
+    }
+    console.error('[sync] Drive API 同步錯誤：', err);
+    return '未知錯誤';
+  }
+
+  if (
+    err instanceof TypeError ||
+    (err instanceof Error && /network|failed to fetch|load failed/i.test(err.message))
+  ) {
+    return '網路連線失敗';
+  }
+
+  console.error('[sync] 同步發生未知錯誤：', err);
+  return '未知錯誤';
+}
+
 async function loadInitialLastSyncAt(): Promise<void> {
   const entry = await db.meta.get(META_KEYS.SYNC_LAST_SYNC_AT);
   if (entry) {
@@ -73,15 +95,15 @@ async function loadInitialLastSyncAt(): Promise<void> {
   }
 }
 
-async function executeSync(): Promise<void> {
+async function executeSync(): Promise<boolean> {
   if (!isGoogleClientConfigured() || !isSyncEnabled()) {
     setState({ status: 'disabled', errorMessage: null });
-    return;
+    return true;
   }
 
   if (isOffline()) {
     setState({ status: 'offline', errorMessage: null });
-    return;
+    return false;
   }
 
   setState({ status: 'syncing', errorMessage: null });
@@ -94,7 +116,7 @@ async function executeSync(): Promise<void> {
     } else {
       setState({ status: 'reauth', errorMessage: null });
     }
-    return;
+    return false;
   }
 
   try {
@@ -104,11 +126,13 @@ async function executeSync(): Promise<void> {
       driveStore,
       deviceId: getDeviceId(),
     });
+    await processRecurringRules();
     setState({
       status: 'synced',
       lastSyncAt: result.lastSyncAt,
       errorMessage: null,
     });
+    return true;
   } catch (err) {
     if (err instanceof DriveApiError && err.status === 401) {
       clearCachedAccessToken();
@@ -118,49 +142,26 @@ async function executeSync(): Promise<void> {
     } else {
       setState({
         status: 'error',
-        errorMessage: err instanceof Error ? err.message : '同步失敗',
+        errorMessage: toFriendlySyncError(err),
       });
     }
+    return false;
   }
 }
+
+const scheduler = createSyncScheduler({
+  getSchedule: () => getSyncSchedule(db),
+  getOutboxCount: () => db.outbox.count(),
+  getLastSyncAt: () => state.lastSyncAt,
+  runSync: executeSync,
+  isVisible: () => typeof document === 'undefined' || document.visibilityState !== 'hidden',
+});
 
 /**
  * 立即觸發一次同步（確保同一時間僅有一個同步任務在執行）。
  */
-export function triggerSync(): Promise<void> {
-  if (inFlightSync) {
-    return inFlightSync;
-  }
-
-  inFlightSync = (async () => {
-    try {
-      await executeSync();
-    } finally {
-      inFlightSync = null;
-      if (pendingResync) {
-        pendingResync = false;
-        void triggerSync();
-      }
-    }
-  })();
-
-  return inFlightSync;
-}
-
-function scheduleDebouncedSync(): void {
-  if (!isGoogleClientConfigured() || !isSyncEnabled()) {
-    return;
-  }
-  if (inFlightSync) {
-    pendingResync = true;
-  }
-  if (debounceTimer !== null) {
-    clearTimeout(debounceTimer);
-  }
-  debounceTimer = setTimeout(() => {
-    debounceTimer = null;
-    void triggerSync();
-  }, DEBOUNCE_MS);
+export async function triggerSync(): Promise<void> {
+  await scheduler.triggerManual();
 }
 
 /**
@@ -174,26 +175,30 @@ export function startSyncManager(): void {
 
   void loadInitialLastSyncAt().then(() => {
     if (isGoogleClientConfigured() && isSyncEnabled()) {
-      void triggerSync();
+      void scheduler.start();
     } else {
       setState({ status: 'disabled' });
     }
   });
 
-  subscribeLocalMutation(() => {
-    scheduleDebouncedSync();
-  });
+  if (typeof document !== 'undefined') {
+    document.addEventListener('visibilitychange', () => {
+      if (isGoogleClientConfigured() && isSyncEnabled()) {
+        void scheduler.onVisibilityChange(document.visibilityState !== 'hidden');
+      }
+    });
+  }
 
   if (typeof window !== 'undefined') {
-    window.addEventListener('focus', () => {
+    window.addEventListener('pagehide', () => {
       if (isGoogleClientConfigured() && isSyncEnabled()) {
-        void triggerSync();
+        void scheduler.onPageHide();
       }
     });
 
     window.addEventListener('online', () => {
       if (isGoogleClientConfigured() && isSyncEnabled()) {
-        void triggerSync();
+        void scheduler.onOnline();
       }
     });
 
@@ -210,18 +215,14 @@ export function startSyncManager(): void {
  */
 export async function loginAndSync(): Promise<void> {
   await signInWithGoogle();
-  await triggerSync();
+  await scheduler.start();
 }
 
 /**
  * 登出 Google 並停用自動同步。
  */
 export async function logoutAndClearSync(): Promise<void> {
-  if (debounceTimer !== null) {
-    clearTimeout(debounceTimer);
-    debounceTimer = null;
-  }
-  pendingResync = false;
+  scheduler.stop();
   await signOutGoogle();
   setState({ status: 'disabled', errorMessage: null });
 }
@@ -234,14 +235,24 @@ export function useSyncState(): SyncState {
 }
 
 /**
- * 將時間戳記格式化為台灣習慣的簡短時間字串（例如：下午 3:20）。
+ * 將時間戳記格式化為台灣習慣的簡短時間字串（例如：今天 下午 3:20）。
  */
 export function formatSyncTimeLabel(timestamp: number): string {
-  return new Intl.DateTimeFormat('zh-TW', {
+  const date = new Date(timestamp);
+  const now = new Date();
+  const isSameDay =
+    date.getFullYear() === now.getFullYear() &&
+    date.getMonth() === now.getMonth() &&
+    date.getDate() === now.getDate();
+
+  const datePrefix = isSameDay ? '今天 ' : `${date.getMonth() + 1}/${date.getDate()} `;
+  const timeText = new Intl.DateTimeFormat('zh-TW', {
     hour: 'numeric',
     minute: '2-digit',
     hour12: true,
-  }).format(new Date(timestamp));
+  }).format(date);
+
+  return `${datePrefix}${timeText}`;
 }
 
 /**

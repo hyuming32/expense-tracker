@@ -1,4 +1,12 @@
-import type { Account, BaseRecord, Category, Transaction, TransactionKind } from '../db/types';
+import type {
+  Account,
+  BaseRecord,
+  Category,
+  Place,
+  Transaction,
+  TransactionKind,
+} from '../db/types';
+import { compareTransactionsByDateTimeDesc } from './places';
 
 const KIND_LABELS: Record<TransactionKind, string> = {
   expense: '支出',
@@ -6,7 +14,19 @@ const KIND_LABELS: Record<TransactionKind, string> = {
   transfer: '轉帳',
 };
 
-const CSV_HEADER = ['日期', '類型', '金額', '分類', '子分類', '帳戶', '轉入帳戶', '備註', '發票號碼'];
+const CSV_HEADER = [
+  '日期',
+  '時間',
+  '類型',
+  '金額',
+  '分類',
+  '子分類',
+  '帳戶',
+  '轉入帳戶',
+  '地點',
+  '備註',
+  '發票號碼',
+];
 
 function escapeCsvCell(value: string): string {
   if (/[",\n\r]/.test(value)) {
@@ -16,22 +36,21 @@ function escapeCsvCell(value: string): string {
 }
 
 /**
- * 將未刪除的交易紀錄轉換為含 UTF-8 BOM 的 CSV 字串，依日期由新到舊排序。
+ * 將未刪除的交易紀錄轉換為含 UTF-8 BOM 的 CSV 字串，依日期與時間由新到舊排序。
  */
 export function toCsv(
   transactions: readonly Transaction[],
   categories: readonly Category[],
   accounts: readonly Account[],
+  places: readonly Place[] = [],
 ): string {
   const categoryMap = new Map(categories.map((c) => [c.id, c]));
   const accountMap = new Map(accounts.map((a) => [a.id, a]));
+  const placeMap = new Map(places.map((p) => [p.id, p]));
 
   const sorted = transactions
     .filter((tx) => !tx.deleted)
-    .sort((a, b) => {
-      const dateCmp = b.date.localeCompare(a.date);
-      return dateCmp !== 0 ? dateCmp : b.updatedAt - a.updatedAt;
-    });
+    .sort(compareTransactionsByDateTimeDesc);
 
   const lines: string[] = [CSV_HEADER.map(escapeCsvCell).join(',')];
 
@@ -47,15 +66,18 @@ export function toCsv(
     const accountName = accountMap.get(tx.accountId)?.name ?? '';
     const toAccountName =
       tx.kind === 'transfer' && tx.toAccountId ? (accountMap.get(tx.toAccountId)?.name ?? '') : '';
+    const placeName = tx.placeId ? (placeMap.get(tx.placeId)?.name ?? '') : '';
 
     const row = [
       tx.date,
+      tx.time ?? '',
       KIND_LABELS[tx.kind],
       String(tx.amount),
       categoryName,
       subCategoryName,
       accountName,
       toAccountName,
+      placeName,
       tx.note ?? '',
       tx.invoiceNo ?? '',
     ];

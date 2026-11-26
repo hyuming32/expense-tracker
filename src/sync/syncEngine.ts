@@ -1,6 +1,17 @@
 import type { EntityTable, IDType } from 'dexie';
 import { db, type ExpenseDatabase, META_KEYS } from '../db/database';
-import type { Account, BaseRecord, Category, NotePreset, OutboxEntry, Transaction } from '../db/types';
+import type {
+  Account,
+  BaseRecord,
+  Category,
+  LotteryDraw,
+  NotePreset,
+  OutboxEntry,
+  Place,
+  RecurringRule,
+  Shortcut,
+  Transaction,
+} from '../db/types';
 import type { DriveFile, DriveStore } from './driveStore';
 import { mergeRecord } from './merge';
 
@@ -13,6 +24,10 @@ export interface SyncRecordsPayload {
   categories: Category[];
   transactions: Transaction[];
   notePresets?: NotePreset[];
+  recurringRules?: RecurringRule[];
+  shortcuts?: Shortcut[];
+  places?: Place[];
+  lotteryDraws?: LotteryDraw[];
 }
 
 export interface ChangeBatchFile {
@@ -106,17 +121,27 @@ async function applyRemoteRecords(
 ): Promise<void> {
   await database.transaction(
     'rw',
-    database.accounts,
-    database.categories,
-    database.transactions,
-    database.notePresets,
-    database.meta,
+    [
+      database.accounts,
+      database.categories,
+      database.transactions,
+      database.notePresets,
+      database.recurringRules,
+      database.shortcuts,
+      database.places,
+      database.lotteryDraws,
+      database.meta,
+    ],
     async () => {
       await Promise.all([
         mergeTableRecords(database.accounts, records.accounts),
         mergeTableRecords(database.categories, records.categories),
         mergeTableRecords(database.transactions, records.transactions),
         mergeTableRecords(database.notePresets, records.notePresets ?? []),
+        mergeTableRecords(database.recurringRules, records.recurringRules ?? []),
+        mergeTableRecords(database.shortcuts, records.shortcuts ?? []),
+        mergeTableRecords(database.places, records.places ?? []),
+        mergeTableRecords(database.lotteryDraws, records.lotteryDraws ?? []),
       ]);
 
       for (const item of seenUpdates) {
@@ -138,6 +163,10 @@ async function buildOutboxRecords(
   const categoryIds: string[] = [];
   const transactionIds: string[] = [];
   const notePresetIds: string[] = [];
+  const recurringRuleIds: string[] = [];
+  const shortcutIds: string[] = [];
+  const placeIds: string[] = [];
+  const lotteryDrawIds: string[] = [];
 
   for (const entry of entries) {
     if (entry.table === 'accounts') {
@@ -146,12 +175,29 @@ async function buildOutboxRecords(
       categoryIds.push(entry.recordId);
     } else if (entry.table === 'notePresets') {
       notePresetIds.push(entry.recordId);
+    } else if (entry.table === 'recurringRules') {
+      recurringRuleIds.push(entry.recordId);
+    } else if (entry.table === 'shortcuts') {
+      shortcutIds.push(entry.recordId);
+    } else if (entry.table === 'places') {
+      placeIds.push(entry.recordId);
+    } else if (entry.table === 'lotteryDraws') {
+      lotteryDrawIds.push(entry.recordId);
     } else {
       transactionIds.push(entry.recordId);
     }
   }
 
-  const [accountsRaw, categoriesRaw, transactionsRaw, notePresetsRaw] = await Promise.all([
+  const [
+    accountsRaw,
+    categoriesRaw,
+    transactionsRaw,
+    notePresetsRaw,
+    recurringRulesRaw,
+    shortcutsRaw,
+    placesRaw,
+    lotteryDrawsRaw,
+  ] = await Promise.all([
     accountIds.length > 0
       ? database.accounts.bulkGet(accountIds)
       : Promise.resolve<Array<Account | undefined>>([]),
@@ -164,6 +210,18 @@ async function buildOutboxRecords(
     notePresetIds.length > 0
       ? database.notePresets.bulkGet(notePresetIds)
       : Promise.resolve<Array<NotePreset | undefined>>([]),
+    recurringRuleIds.length > 0
+      ? database.recurringRules.bulkGet(recurringRuleIds)
+      : Promise.resolve<Array<RecurringRule | undefined>>([]),
+    shortcutIds.length > 0
+      ? database.shortcuts.bulkGet(shortcutIds)
+      : Promise.resolve<Array<Shortcut | undefined>>([]),
+    placeIds.length > 0
+      ? database.places.bulkGet(placeIds)
+      : Promise.resolve<Array<Place | undefined>>([]),
+    lotteryDrawIds.length > 0
+      ? database.lotteryDraws.bulkGet(lotteryDrawIds)
+      : Promise.resolve<Array<LotteryDraw | undefined>>([]),
   ]);
 
   const accounts: Account[] = [];
@@ -190,8 +248,41 @@ async function buildOutboxRecords(
       notePresets.push(item);
     }
   }
+  const recurringRules: RecurringRule[] = [];
+  for (const item of recurringRulesRaw) {
+    if (item) {
+      recurringRules.push(item);
+    }
+  }
+  const shortcuts: Shortcut[] = [];
+  for (const item of shortcutsRaw) {
+    if (item) {
+      shortcuts.push(item);
+    }
+  }
+  const places: Place[] = [];
+  for (const item of placesRaw) {
+    if (item) {
+      places.push(item);
+    }
+  }
+  const lotteryDraws: LotteryDraw[] = [];
+  for (const item of lotteryDrawsRaw) {
+    if (item) {
+      lotteryDraws.push(item);
+    }
+  }
 
-  return { accounts, categories, transactions, notePresets };
+  return {
+    accounts,
+    categories,
+    transactions,
+    notePresets,
+    recurringRules,
+    shortcuts,
+    places,
+    lotteryDraws,
+  };
 }
 
 /**
@@ -286,11 +377,25 @@ export async function syncOnce(options: SyncOnceOptions): Promise<SyncOnceResult
 
   // 6. 變更檔總數超過門檻時，產生新的 snapshot.json 並清理已包含的變更檔
   if (changeFiles.length > snapshotThreshold) {
-    const [accounts, categories, transactions, notePresets, allMeta] = await Promise.all([
+    const [
+      accounts,
+      categories,
+      transactions,
+      notePresets,
+      recurringRules,
+      shortcuts,
+      places,
+      lotteryDraws,
+      allMeta,
+    ] = await Promise.all([
       database.accounts.toArray(),
       database.categories.toArray(),
       database.transactions.toArray(),
       database.notePresets.toArray(),
+      database.recurringRules.toArray(),
+      database.shortcuts.toArray(),
+      database.places.toArray(),
+      database.lotteryDraws.toArray(),
       database.meta.toArray(),
     ]);
 
@@ -313,7 +418,16 @@ export async function syncOnce(options: SyncOnceOptions): Promise<SyncOnceResult
     const snapshot: SnapshotFile = {
       createdAt: Date.now(),
       includes,
-      records: { accounts, categories, transactions, notePresets },
+      records: {
+        accounts,
+        categories,
+        transactions,
+        notePresets,
+        recurringRules,
+        shortcuts,
+        places,
+        lotteryDraws,
+      },
     };
     const snapshotJson = JSON.stringify(snapshot);
 

@@ -1,19 +1,36 @@
 import Dexie, { type EntityTable, type Table } from 'dexie';
 import { getDeviceId } from './deviceId';
-import type { Account, Category, MetaEntry, NotePreset, OutboxEntry, Transaction } from './types';
+import type {
+  Account,
+  Category,
+  LotteryDraw,
+  MetaEntry,
+  NotePreset,
+  OutboxEntry,
+  Place,
+  RecurringRule,
+  Shortcut,
+  Transaction,
+} from './types';
 
 export const META_KEYS = {
   DEVICE_ID: 'deviceId',
   LAST_ACCOUNT_ID: 'lastAccountId',
   LAST_EXPENSE_CATEGORY_ID: 'lastExpenseCategoryId',
   LAST_INCOME_CATEGORY_ID: 'lastIncomeCategoryId',
+  LAST_PLACE_ID: 'lastPlaceId',
+  AUTO_SELECT_LAST_PLACE: 'autoSelectLastPlace',
   COLOR_EXPENSE: 'color.expense',
   COLOR_INCOME: 'color.income',
   REPORT_PERIOD_KIND: 'reportPeriodKind',
   AUTO_ADD_NOTE_PRESETS: 'autoAddNotePresets',
+  RECURRING_LAST_CHECKED_DATE: 'recurringLastCheckedDate',
   SYNC_LOCAL_SEQ: 'localSeq',
   SYNC_LAST_SYNC_AT: 'lastSyncAt',
   SYNC_SEEN_PREFIX: 'seen.',
+  SYNC_SCHEDULE: 'sync.schedule',
+  DRIVE_BACKUP_FOLDER_ID: 'driveBackup.folderId',
+  DRIVE_BACKUP_LAST_AT: 'driveBackup.lastAt',
 } as const;
 
 export const SEED_DEVICE_ID = 'seed';
@@ -61,6 +78,10 @@ export class ExpenseDatabase extends Dexie {
   categories!: EntityTable<Category, 'id'>;
   transactions!: EntityTable<Transaction, 'id'>;
   notePresets!: EntityTable<NotePreset, 'id'>;
+  recurringRules!: EntityTable<RecurringRule, 'id'>;
+  shortcuts!: EntityTable<Shortcut, 'id'>;
+  places!: EntityTable<Place, 'id'>;
+  lotteryDraws!: EntityTable<LotteryDraw, 'id'>;
   meta!: Table<MetaEntry, string>;
   outbox!: Table<OutboxEntry, string>;
 
@@ -270,6 +291,52 @@ export class ExpenseDatabase extends Dexie {
       categories: 'id, kind, parentId, updatedAt, deleted, sortOrder',
       transactions: 'id, kind, date, accountId, toAccountId, categoryId, invoiceNo, updatedAt, deleted',
       notePresets: 'id, categoryId, useCount, lastUsedAt, sortOrder, updatedAt, deleted',
+      meta: 'key',
+      outbox: 'key, table, recordId, updatedAt',
+    });
+    this.version(6).stores({
+      accounts: 'id, updatedAt, deleted, sortOrder',
+      categories: 'id, kind, parentId, updatedAt, deleted, sortOrder',
+      transactions:
+        'id, kind, date, accountId, toAccountId, categoryId, invoiceNo, recurringId, occurrenceDate, updatedAt, deleted',
+      notePresets: 'id, categoryId, useCount, lastUsedAt, sortOrder, updatedAt, deleted',
+      recurringRules: 'id, frequency, paused, startDate, endDate, updatedAt, deleted',
+      meta: 'key',
+      outbox: 'key, table, recordId, updatedAt',
+    });
+    this.version(7).stores({
+      accounts: 'id, updatedAt, deleted, sortOrder',
+      categories: 'id, kind, parentId, updatedAt, deleted, sortOrder',
+      transactions:
+        'id, kind, date, accountId, toAccountId, categoryId, invoiceNo, recurringId, occurrenceDate, updatedAt, deleted',
+      notePresets: 'id, categoryId, useCount, lastUsedAt, sortOrder, updatedAt, deleted',
+      recurringRules: 'id, frequency, paused, startDate, endDate, updatedAt, deleted',
+      shortcuts: 'id, sortOrder, updatedAt, deleted',
+      meta: 'key',
+      outbox: 'key, table, recordId, updatedAt',
+    });
+    this.version(8).stores({
+      accounts: 'id, updatedAt, deleted, sortOrder',
+      categories: 'id, kind, parentId, updatedAt, deleted, sortOrder',
+      transactions:
+        'id, kind, date, accountId, toAccountId, categoryId, placeId, invoiceNo, recurringId, occurrenceDate, updatedAt, deleted',
+      notePresets: 'id, categoryId, useCount, lastUsedAt, sortOrder, updatedAt, deleted',
+      recurringRules: 'id, frequency, paused, startDate, endDate, updatedAt, deleted',
+      shortcuts: 'id, sortOrder, updatedAt, deleted',
+      places: 'id, useCount, lastUsedAt, sortOrder, archived, updatedAt, deleted',
+      meta: 'key',
+      outbox: 'key, table, recordId, updatedAt',
+    });
+    this.version(9).stores({
+      accounts: 'id, updatedAt, deleted, sortOrder',
+      categories: 'id, kind, parentId, updatedAt, deleted, sortOrder',
+      transactions:
+        'id, kind, date, accountId, toAccountId, categoryId, placeId, invoiceNo, recurringId, occurrenceDate, updatedAt, deleted',
+      notePresets: 'id, categoryId, useCount, lastUsedAt, sortOrder, updatedAt, deleted',
+      recurringRules: 'id, frequency, paused, startDate, endDate, updatedAt, deleted',
+      shortcuts: 'id, sortOrder, updatedAt, deleted',
+      places: 'id, useCount, lastUsedAt, sortOrder, archived, updatedAt, deleted',
+      lotteryDraws: 'id, period, updatedAt, deleted',
       meta: 'key',
       outbox: 'key, table, recordId, updatedAt',
     });

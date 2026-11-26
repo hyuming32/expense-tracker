@@ -1,11 +1,13 @@
 import { describe, expect, it } from 'vitest';
-import type { Account, Category, NotePreset, Transaction } from '../db/types';
+import type { Account, Category, NotePreset, Place, Transaction } from '../db/types';
 import {
   accountBalance,
   categoryBreakdown,
   categoryCompare,
   clipToElapsed,
   compareSummary,
+  findPlaceBySellerId,
+  getCurrentTimeString,
   groupByDay,
   mergeBackup,
   monthSummary,
@@ -13,8 +15,10 @@ import {
   periodRange,
   periodSummary,
   periodTrend,
+  placeBreakdownInRange,
   sameLastYear,
   selectQuickNotePresets,
+  selectQuickPlaces,
   shiftPeriod,
   toCsv,
   validateTransaction,
@@ -313,9 +317,9 @@ describe('toCsv', () => {
     const content = csv.slice(1);
     expect(content).toBe(
       [
-        '日期,類型,金額,分類,子分類,帳戶,轉入帳戶,備註,發票號碼',
-        '2026-11-05,轉帳,3000,,,"銀行,帳戶",現金,,',
-        '2026-11-01,支出,120,飲食,午餐,現金,,"便當, 加""蛋""\n外帶",AB12345678',
+        '日期,時間,類型,金額,分類,子分類,帳戶,轉入帳戶,地點,備註,發票號碼',
+        '2026-11-05,,轉帳,3000,,,"銀行,帳戶",現金,,,',
+        '2026-11-01,,支出,120,飲食,午餐,現金,,,"便當, 加""蛋""\n外帶",AB12345678',
       ].join('\n'),
     );
   });
@@ -609,5 +613,144 @@ describe('selectQuickNotePresets', () => {
       query: 'star',
     });
     expect(filtered.map((p) => p.id)).toEqual(['1']);
+  });
+});
+
+describe('selectQuickPlaces 與地點輔助函式', () => {
+  function makePlace(overrides: Partial<Place>): Place {
+    return {
+      id: 'pl-1',
+      name: '公司附近',
+      icon: '📍',
+      useCount: 0,
+      lastUsedAt: 0,
+      sortOrder: 1,
+      archived: false,
+      ...baseMeta,
+      ...overrides,
+    };
+  }
+
+  it('依 useCount 由大到小、lastUsedAt 新到舊排序，最多 10 個並排除已停用與已刪除', () => {
+    const places: Place[] = [
+      makePlace({ id: 'archived', name: '已停用', useCount: 99, archived: true }),
+      makePlace({ id: 'deleted', name: '已刪除', useCount: 99, deleted: true }),
+      ...Array.from({ length: 12 }, (_, idx) =>
+        makePlace({
+          id: `p-${idx}`,
+          name: `地點-${idx}`,
+          useCount: idx === 0 || idx === 1 ? 5 : idx,
+          lastUsedAt: idx === 0 ? 1000 : idx === 1 ? 3000 : idx * 100,
+          sortOrder: idx + 1,
+        }),
+      ),
+    ];
+
+    const quick = selectQuickPlaces({ places });
+    expect(quick).toHaveLength(10);
+    expect(quick[0]?.id).toBe('p-11');
+    const idx1 = quick.findIndex((p) => p.id === 'p-1');
+    const idx0 = quick.findIndex((p) => p.id === 'p-0');
+    expect(idx1).toBeLessThan(idx0);
+    expect(quick.some((p) => p.id === 'archived' || p.id === 'deleted')).toBe(false);
+  });
+
+  it('停用地點不自動帶入，未停用地點可依統編自動帶入', () => {
+    const places: Place[] = [
+      makePlace({ id: 'p-arch', name: '停用店', archived: true, sellerIds: ['11112222'] }),
+      makePlace({ id: 'p-active', name: '全聯', archived: false, sellerIds: ['33334444'] }),
+    ];
+
+    expect(findPlaceBySellerId(places, '11112222')).toBeUndefined();
+    expect(findPlaceBySellerId(places, '33334444')?.id).toBe('p-active');
+  });
+
+  it('同日交易依時間由晚到早排序，無時間排在最後，再依 updatedAt', () => {
+    const txs: Transaction[] = [
+      makeTx({ id: 'no-time-old', date: '2026-11-26', time: null, updatedAt: 100 }),
+      makeTx({ id: 'morning', date: '2026-11-26', time: '08:30', updatedAt: 500 }),
+      makeTx({ id: 'no-time-new', date: '2026-11-26', time: null, updatedAt: 900 }),
+      makeTx({ id: 'evening', date: '2026-11-26', time: '20:15', updatedAt: 200 }),
+    ];
+
+    const groups = groupByDay(txs);
+    expect(groups).toHaveLength(1);
+    expect(groups[0]?.transactions.map((t) => t.id)).toEqual([
+      'evening',
+      'morning',
+      'no-time-new',
+      'no-time-old',
+    ]);
+  });
+
+  it('placeBreakdownInRange 依地點彙總所選期間支出前 10 名', () => {
+    const places: Place[] = Array.from({ length: 12 }, (_, idx) =>
+      makePlace({ id: `pl-${idx}`, name: `地點${idx}` }),
+    );
+    const txs: Transaction[] = [
+      ...places.map((p, idx) =>
+        makeTx({
+          id: `tx-${idx}`,
+          kind: 'expense',
+          date: '2026-11-10',
+          amount: (idx + 1) * 100,
+          placeId: p.id,
+        }),
+      ),
+      makeTx({
+        id: 'tx-transfer',
+        kind: 'transfer',
+        date: '2026-11-10',
+        amount: 99999,
+        toAccountId: 'acc-bank',
+        categoryId: null,
+        placeId: 'pl-0',
+      }),
+    ];
+
+    const range = periodRange('month', '2026-11-01');
+    const breakdown = placeBreakdownInRange(txs, places, range, 10);
+    expect(breakdown).toHaveLength(10);
+    expect(breakdown[0]?.placeId).toBe('pl-11');
+    expect(breakdown[0]?.amount).toBe(1200);
+    expect(breakdown[9]?.placeId).toBe('pl-2');
+  });
+
+  it('placeBreakdownInRange 未指定地點固定排在有地點項目之後且不佔前 10 名名額', () => {
+    const places: Place[] = Array.from({ length: 12 }, (_, idx) =>
+      makePlace({ id: `pl-${idx}`, name: `地點${idx}` }),
+    );
+    const txs: Transaction[] = [
+      ...places.map((p, idx) =>
+        makeTx({
+          id: `tx-${idx}`,
+          kind: 'expense',
+          date: '2026-11-10',
+          amount: (idx + 1) * 100,
+          placeId: p.id,
+        }),
+      ),
+      makeTx({
+        id: 'tx-unspecified',
+        kind: 'expense',
+        date: '2026-11-12',
+        amount: 50000, // 金額最大，仍應排在最後
+        placeId: null,
+      }),
+    ];
+
+    const range = periodRange('month', '2026-11-01');
+    const breakdown = placeBreakdownInRange(txs, places, range, 10);
+    expect(breakdown).toHaveLength(11);
+    expect(breakdown[0]?.placeId).toBe('pl-11');
+    expect(breakdown[9]?.placeId).toBe('pl-2');
+    expect(breakdown[10]?.placeId).toBe('unspecified');
+    expect(breakdown[10]?.name).toBe('未指定地點');
+    expect(breakdown[10]?.amount).toBe(50000);
+  });
+
+  it('getCurrentTimeString 回傳 HH:mm 格式', () => {
+    const dt = new Date(2026, 10, 26, 9, 5);
+    expect(getCurrentTimeString(dt)).toBe('09:05');
   });
 });

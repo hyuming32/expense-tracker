@@ -19,6 +19,15 @@ export function getTodayDateString(now = new Date()): string {
 }
 
 /**
+ * 取得本地現在時間字串 HH:mm（取到分鐘）。
+ */
+export function getCurrentTimeString(now = new Date()): string {
+  const hours = String(now.getHours()).padStart(2, '0');
+  const minutes = String(now.getMinutes()).padStart(2, '0');
+  return `${hours}:${minutes}`;
+}
+
+/**
  * 取得本地當月字串 YYYY-MM。
  */
 export function getCurrentMonthString(now = new Date()): string {

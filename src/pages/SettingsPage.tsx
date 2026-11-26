@@ -1,25 +1,38 @@
-import { useMemo, useRef, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
+import { Link } from 'react-router-dom';
 import {
   type AmountColors,
   archiveAccount,
   archiveCategory,
+  archivePlace,
   type BackupPayload,
+  endRecurringRule,
   exportBackupData,
   importCsvPlan,
   NOTE_PRESET_MAX_LENGTH,
   parseBackupPayload,
+  pauseRecurringRule,
   resetAmountColors,
   restoreBackupData,
   saveAccount,
   saveAmountColors,
   saveCategory,
   saveNotePreset,
+  savePlace,
   setAutoAddNotePresets,
+  setAutoSelectLastPlace,
+  setSyncSchedule,
   softDeleteCategory,
   softDeleteNotePreset,
+  softDeletePlace,
+  softDeleteRecurringRule,
+  softDeleteShortcut,
   swapAccountSortOrder,
   swapCategorySortOrder,
   swapNotePresetSortOrder,
+  swapPlaceSortOrder,
+  swapShortcutSortOrder,
+  type SyncSchedule,
 } from '../db/repository';
 import type {
   Account,
@@ -27,16 +40,33 @@ import type {
   Category,
   CategoryKind,
   NotePreset,
+  Place,
+  RecurringRule,
+  Shortcut,
   Transaction,
 } from '../db/types';
-import { type CsvImportPlan, formatCurrency, getTodayDateString, planCsvImport, toCsv } from '../domain';
+import {
+  type CsvImportPlan,
+  formatCurrency,
+  formatRecurringFrequency,
+  getNextOccurrenceDate,
+  getRecurringRuleStatus,
+  getTodayDateString,
+  isValidSellerId,
+  PLACE_NAME_MAX_LENGTH,
+  planCsvImport,
+  toCsv,
+} from '../domain';
+import { useLastDriveBackupAt, useOutboxCount, useSyncSchedule } from '../hooks/useExpenseData';
 import { pickFileWithSystemPicker, saveFile, supportsOpenFilePicker } from '../lib/fileSave';
-import { isSyncEnabled } from '../sync/auth';
+import { DriveAuthCancelledError, isSyncEnabled } from '../sync/auth';
+import { backupToGoogleDrive } from '../sync/driveBackup';
 import {
   formatSyncStatusText,
   formatSyncTimeLabel,
   loginAndSync,
   logoutAndClearSync,
+  toFriendlySyncError,
   triggerSync,
   useSyncState,
 } from '../sync/syncManager';
@@ -44,10 +74,18 @@ import {
 interface SettingsPageProps {
   accounts: readonly Account[];
   categories: readonly Category[];
+  places: readonly Place[];
+  autoSelectLastPlace: boolean;
   transactions: readonly Transaction[];
   amountColors: AmountColors;
   notePresets: readonly NotePreset[];
   autoAddNotePresets: boolean;
+  recurringRules: readonly RecurringRule[];
+  shortcuts: readonly Shortcut[];
+  onOpenCreateRecurring: () => void;
+  onEditRecurring: (rule: RecurringRule) => void;
+  onOpenCreateShortcut: () => void;
+  onEditShortcut: (shortcut: Shortcut) => void;
 }
 
 const ACCOUNT_TYPE_LABELS: Record<AccountType, string> = {
@@ -63,10 +101,18 @@ function getCompactDateStamp(): string {
 export function SettingsPage({
   accounts,
   categories,
+  places,
+  autoSelectLastPlace,
   transactions,
   amountColors,
   notePresets,
   autoAddNotePresets,
+  recurringRules,
+  shortcuts,
+  onOpenCreateRecurring,
+  onEditRecurring,
+  onOpenCreateShortcut,
+  onEditShortcut,
 }: SettingsPageProps) {
   const [catTab, setCatTab] = useState<CategoryKind>('expense');
   const [catFormOpen, setCatFormOpen] = useState(false);
@@ -86,15 +132,43 @@ export function SettingsPage({
   const [presetText, setPresetText] = useState('');
   const [presetCategoryId, setPresetCategoryId] = useState('');
 
+  const [placeFormOpen, setPlaceFormOpen] = useState(false);
+  const [editingPlaceId, setEditingPlaceId] = useState<string | null>(null);
+  const [placeName, setPlaceName] = useState('');
+  const [placeIcon, setPlaceIcon] = useState('📍');
+  const [placeSellerIds, setPlaceSellerIds] = useState<string[]>([]);
+  const [newSellerIdInput, setNewSellerIdInput] = useState('');
+
   const [pendingBackup, setPendingBackup] = useState<BackupPayload | null>(null);
   const [pendingCsvPlan, setPendingCsvPlan] = useState<CsvImportPlan | null>(null);
   const [statusMessage, setStatusMessage] = useState<string | null>(null);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [authBusy, setAuthBusy] = useState(false);
+  const [driveBackupBusy, setDriveBackupBusy] = useState(false);
+  const [isOnline, setIsOnline] = useState(() =>
+    typeof navigator === 'undefined' ? true : navigator.onLine !== false,
+  );
   const fileInputRef = useRef<HTMLInputElement>(null);
   const csvFileInputRef = useRef<HTMLInputElement>(null);
   const syncState = useSyncState();
   const syncEnabled = isSyncEnabled();
+  const syncSchedule = useSyncSchedule();
+  const outboxCount = useOutboxCount();
+  const lastDriveBackupAt = useLastDriveBackupAt();
+
+  useEffect(() => {
+    if (typeof window === 'undefined') {
+      return;
+    }
+    const handleOnline = () => setIsOnline(true);
+    const handleOffline = () => setIsOnline(false);
+    window.addEventListener('online', handleOnline);
+    window.addEventListener('offline', handleOffline);
+    return () => {
+      window.removeEventListener('online', handleOnline);
+      window.removeEventListener('offline', handleOffline);
+    };
+  }, []);
 
   const usedCategoryIds = useMemo(() => {
     const set = new Set<string>();
@@ -105,6 +179,21 @@ export function SettingsPage({
     }
     return set;
   }, [transactions]);
+
+  const usedPlaceIds = useMemo(() => {
+    const set = new Set<string>();
+    for (const tx of transactions) {
+      if (!tx.deleted && tx.placeId) {
+        set.add(tx.placeId);
+      }
+    }
+    return set;
+  }, [transactions]);
+
+  const sortedPlaces = useMemo(
+    () => [...places].sort((a, b) => a.sortOrder - b.sortOrder),
+    [places],
+  );
 
   const tabCategories = useMemo(
     () => categories.filter((c) => c.kind === catTab),
@@ -310,9 +399,82 @@ export function SettingsPage({
     return parent ? `${parent.icon} ${parent.name} > ${cat.icon} ${cat.name}` : `${cat.icon} ${cat.name}`;
   }
 
+  function openCreatePlace() {
+    setEditingPlaceId(null);
+    setPlaceName('');
+    setPlaceIcon('📍');
+    setPlaceSellerIds([]);
+    setNewSellerIdInput('');
+    setPlaceFormOpen(true);
+    setErrorMessage(null);
+  }
+
+  function openEditPlace(place: Place) {
+    setEditingPlaceId(place.id);
+    setPlaceName(place.name);
+    setPlaceIcon(place.icon);
+    setPlaceSellerIds(place.sellerIds ?? []);
+    setNewSellerIdInput('');
+    setPlaceFormOpen(true);
+    setErrorMessage(null);
+  }
+
+  function handleAddSellerIdToForm() {
+    const trimmed = newSellerIdInput.trim();
+    if (!isValidSellerId(trimmed)) {
+      setErrorMessage('統一編號需為 8 位數字');
+      return;
+    }
+    if (placeSellerIds.includes(trimmed)) {
+      setNewSellerIdInput('');
+      return;
+    }
+    const conflict = places.find(
+      (p) => !p.deleted && p.id !== editingPlaceId && (p.sellerIds ?? []).includes(trimmed),
+    );
+    if (conflict) {
+      setErrorMessage(`統一編號 ${trimmed} 已綁定至「${conflict.name}」`);
+      return;
+    }
+    setPlaceSellerIds((prev) => [...prev, trimmed]);
+    setNewSellerIdInput('');
+    setErrorMessage(null);
+  }
+
+  async function handleSavePlace(e: React.FormEvent) {
+    e.preventDefault();
+    if (!placeName.trim()) {
+      setErrorMessage('請輸入地點名稱');
+      return;
+    }
+    try {
+      await savePlace({
+        id: editingPlaceId ?? undefined,
+        name: placeName,
+        icon: placeIcon,
+        sellerIds: placeSellerIds,
+      });
+      setPlaceFormOpen(false);
+      setStatusMessage(editingPlaceId ? '已更新地點' : '已新增地點');
+      setErrorMessage(null);
+    } catch (err) {
+      setErrorMessage(err instanceof Error ? err.message : '儲存地點失敗');
+    }
+  }
+
+  async function handleDeletePlace(id: string) {
+    try {
+      await softDeletePlace(id);
+      setStatusMessage('已刪除地點');
+      setErrorMessage(null);
+    } catch (err) {
+      setErrorMessage(err instanceof Error ? err.message : '無法刪除地點');
+    }
+  }
+
   async function handleExportCsv() {
     try {
-      const csv = toCsv(transactions, categories, accounts);
+      const csv = toCsv(transactions, categories, accounts, places);
       const blob = new Blob([csv], { type: 'text/csv;charset=utf-8' });
       const result = await saveFile(
         blob,
@@ -344,6 +506,31 @@ export function SettingsPage({
       }
     } catch (err) {
       setErrorMessage(err instanceof Error ? err.message : '存檔失敗');
+    }
+  }
+
+  async function handleBackupToDrive() {
+    if (!isOnline || driveBackupBusy) {
+      return;
+    }
+    setDriveBackupBusy(true);
+    setErrorMessage(null);
+    try {
+      const result = await backupToGoogleDrive();
+      setStatusMessage(`已備份：${result.fileName}（Drive › 記帳備份）`);
+    } catch (err) {
+      if (err instanceof DriveAuthCancelledError) {
+        setErrorMessage('未授權，無法備份到 Drive');
+      } else if (
+        err instanceof Error &&
+        (err.message === '尚未設定 Google Client ID' || err.message === 'Google 登入元件尚未載入')
+      ) {
+        setErrorMessage(err.message);
+      } else {
+        setErrorMessage(`備份失敗：${toFriendlySyncError(err)}`);
+      }
+    } finally {
+      setDriveBackupBusy(false);
     }
   }
 
@@ -404,7 +591,7 @@ export function SettingsPage({
   async function processCsvFile(file: File) {
     try {
       const text = await file.text();
-      const plan = planCsvImport(text, { transactions, categories, accounts });
+      const plan = planCsvImport(text, { transactions, categories, accounts, places });
       setPendingCsvPlan(plan);
       setPendingBackup(null);
       setErrorMessage(null);
@@ -452,6 +639,9 @@ export function SettingsPage({
       if (result.createdCategoriesCount > 0) {
         extras.push(`新建分類 ${result.createdCategoriesCount} 個`);
       }
+      if (result.createdPlacesCount > 0) {
+        extras.push(`新建地點 ${result.createdPlacesCount} 個`);
+      }
       const extraText = extras.length > 0 ? `，${extras.join('、')}` : '';
       setStatusMessage(`匯入完成（新增 ${result.importedCount} 筆交易${extraText}）`);
       setErrorMessage(null);
@@ -472,6 +662,17 @@ export function SettingsPage({
           {errorMessage}
         </div>
       )}
+
+      {/* 發票兌獎入口 */}
+      <section className="rounded-2xl border border-slate-200 bg-white p-4 dark:border-slate-800 dark:bg-slate-900">
+        <Link
+          to="/lottery"
+          className="flex items-center justify-between text-sm font-semibold text-slate-900 hover:text-emerald-600 dark:text-slate-100 dark:hover:text-emerald-400"
+        >
+          <span>🎟️ 發票兌獎（手動輸入／截圖辨識）</span>
+          <span className="text-xs font-medium text-emerald-600 dark:text-emerald-400">開啟 →</span>
+        </Link>
+      </section>
 
       {/* 外觀設定 */}
       <section className="rounded-2xl border border-slate-200 bg-white p-4 dark:border-slate-800 dark:bg-slate-900">
@@ -550,6 +751,120 @@ export function SettingsPage({
             </div>
           </div>
         </div>
+      </section>
+
+      {/* 週期性收支 */}
+      <section className="rounded-2xl border border-slate-200 bg-white p-4 dark:border-slate-800 dark:bg-slate-900">
+        <div className="mb-3 flex items-center justify-between">
+          <h2 className="text-sm font-semibold text-slate-900 dark:text-slate-100">週期性收支</h2>
+          <button
+            type="button"
+            onClick={onOpenCreateRecurring}
+            className="rounded-lg bg-emerald-600 px-3 py-1.5 text-xs font-medium text-white hover:bg-emerald-700"
+          >
+            ＋ 新增規則
+          </button>
+        </div>
+
+        {recurringRules.length === 0 ? (
+          <div className="py-4 text-center text-xs text-slate-500 dark:text-slate-400">
+            尚未設定週期性收支（例如房租、訂閱、薪水）
+          </div>
+        ) : (
+          <div className="divide-y divide-slate-100 dark:divide-slate-800">
+            {recurringRules.map((rule) => {
+              const today = getTodayDateString();
+              const status = getRecurringRuleStatus(rule, today);
+              const nextDate = getNextOccurrenceDate(rule, today);
+              const category = rule.categoryId ? categoryMap.get(rule.categoryId) : undefined;
+              const displayName =
+                rule.note ||
+                (rule.kind === 'transfer' ? '定期轉帳' : (category?.name ?? '週期收支'));
+
+              const statusLabel =
+                status === 'active' ? '啟用' : status === 'paused' ? '暫停' : '已結束';
+              const statusBadgeClass =
+                status === 'active'
+                  ? 'bg-emerald-50 text-emerald-700 dark:bg-emerald-950/50 dark:text-emerald-300'
+                  : status === 'paused'
+                    ? 'bg-amber-50 text-amber-700 dark:bg-amber-950/50 dark:text-amber-300'
+                    : 'bg-slate-100 text-slate-500 dark:bg-slate-800 dark:text-slate-400';
+
+              return (
+                <div key={rule.id} className="space-y-2 py-3">
+                  <div className="flex items-start justify-between gap-2">
+                    <div className="min-w-0">
+                      <div className="flex items-center gap-2">
+                        <span className="truncate text-sm font-medium text-slate-900 dark:text-slate-100">
+                          {displayName}
+                        </span>
+                        <span className={`rounded px-1.5 py-0.5 text-[10px] font-medium ${statusBadgeClass}`}>
+                          {statusLabel}
+                        </span>
+                        {!rule.autoPost && (
+                          <span className="rounded bg-slate-100 px-1.5 py-0.5 text-[10px] text-slate-600 dark:bg-slate-800 dark:text-slate-300">
+                            待確認
+                          </span>
+                        )}
+                      </div>
+                      <div className="mt-0.5 text-xs text-slate-500 dark:text-slate-400">
+                        {formatRecurringFrequency(rule)} · 下次：{nextDate ?? '—'}
+                      </div>
+                    </div>
+
+                    <span
+                      className="shrink-0 text-sm font-semibold tabular-nums"
+                      style={
+                        rule.kind === 'expense'
+                          ? { color: amountColors.expense }
+                          : rule.kind === 'income'
+                            ? { color: amountColors.income }
+                            : undefined
+                      }
+                    >
+                      {formatCurrency(rule.amount)}
+                    </span>
+                  </div>
+
+                  <div className="flex flex-wrap justify-end gap-1.5 text-xs">
+                    <button
+                      type="button"
+                      onClick={() => onEditRecurring(rule)}
+                      className="rounded px-2 py-1 text-slate-600 hover:bg-slate-100 dark:text-slate-300 dark:hover:bg-slate-800"
+                    >
+                      編輯
+                    </button>
+                    {status !== 'ended' && (
+                      <button
+                        type="button"
+                        onClick={() => void pauseRecurringRule(rule.id, !rule.paused)}
+                        className="rounded px-2 py-1 text-amber-600 hover:bg-amber-50 dark:text-amber-400 dark:hover:bg-slate-800"
+                      >
+                        {rule.paused ? '恢復' : '暫停'}
+                      </button>
+                    )}
+                    {status !== 'ended' && (
+                      <button
+                        type="button"
+                        onClick={() => void endRecurringRule(rule.id, today)}
+                        className="rounded px-2 py-1 text-slate-600 hover:bg-slate-100 dark:text-slate-300 dark:hover:bg-slate-800"
+                      >
+                        結束
+                      </button>
+                    )}
+                    <button
+                      type="button"
+                      onClick={() => void softDeleteRecurringRule(rule.id)}
+                      className="rounded px-2 py-1 text-red-600 hover:bg-red-50 dark:text-red-400 dark:hover:bg-slate-800"
+                    >
+                      刪除
+                    </button>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        )}
       </section>
 
       {/* 分類管理 */}
@@ -935,6 +1250,227 @@ export function SettingsPage({
         </div>
       </section>
 
+      {/* 地點管理 */}
+      <section className="rounded-2xl border border-slate-200 bg-white p-4 dark:border-slate-800 dark:bg-slate-900">
+        <div className="mb-3 flex items-center justify-between">
+          <h2 className="text-sm font-semibold text-slate-900 dark:text-slate-100">地點管理</h2>
+          <button
+            type="button"
+            onClick={openCreatePlace}
+            className="rounded-lg bg-emerald-600 px-3 py-1.5 text-xs font-medium text-white hover:bg-emerald-700"
+          >
+            ＋ 新增地點
+          </button>
+        </div>
+
+        <label className="mb-3 flex cursor-pointer items-center justify-between gap-3 rounded-xl border border-slate-100 bg-slate-50/70 px-3 py-2.5 dark:border-slate-800 dark:bg-slate-800/50">
+          <div>
+            <div className="text-sm font-medium text-slate-700 dark:text-slate-200">
+              新增記帳時自動帶入上次的地點
+            </div>
+            <div className="text-xs text-slate-500 dark:text-slate-400">
+              開啟後，每次開新記帳面板會自動選取上次使用的地點
+            </div>
+          </div>
+          <input
+            type="checkbox"
+            aria-label="新增記帳時自動帶入上次的地點"
+            checked={autoSelectLastPlace}
+            onChange={(e) => {
+              void setAutoSelectLastPlace(e.target.checked);
+            }}
+            className="h-4 w-4 accent-emerald-600"
+          />
+        </label>
+
+        {placeFormOpen && (
+          <form
+            onSubmit={handleSavePlace}
+            className="mb-3 space-y-2.5 rounded-xl border border-slate-200 bg-slate-50 p-3 dark:border-slate-700 dark:bg-slate-800/60"
+          >
+            <div className="text-xs font-semibold text-slate-700 dark:text-slate-200">
+              {editingPlaceId ? '編輯地點' : '新增地點'}
+            </div>
+            <div className="grid grid-cols-4 gap-2">
+              <input
+                type="text"
+                aria-label="地點圖示"
+                placeholder="Emoji"
+                value={placeIcon}
+                onChange={(e) => setPlaceIcon(e.target.value)}
+                className="col-span-1 rounded-lg border border-slate-200 bg-white px-2.5 py-1.5 text-center text-sm dark:border-slate-700 dark:bg-slate-900"
+              />
+              <input
+                type="text"
+                aria-label="地點名稱"
+                placeholder="地點名稱（最多 30 字）"
+                maxLength={PLACE_NAME_MAX_LENGTH}
+                value={placeName}
+                onChange={(e) => setPlaceName(e.target.value)}
+                className="col-span-3 rounded-lg border border-slate-200 bg-white px-3 py-1.5 text-sm dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100"
+              />
+            </div>
+
+            <div className="space-y-1.5">
+              <div className="text-xs text-slate-500 dark:text-slate-400">
+                綁定發票賣方統編（8 位數字，掃描發票時自動選取）
+              </div>
+              <div className="flex items-center gap-2">
+                <input
+                  type="text"
+                  inputMode="numeric"
+                  aria-label="新增綁定統編"
+                  placeholder="輸入 8 位數統編（例如 12345678）"
+                  maxLength={8}
+                  value={newSellerIdInput}
+                  onChange={(e) => setNewSellerIdInput(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter') {
+                      e.preventDefault();
+                      handleAddSellerIdToForm();
+                    }
+                  }}
+                  className="min-w-0 flex-1 rounded-lg border border-slate-200 bg-white px-3 py-1.5 text-xs tabular-nums dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100"
+                />
+                <button
+                  type="button"
+                  onClick={handleAddSellerIdToForm}
+                  className="shrink-0 rounded-lg border border-slate-200 bg-white px-2.5 py-1.5 text-xs font-medium text-slate-700 hover:bg-slate-100 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-200 dark:hover:bg-slate-800"
+                >
+                  加入統編
+                </button>
+              </div>
+              {placeSellerIds.length > 0 && (
+                <div className="flex flex-wrap gap-1.5">
+                  {placeSellerIds.map((sid) => (
+                    <span
+                      key={sid}
+                      className="inline-flex items-center gap-1 rounded-full bg-white px-2 py-0.5 text-xs tabular-nums text-slate-700 border border-slate-200 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-200"
+                    >
+                      <span>{sid}</span>
+                      <button
+                        type="button"
+                        aria-label={`移除統編 ${sid}`}
+                        onClick={() =>
+                          setPlaceSellerIds((prev) => prev.filter((item) => item !== sid))
+                        }
+                        className="text-slate-400 hover:text-red-500"
+                      >
+                        ×
+                      </button>
+                    </span>
+                  ))}
+                </div>
+              )}
+            </div>
+
+            <div className="flex justify-end gap-2">
+              <button
+                type="button"
+                onClick={() => setPlaceFormOpen(false)}
+                className="rounded-lg px-3 py-1.5 text-xs text-slate-600 hover:bg-slate-200 dark:text-slate-300 dark:hover:bg-slate-700"
+              >
+                取消
+              </button>
+              <button
+                type="submit"
+                className="rounded-lg bg-emerald-600 px-3 py-1.5 text-xs font-medium text-white hover:bg-emerald-700"
+              >
+                儲存
+              </button>
+            </div>
+          </form>
+        )}
+
+        {sortedPlaces.length === 0 ? (
+          <p className="py-2 text-xs text-slate-400 dark:text-slate-500">
+            尚無地點，可在記帳時快選列新增，或點擊右上方新增。
+          </p>
+        ) : (
+          <div className="divide-y divide-slate-100 dark:divide-slate-800">
+            {sortedPlaces.map((place, idx) => {
+              const inUse = usedPlaceIds.has(place.id);
+              const sellerIds = place.sellerIds ?? [];
+              return (
+                <div key={place.id} className="flex items-center justify-between gap-2 py-2.5">
+                  <div className="min-w-0">
+                    <div className="flex items-center gap-1.5">
+                      <span>{place.icon}</span>
+                      <span
+                        className={`truncate text-sm font-medium ${
+                          place.archived
+                            ? 'text-slate-400 line-through'
+                            : 'text-slate-900 dark:text-slate-100'
+                        }`}
+                      >
+                        {place.name}
+                      </span>
+                      {place.archived && (
+                        <span className="rounded bg-slate-100 px-1.5 py-0.5 text-[10px] text-slate-500 dark:bg-slate-800">
+                          已停用
+                        </span>
+                      )}
+                    </div>
+                    <div className="mt-0.5 flex flex-wrap items-center gap-2 text-xs text-slate-500 dark:text-slate-400">
+                      <span className="tabular-nums">使用 {place.useCount} 次</span>
+                      {sellerIds.length > 0 && (
+                        <span className="rounded bg-slate-100 px-1.5 py-0.5 text-[11px] tabular-nums text-slate-600 dark:bg-slate-800 dark:text-slate-300">
+                          統編：{sellerIds.join('、')}
+                        </span>
+                      )}
+                    </div>
+                  </div>
+
+                  <div className="flex shrink-0 items-center gap-1 text-xs">
+                    <button
+                      type="button"
+                      disabled={idx === 0}
+                      onClick={() => void swapPlaceSortOrder(place.id, sortedPlaces[idx - 1]!.id)}
+                      aria-label={`上移 ${place.name}`}
+                      className="rounded px-1.5 py-1 text-slate-500 hover:bg-slate-100 disabled:opacity-30 dark:hover:bg-slate-800"
+                    >
+                      ↑
+                    </button>
+                    <button
+                      type="button"
+                      disabled={idx === sortedPlaces.length - 1}
+                      onClick={() => void swapPlaceSortOrder(place.id, sortedPlaces[idx + 1]!.id)}
+                      aria-label={`下移 ${place.name}`}
+                      className="rounded px-1.5 py-1 text-slate-500 hover:bg-slate-100 disabled:opacity-30 dark:hover:bg-slate-800"
+                    >
+                      ↓
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => openEditPlace(place)}
+                      className="rounded px-2 py-1 text-slate-600 hover:bg-slate-100 dark:text-slate-300 dark:hover:bg-slate-800"
+                    >
+                      編輯
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => void archivePlace(place.id, !place.archived)}
+                      className="rounded px-2 py-1 text-amber-600 hover:bg-amber-50 dark:text-amber-400 dark:hover:bg-slate-800"
+                    >
+                      {place.archived ? '啟用' : '停用'}
+                    </button>
+                    {!inUse && (
+                      <button
+                        type="button"
+                        onClick={() => void handleDeletePlace(place.id)}
+                        className="rounded px-2 py-1 text-red-600 hover:bg-red-50 dark:text-red-400 dark:hover:bg-slate-800"
+                      >
+                        刪除
+                      </button>
+                    )}
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        )}
+      </section>
+
       {/* 常用備註管理 */}
       <section className="rounded-2xl border border-slate-200 bg-white p-4 dark:border-slate-800 dark:bg-slate-900">
         <div className="mb-3 flex items-center justify-between">
@@ -1085,6 +1621,112 @@ export function SettingsPage({
         )}
       </section>
 
+      {/* 首頁捷徑管理 */}
+      <section className="rounded-2xl border border-slate-200 bg-white p-4 dark:border-slate-800 dark:bg-slate-900">
+        <div className="mb-3 flex items-center justify-between">
+          <div>
+            <h2 className="text-sm font-semibold text-slate-900 dark:text-slate-100">首頁捷徑</h2>
+            <p className="mt-0.5 text-xs text-slate-500 dark:text-slate-400">
+              首頁「＋」上方最多顯示前 8 個捷徑
+            </p>
+          </div>
+          <button
+            type="button"
+            onClick={onOpenCreateShortcut}
+            className="rounded-lg bg-emerald-600 px-3 py-1.5 text-xs font-medium text-white hover:bg-emerald-700"
+          >
+            ＋ 新增捷徑
+          </button>
+        </div>
+
+        {shortcuts.length === 0 ? (
+          <p className="py-2 text-xs text-slate-400 dark:text-slate-500">
+            尚無首頁捷徑，點擊右上方新增或於記帳後點「存成捷徑」。
+          </p>
+        ) : (
+          <div className="divide-y divide-slate-100 dark:divide-slate-800">
+            {shortcuts.map((shortcut, idx) => {
+              const cat = shortcut.categoryId ? categoryMap.get(shortcut.categoryId) : undefined;
+              const acc = accounts.find((a) => a.id === shortcut.accountId);
+              const toAcc = shortcut.toAccountId
+                ? accounts.find((a) => a.id === shortcut.toAccountId)
+                : undefined;
+              const detailText =
+                shortcut.kind === 'transfer'
+                  ? `${acc?.name ?? '帳戶'} → ${toAcc?.name ?? '帳戶'}`
+                  : `${cat?.name ?? '分類'} · ${acc?.name ?? '帳戶'}`;
+
+              return (
+                <div key={shortcut.id} className="flex items-center justify-between gap-2 py-2.5">
+                  <div className="min-w-0">
+                    <div className="flex items-center gap-1.5 truncate text-sm font-medium text-slate-900 dark:text-slate-100">
+                      <span>{shortcut.icon}</span>
+                      <span className="truncate">{shortcut.label}</span>
+                      <span
+                        className="shrink-0 text-xs font-semibold tabular-nums"
+                        style={
+                          shortcut.amount !== null
+                            ? shortcut.kind === 'expense'
+                              ? { color: amountColors.expense }
+                              : shortcut.kind === 'income'
+                                ? { color: amountColors.income }
+                                : undefined
+                            : undefined
+                        }
+                      >
+                        {shortcut.amount !== null ? formatCurrency(shortcut.amount) : '每次輸入'}
+                      </span>
+                    </div>
+                    <div className="mt-0.5 truncate text-xs text-slate-500 dark:text-slate-400">
+                      {detailText}
+                      {shortcut.note ? ` · ${shortcut.note}` : ''}
+                    </div>
+                  </div>
+
+                  <div className="flex shrink-0 items-center gap-1 text-xs">
+                    <button
+                      type="button"
+                      disabled={idx === 0}
+                      onClick={() => void swapShortcutSortOrder(shortcut.id, shortcuts[idx - 1]!.id)}
+                      aria-label={`上移 ${shortcut.label}`}
+                      className="rounded px-1.5 py-1 text-slate-500 hover:bg-slate-100 disabled:opacity-30 dark:hover:bg-slate-800"
+                    >
+                      ↑
+                    </button>
+                    <button
+                      type="button"
+                      disabled={idx === shortcuts.length - 1}
+                      onClick={() => void swapShortcutSortOrder(shortcut.id, shortcuts[idx + 1]!.id)}
+                      aria-label={`下移 ${shortcut.label}`}
+                      className="rounded px-1.5 py-1 text-slate-500 hover:bg-slate-100 disabled:opacity-30 dark:hover:bg-slate-800"
+                    >
+                      ↓
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => onEditShortcut(shortcut)}
+                      className="rounded px-2 py-1 text-slate-600 hover:bg-slate-100 dark:text-slate-300 dark:hover:bg-slate-800"
+                    >
+                      編輯
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        void softDeleteShortcut(shortcut.id);
+                        setStatusMessage('已刪除捷徑');
+                      }}
+                      className="rounded px-2 py-1 text-red-600 hover:bg-red-50 dark:text-red-400 dark:hover:bg-slate-800"
+                    >
+                      刪除
+                    </button>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        )}
+      </section>
+
       {/* 資料 */}
       <section className="rounded-2xl border border-slate-200 bg-white p-4 dark:border-slate-800 dark:bg-slate-900">
         <h2 className="mb-3 text-sm font-semibold text-slate-900 dark:text-slate-100">資料</h2>
@@ -1142,6 +1784,28 @@ export function SettingsPage({
             </p>
           </div>
 
+          <div className="sm:col-span-2">
+            <button
+              type="button"
+              disabled={!isOnline || driveBackupBusy}
+              onClick={() => void handleBackupToDrive()}
+              className="w-full rounded-xl border border-slate-200 px-3 py-2.5 text-sm font-medium text-slate-700 hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-50 dark:border-slate-700 dark:text-slate-200 dark:hover:bg-slate-800"
+            >
+              {driveBackupBusy ? '備份中…' : '備份到 Google Drive'}
+            </button>
+            <p className="mt-1 px-1 text-xs text-slate-500 dark:text-slate-400">
+              {!isOnline ? (
+                <span className="text-amber-600 dark:text-amber-400">需要網路</span>
+              ) : (
+                <>
+                  上次 Drive 備份：
+                  {lastDriveBackupAt ? formatSyncTimeLabel(lastDriveBackupAt) : '尚未備份'}
+                  （存於 Drive「記帳備份」資料夾，保留最近 10 份）
+                </>
+              )}
+            </p>
+          </div>
+
           <input
             ref={fileInputRef}
             type="file"
@@ -1196,7 +1860,9 @@ export function SettingsPage({
               {pendingCsvPlan.errors.length} 筆
             </p>
 
-            {(pendingCsvPlan.newAccounts.length > 0 || pendingCsvPlan.newCategories.length > 0) && (
+            {(pendingCsvPlan.newAccounts.length > 0 ||
+              pendingCsvPlan.newCategories.length > 0 ||
+              pendingCsvPlan.newPlaces.length > 0) && (
               <div className="mt-2 rounded-lg bg-white/70 p-2 text-xs text-amber-900 dark:bg-slate-900/50 dark:text-amber-200">
                 <div className="font-semibold">將新建</div>
                 {pendingCsvPlan.newAccounts.length > 0 && (
@@ -1216,6 +1882,9 @@ export function SettingsPage({
                       })
                       .join('、')}
                   </div>
+                )}
+                {pendingCsvPlan.newPlaces.length > 0 && (
+                  <div className="mt-1">地點：{pendingCsvPlan.newPlaces.join('、')}</div>
                 )}
               </div>
             )}
@@ -1269,9 +1938,17 @@ export function SettingsPage({
               <div className="mt-1 space-y-0.5 text-xs text-slate-500 dark:text-slate-400">
                 <div>目前狀態：{formatSyncStatusText(syncState)}</div>
                 <div>
-                  最後同步時間：
+                  上次成功同步：
                   {syncState.lastSyncAt ? formatSyncTimeLabel(syncState.lastSyncAt) : '尚未同步'}
                 </div>
+                {syncState.status === 'offline' && (
+                  <div>未同步筆數：{outboxCount} 筆</div>
+                )}
+                {syncState.status === 'error' && (
+                  <div className="font-medium text-red-600 dark:text-red-400">
+                    失敗原因：{syncState.errorMessage ?? '未知錯誤'}
+                  </div>
+                )}
               </div>
             )}
           </div>
@@ -1291,9 +1968,17 @@ export function SettingsPage({
                   type="button"
                   disabled={syncState.status === 'syncing' || authBusy}
                   onClick={() => void triggerSync()}
-                  className="rounded-xl bg-emerald-600 px-3 py-2 text-xs font-medium text-white hover:bg-emerald-700 disabled:opacity-50"
+                  className={
+                    syncState.status === 'error'
+                      ? 'rounded-xl bg-red-600 px-3 py-2 text-xs font-medium text-white hover:bg-red-700 disabled:opacity-50'
+                      : 'rounded-xl bg-emerald-600 px-3 py-2 text-xs font-medium text-white hover:bg-emerald-700 disabled:opacity-50'
+                  }
                 >
-                  {syncState.status === 'syncing' ? '同步中…' : '立即同步'}
+                  {syncState.status === 'syncing'
+                    ? '同步中…'
+                    : syncState.status === 'error'
+                      ? '重試'
+                      : '立即同步'}
                 </button>
                 {syncState.status === 'reauth' && (
                   <button
@@ -1345,6 +2030,36 @@ export function SettingsPage({
             )}
           </div>
         </div>
+
+        {syncState.configured && syncEnabled && (
+          <div className="mt-4 border-t border-slate-100 pt-3 dark:border-slate-800">
+            <div className="flex items-center justify-between gap-3">
+              <label
+                htmlFor="sync-schedule-select"
+                className="text-xs font-medium text-slate-700 dark:text-slate-200"
+              >
+                定時同步
+              </label>
+              <select
+                id="sync-schedule-select"
+                value={syncSchedule}
+                onChange={(e) => void setSyncSchedule(e.target.value as SyncSchedule)}
+                className="rounded-xl border border-slate-200 bg-white px-3 py-1.5 text-xs text-slate-800 dark:border-slate-700 dark:bg-slate-800 dark:text-slate-100"
+              >
+                <option value="daily">每天（建議）</option>
+                <option value="weekly">每週</option>
+                <option value="none">不定時（僅開啟與離開時）</option>
+              </select>
+            </div>
+            <p className="mt-1.5 text-[11px] text-slate-500 dark:text-slate-400">
+              {syncSchedule === 'daily'
+                ? '打開與離開 App 時都會同步；另外每天自動同步一次。'
+                : syncSchedule === 'weekly'
+                  ? '打開與離開 App 時都會同步；另外每週自動同步一次。'
+                  : '打開與離開 App 時都會同步；不另行定時同步。'}
+            </p>
+          </div>
+        )}
       </section>
     </div>
   );
