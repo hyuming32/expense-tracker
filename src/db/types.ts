@@ -41,6 +41,17 @@ export interface Transaction extends BaseRecord {
   /** 轉帳時為 null */
   categoryId: string | null;
   note: string | null;
+  /** 電子發票字軌號碼（選填，例如 AB12345678） */
+  invoiceNo?: string | null;
+}
+
+export interface NotePreset extends BaseRecord {
+  text: string;
+  /** null 代表所有分類都顯示 */
+  categoryId: string | null;
+  useCount: number;
+  lastUsedAt: number;
+  sortOrder: number;
 }
 
 export interface MetaEntry {
@@ -48,7 +59,7 @@ export interface MetaEntry {
   value: string;
 }
 
-export type SyncTableName = 'accounts' | 'categories' | 'transactions';
+export type SyncTableName = 'accounts' | 'categories' | 'transactions' | 'notePresets';
 
 export interface OutboxEntry {
   /** 複合主鍵 `${table}:${recordId}`，避免同一筆紀錄重複排隊 */

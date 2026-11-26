@@ -1,6 +1,14 @@
 import { useLiveQuery } from 'dexie-react-hooks';
 import { db, META_KEYS } from '../db/database';
-import type { Account, Category, Transaction } from '../db/types';
+import {
+  type AmountColors,
+  DEFAULT_AMOUNT_COLORS,
+  getAmountColors,
+  getAutoAddNotePresets,
+  getReportPeriodKind,
+} from '../db/repository';
+import type { Account, Category, NotePreset, Transaction } from '../db/types';
+import type { PeriodKind } from '../domain';
 
 export interface LastUsedMeta {
   lastAccountId: string | null;
@@ -83,4 +91,39 @@ export function useLastUsedMeta(): LastUsedMeta {
       lastIncomeCategoryId: null,
     }
   );
+}
+
+/**
+ * 訂閱本機金額顯示顏色設定（支出／收入）。
+ */
+export function useAmountColors(): AmountColors {
+  return (
+    useLiveQuery(async () => getAmountColors(db), []) ?? DEFAULT_AMOUNT_COLORS
+  );
+}
+
+/**
+ * 訂閱報表頁上次選擇的期間模式（月／季／年）。
+ */
+export function useReportPeriodKind(): PeriodKind {
+  return useLiveQuery(async () => getReportPeriodKind(db), []) ?? 'month';
+}
+
+/**
+ * 訂閱所有未刪除的常用備註（依 sortOrder 排序）。
+ */
+export function useNotePresets(): NotePreset[] {
+  return (
+    useLiveQuery(async () => {
+      const rows = await db.notePresets.orderBy('sortOrder').toArray();
+      return rows.filter((p) => !p.deleted);
+    }, []) ?? []
+  );
+}
+
+/**
+ * 訂閱是否啟用「自動加入常用備註」本機設定。
+ */
+export function useAutoAddNotePresets(): boolean {
+  return useLiveQuery(async () => getAutoAddNotePresets(db), []) ?? true;
 }

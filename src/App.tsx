@@ -8,7 +8,10 @@ import {
   useActiveAccounts,
   useAllAccounts,
   useAllCategories,
+  useAmountColors,
+  useAutoAddNotePresets,
   useLastUsedMeta,
+  useNotePresets,
   useTransactions,
 } from './hooks/useExpenseData';
 import { AccountsPage } from './pages/AccountsPage';
@@ -28,6 +31,9 @@ export function App() {
   const categories = useAllCategories();
   const transactions = useTransactions();
   const lastUsed = useLastUsedMeta();
+  const amountColors = useAmountColors();
+  const notePresets = useNotePresets();
+  const autoAddNotePresets = useAutoAddNotePresets();
   const syncState = useSyncState();
 
   useEffect(() => {
@@ -75,6 +81,7 @@ export function App() {
                   transactions={transactions}
                   accountMap={accountMap}
                   categoryMap={categoryMap}
+                  amountColors={amountColors}
                   syncState={syncState}
                   onOpenCreate={handleOpenCreate}
                   onEditTransaction={handleEditTransaction}
@@ -90,13 +97,20 @@ export function App() {
                   categories={categories}
                   accountMap={accountMap}
                   categoryMap={categoryMap}
+                  amountColors={amountColors}
                   onEditTransaction={handleEditTransaction}
                 />
               }
             />
             <Route
               path="/reports"
-              element={<ReportsPage transactions={transactions} categories={categories} />}
+              element={
+                <ReportsPage
+                  transactions={transactions}
+                  categories={categories}
+                  amountColors={amountColors}
+                />
+              }
             />
             <Route
               path="/accounts"
@@ -108,6 +122,7 @@ export function App() {
                   transactions={transactions}
                   accountMap={accountMap}
                   categoryMap={categoryMap}
+                  amountColors={amountColors}
                   onEditTransaction={handleEditTransaction}
                 />
               }
@@ -119,6 +134,9 @@ export function App() {
                   accounts={allAccounts}
                   categories={categories}
                   transactions={transactions}
+                  amountColors={amountColors}
+                  notePresets={notePresets}
+                  autoAddNotePresets={autoAddNotePresets}
                 />
               }
             />
@@ -133,6 +151,8 @@ export function App() {
           accounts={activeAccounts}
           categories={categories}
           lastUsed={lastUsed}
+          amountColors={amountColors}
+          notePresets={notePresets}
           onClose={handleCloseSheet}
         />
       </div>

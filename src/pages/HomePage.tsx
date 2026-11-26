@@ -1,6 +1,7 @@
 import { useMemo } from 'react';
 import { Link } from 'react-router-dom';
 import { TransactionRow } from '../components/TransactionRow';
+import type { AmountColors } from '../db/repository';
 import type { Account, Category, Transaction } from '../db/types';
 import { formatCurrency, formatMonthLabel, getCurrentMonthString, monthSummary } from '../domain';
 import { formatSyncStatusText, type SyncState } from '../sync/syncManager';
@@ -9,6 +10,7 @@ interface HomePageProps {
   transactions: readonly Transaction[];
   accountMap: ReadonlyMap<string, Account>;
   categoryMap: ReadonlyMap<string, Category>;
+  amountColors: AmountColors;
   syncState: SyncState;
   onOpenCreate: () => void;
   onEditTransaction: (tx: Transaction) => void;
@@ -18,6 +20,7 @@ export function HomePage({
   transactions,
   accountMap,
   categoryMap,
+  amountColors,
   syncState,
   onOpenCreate,
   onEditTransaction,
@@ -43,13 +46,13 @@ export function HomePage({
         <div className="grid grid-cols-3 gap-3">
           <div>
             <div className="text-xs text-slate-300">本月支出</div>
-            <div className="mt-1 text-lg font-bold tabular-nums text-red-400">
+            <div className="mt-1 text-lg font-bold tabular-nums" style={{ color: amountColors.expense }}>
               {formatCurrency(summary.expense)}
             </div>
           </div>
           <div>
             <div className="text-xs text-slate-300">本月收入</div>
-            <div className="mt-1 text-lg font-bold tabular-nums text-emerald-400">
+            <div className="mt-1 text-lg font-bold tabular-nums" style={{ color: amountColors.income }}>
               {formatCurrency(summary.income)}
             </div>
           </div>
@@ -83,6 +86,7 @@ export function HomePage({
                 transaction={tx}
                 accountMap={accountMap}
                 categoryMap={categoryMap}
+                amountColors={amountColors}
                 onSelect={onEditTransaction}
                 showDate
               />

@@ -1,6 +1,6 @@
 import type { EntityTable, IDType } from 'dexie';
 import { db, type ExpenseDatabase, META_KEYS } from '../db/database';
-import type { Account, BaseRecord, Category, OutboxEntry, Transaction } from '../db/types';
+import type { Account, BaseRecord, Category, NotePreset, OutboxEntry, Transaction } from '../db/types';
 import type { DriveFile, DriveStore } from './driveStore';
 import { mergeRecord } from './merge';
 
@@ -12,6 +12,7 @@ export interface SyncRecordsPayload {
   accounts: Account[];
   categories: Category[];
   transactions: Transaction[];
+  notePresets?: NotePreset[];
 }
 
 export interface ChangeBatchFile {
@@ -108,12 +109,14 @@ async function applyRemoteRecords(
     database.accounts,
     database.categories,
     database.transactions,
+    database.notePresets,
     database.meta,
     async () => {
       await Promise.all([
         mergeTableRecords(database.accounts, records.accounts),
         mergeTableRecords(database.categories, records.categories),
         mergeTableRecords(database.transactions, records.transactions),
+        mergeTableRecords(database.notePresets, records.notePresets ?? []),
       ]);
 
       for (const item of seenUpdates) {
@@ -134,18 +137,21 @@ async function buildOutboxRecords(
   const accountIds: string[] = [];
   const categoryIds: string[] = [];
   const transactionIds: string[] = [];
+  const notePresetIds: string[] = [];
 
   for (const entry of entries) {
     if (entry.table === 'accounts') {
       accountIds.push(entry.recordId);
     } else if (entry.table === 'categories') {
       categoryIds.push(entry.recordId);
+    } else if (entry.table === 'notePresets') {
+      notePresetIds.push(entry.recordId);
     } else {
       transactionIds.push(entry.recordId);
     }
   }
 
-  const [accountsRaw, categoriesRaw, transactionsRaw] = await Promise.all([
+  const [accountsRaw, categoriesRaw, transactionsRaw, notePresetsRaw] = await Promise.all([
     accountIds.length > 0
       ? database.accounts.bulkGet(accountIds)
       : Promise.resolve<Array<Account | undefined>>([]),
@@ -155,6 +161,9 @@ async function buildOutboxRecords(
     transactionIds.length > 0
       ? database.transactions.bulkGet(transactionIds)
       : Promise.resolve<Array<Transaction | undefined>>([]),
+    notePresetIds.length > 0
+      ? database.notePresets.bulkGet(notePresetIds)
+      : Promise.resolve<Array<NotePreset | undefined>>([]),
   ]);
 
   const accounts: Account[] = [];
@@ -175,8 +184,14 @@ async function buildOutboxRecords(
       transactions.push(item);
     }
   }
+  const notePresets: NotePreset[] = [];
+  for (const item of notePresetsRaw) {
+    if (item) {
+      notePresets.push(item);
+    }
+  }
 
-  return { accounts, categories, transactions };
+  return { accounts, categories, transactions, notePresets };
 }
 
 /**
@@ -271,10 +286,11 @@ export async function syncOnce(options: SyncOnceOptions): Promise<SyncOnceResult
 
   // 6. 變更檔總數超過門檻時，產生新的 snapshot.json 並清理已包含的變更檔
   if (changeFiles.length > snapshotThreshold) {
-    const [accounts, categories, transactions, allMeta] = await Promise.all([
+    const [accounts, categories, transactions, notePresets, allMeta] = await Promise.all([
       database.accounts.toArray(),
       database.categories.toArray(),
       database.transactions.toArray(),
+      database.notePresets.toArray(),
       database.meta.toArray(),
     ]);
 
@@ -297,7 +313,7 @@ export async function syncOnce(options: SyncOnceOptions): Promise<SyncOnceResult
     const snapshot: SnapshotFile = {
       createdAt: Date.now(),
       includes,
-      records: { accounts, categories, transactions },
+      records: { accounts, categories, transactions, notePresets },
     };
     const snapshotJson = JSON.stringify(snapshot);
 

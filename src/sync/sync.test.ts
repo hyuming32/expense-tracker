@@ -4,7 +4,9 @@ import { ExpenseDatabase, META_KEYS, ensureSeeded } from '../db/database';
 import {
   saveAccount,
   saveCategory,
+  saveNotePreset,
   saveTransaction,
+  softDeleteNotePreset,
   softDeleteTransaction,
 } from '../db/repository';
 import type { Transaction } from '../db/types';
@@ -263,7 +265,7 @@ describe('syncOnce 雙裝置與快照同步', () => {
       dbA,
     );
 
-    expect(await dbA.outbox.count()).toBe(1);
+    expect(await dbA.outbox.count()).toBe(2);
     drive.failNextUpload = true;
 
     await expect(
@@ -271,12 +273,12 @@ describe('syncOnce 雙裝置與快照同步', () => {
     ).rejects.toThrow('模擬上傳失敗');
 
     // outbox 仍保留，localSeq 尚未寫入
-    expect(await dbA.outbox.count()).toBe(1);
+    expect(await dbA.outbox.count()).toBe(2);
     expect(await dbA.meta.get(META_KEYS.SYNC_LOCAL_SEQ)).toBeUndefined();
 
     // 下次同步成功清掉 outbox 並更新 localSeq
     const result = await syncOnce({ database: dbA, driveStore: drive, deviceId: 'device-a' });
-    expect(result.uploadedCount).toBe(1);
+    expect(result.uploadedCount).toBe(2);
     expect(await dbA.outbox.count()).toBe(0);
     expect((await dbA.meta.get(META_KEYS.SYNC_LOCAL_SEQ))?.value).toBe('1');
   });
@@ -318,5 +320,61 @@ describe('syncOnce 雙裝置與快照同步', () => {
 
     expect(aMatchedAccount?.name).toBe('現金');
     expect(aMatchedCategory?.name).toBe('午餐');
+  });
+
+  it('交易的 invoiceNo 會在雙裝置同步合併後完整保留', async () => {
+    const drive = new MemoryDriveStore();
+    const dbA = createTestDb('invoice-sync-a');
+    const dbB = createTestDb('invoice-sync-b');
+
+    const tx = await saveTransaction(
+      {
+        kind: 'expense',
+        date: '2026-11-26',
+        amount: 240,
+        accountId: 'seed-acc-cash',
+        toAccountId: null,
+        categoryId: 'seed-cat-food',
+        note: '超商購物',
+        invoiceNo: 'EF11223344',
+      },
+      dbA,
+    );
+
+    await syncOnce({ database: dbA, driveStore: drive, deviceId: 'device-a' });
+    await syncOnce({ database: dbB, driveStore: drive, deviceId: 'device-b' });
+
+    const syncedTx = await dbB.transactions.get(tx.id);
+    expect(syncedTx?.invoiceNo).toBe('EF11223344');
+  });
+
+  it('常用備註（notePresets）的新增與軟刪除會在兩裝置同步後完全一致', async () => {
+    const drive = new MemoryDriveStore();
+    const dbA = createTestDb('preset-sync-a');
+    const dbB = createTestDb('preset-sync-b');
+
+    const presetA = await saveNotePreset({ text: 'A 常用備註', categoryId: 'seed-cat-food' }, dbA);
+    const presetB = await saveNotePreset({ text: 'B 常用備註', categoryId: null }, dbB);
+
+    await syncOnce({ database: dbA, driveStore: drive, deviceId: 'device-a' });
+    await syncOnce({ database: dbB, driveStore: drive, deviceId: 'device-b' });
+    await syncOnce({ database: dbA, driveStore: drive, deviceId: 'device-a' });
+
+    const [aPresets1, bPresets1] = await Promise.all([
+      dbA.notePresets.orderBy('id').toArray(),
+      dbB.notePresets.orderBy('id').toArray(),
+    ]);
+    expect(aPresets1).toEqual(bPresets1);
+    expect(aPresets1).toHaveLength(2);
+
+    // A 軟刪除 presetB 後再同步
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    await softDeleteNotePreset(presetB.id, dbA);
+    await syncOnce({ database: dbA, driveStore: drive, deviceId: 'device-a' });
+    await syncOnce({ database: dbB, driveStore: drive, deviceId: 'device-b' });
+
+    expect((await dbB.notePresets.get(presetA.id))?.deleted).toBe(false);
+    expect((await dbB.notePresets.get(presetB.id))?.deleted).toBe(true);
+    expect(await dbB.outbox.count()).toBe(0);
   });
 });

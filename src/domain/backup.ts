@@ -6,7 +6,7 @@ const KIND_LABELS: Record<TransactionKind, string> = {
   transfer: '轉帳',
 };
 
-const CSV_HEADER = ['日期', '類型', '金額', '分類', '子分類', '帳戶', '轉入帳戶', '備註'];
+const CSV_HEADER = ['日期', '類型', '金額', '分類', '子分類', '帳戶', '轉入帳戶', '備註', '發票號碼'];
 
 function escapeCsvCell(value: string): string {
   if (/[",\n\r]/.test(value)) {
@@ -57,6 +57,7 @@ export function toCsv(
       accountName,
       toAccountName,
       tx.note ?? '',
+      tx.invoiceNo ?? '',
     ];
 
     lines.push(row.map(escapeCsvCell).join(','));

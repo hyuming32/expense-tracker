@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState } from 'react';
 import { TransactionRow } from '../components/TransactionRow';
+import type { AmountColors } from '../db/repository';
 import type { Account, Category, Transaction } from '../db/types';
 import {
   formatCurrency,
@@ -16,6 +17,7 @@ interface TransactionsPageProps {
   categories: readonly Category[];
   accountMap: ReadonlyMap<string, Account>;
   categoryMap: ReadonlyMap<string, Category>;
+  amountColors: AmountColors;
   onEditTransaction: (tx: Transaction) => void;
   initialAccountId?: string;
   onBack?: () => void;
@@ -27,6 +29,7 @@ export function TransactionsPage({
   categories,
   accountMap,
   categoryMap,
+  amountColors,
   onEditTransaction,
   initialAccountId = '',
   onBack,
@@ -177,12 +180,12 @@ export function TransactionsPage({
                 </span>
                 <div className="flex items-center gap-3 tabular-nums">
                   {group.incomeTotal > 0 && (
-                    <span className="text-emerald-600 dark:text-emerald-400">
+                    <span style={{ color: amountColors.income }}>
                       收 {formatCurrency(group.incomeTotal)}
                     </span>
                   )}
                   {group.expenseTotal > 0 && (
-                    <span className="text-red-600 dark:text-red-400">
+                    <span style={{ color: amountColors.expense }}>
                       支 {formatCurrency(group.expenseTotal)}
                     </span>
                   )}
@@ -196,6 +199,7 @@ export function TransactionsPage({
                     transaction={tx}
                     accountMap={accountMap}
                     categoryMap={categoryMap}
+                    amountColors={amountColors}
                     onSelect={onEditTransaction}
                   />
                 ))}

@@ -1,12 +1,21 @@
 import { describe, expect, it } from 'vitest';
-import type { Account, Category, Transaction } from '../db/types';
+import type { Account, Category, NotePreset, Transaction } from '../db/types';
 import {
   accountBalance,
   categoryBreakdown,
+  categoryCompare,
+  clipToElapsed,
+  compareSummary,
   groupByDay,
   mergeBackup,
   monthSummary,
   monthlyTrend,
+  periodRange,
+  periodSummary,
+  periodTrend,
+  sameLastYear,
+  selectQuickNotePresets,
+  shiftPeriod,
   toCsv,
   validateTransaction,
 } from './index';
@@ -278,6 +287,7 @@ describe('toCsv', () => {
         accountId: 'acc-cash',
         categoryId: 'cat-lunch',
         note: '便當, 加"蛋"\n外帶',
+        invoiceNo: 'AB12345678',
       }),
       makeTx({
         id: '2',
@@ -303,9 +313,9 @@ describe('toCsv', () => {
     const content = csv.slice(1);
     expect(content).toBe(
       [
-        '日期,類型,金額,分類,子分類,帳戶,轉入帳戶,備註',
-        '2026-11-05,轉帳,3000,,,"銀行,帳戶",現金,',
-        '2026-11-01,支出,120,飲食,午餐,現金,,"便當, 加""蛋""\n外帶"',
+        '日期,類型,金額,分類,子分類,帳戶,轉入帳戶,備註,發票號碼',
+        '2026-11-05,轉帳,3000,,,"銀行,帳戶",現金,,',
+        '2026-11-01,支出,120,飲食,午餐,現金,,"便當, 加""蛋""\n外帶",AB12345678',
       ].join('\n'),
     );
   });
@@ -331,5 +341,273 @@ describe('mergeBackup', () => {
     expect(byId.get('a2')?.name).toBe('本地獨有');
     expect(byId.get('a3')?.name).toBe('本地較新');
     expect(byId.get('a4')?.name).toBe('匯入獨有');
+  });
+});
+
+describe('periodRange / shiftPeriod / sameLastYear', () => {
+  it('計算月、自然季與年的起訖日期，並支援跨年 Q4 與 Q1 切換', () => {
+    const q4 = periodRange('quarter', '2025-11-15');
+    expect(q4).toEqual({
+      kind: 'quarter',
+      start: '2025-10-01',
+      end: '2025-12-31',
+      label: '2025 年 第 4 季（10–12 月）',
+    });
+
+    const nextQ1 = shiftPeriod(q4, 1);
+    expect(nextQ1).toEqual({
+      kind: 'quarter',
+      start: '2026-01-01',
+      end: '2026-03-31',
+      label: '2026 年 第 1 季（1–3 月）',
+    });
+
+    expect(shiftPeriod(nextQ1, -1)).toEqual(q4);
+
+    expect(periodRange('month', '2026-11-26')).toEqual({
+      kind: 'month',
+      start: '2026-11-01',
+      end: '2026-11-30',
+      label: '2026 年 11 月',
+    });
+
+    expect(periodRange('year', '2026-11-26')).toEqual({
+      kind: 'year',
+      start: '2026-01-01',
+      end: '2026-12-31',
+      label: '2026 年',
+    });
+  });
+
+  it('正確處理閏年 2/29 的去年同期', () => {
+    const leapFeb = periodRange('month', '2024-02-29');
+    expect(leapFeb.end).toBe('2024-02-29');
+
+    const prevYearFeb = sameLastYear(leapFeb);
+    expect(prevYearFeb).toEqual({
+      kind: 'month',
+      start: '2023-02-01',
+      end: '2023-02-28',
+      label: '2023 年 2 月',
+    });
+
+    const normalFeb = periodRange('month', '2025-02-10');
+    expect(sameLastYear(normalFeb).end).toBe('2024-02-29');
+  });
+});
+
+describe('clipToElapsed', () => {
+  it('進行中期間將比較期裁切至相同已過天數，月底日數不同時以較短者為準', () => {
+    const nov = periodRange('month', '2026-11-26');
+    const oct = shiftPeriod(nov, -1);
+    const clipped = clipToElapsed(nov, oct, '2026-11-26');
+
+    expect(clipped.isInProgress).toBe(true);
+    expect(clipped.range.end).toBe('2026-11-26');
+    expect(clipped.compareRange.start).toBe('2026-10-01');
+    expect(clipped.compareRange.end).toBe('2026-10-26');
+
+    // 3/31 對比 2 月時，以較短的 2/28 為準
+    const mar = periodRange('month', '2026-03-31');
+    const feb = shiftPeriod(mar, -1);
+    const clippedMar = clipToElapsed(mar, feb, '2026-03-31');
+    expect(clippedMar.isInProgress).toBe(true);
+    expect(clippedMar.range.end).toBe('2026-03-31');
+    expect(clippedMar.compareRange.end).toBe('2026-02-28');
+
+    // 已結束期間不裁切
+    const past = clipToElapsed(oct, shiftPeriod(oct, -1), '2026-11-26');
+    expect(past.isInProgress).toBe(false);
+    expect(past.range.end).toBe('2026-10-31');
+    expect(past.compareRange.end).toBe('2026-09-30');
+  });
+});
+
+describe('periodSummary & compareSummary', () => {
+  it('計算期間收支並排除轉帳與已刪除，比較期為 0 時 pct 為 null', () => {
+    const range = periodRange('quarter', '2026-11-26');
+    const txs: Transaction[] = [
+      makeTx({ id: '1', kind: 'income', date: '2026-10-05', amount: 60000, categoryId: 'cat-salary' }),
+      makeTx({ id: '2', kind: 'expense', date: '2026-11-10', amount: 15000 }),
+      makeTx({
+        id: '3',
+        kind: 'transfer',
+        date: '2026-11-15',
+        amount: 20000,
+        accountId: 'acc-bank',
+        toAccountId: 'acc-cash',
+        categoryId: null,
+      }),
+      makeTx({ id: '4', kind: 'expense', date: '2026-11-20', amount: 9999, deleted: true }),
+      makeTx({ id: '5', kind: 'expense', date: '2026-09-30', amount: 5000 }),
+    ];
+
+    expect(periodSummary(txs, range)).toEqual({
+      income: 60000,
+      expense: 15000,
+      net: 45000,
+    });
+
+    expect(compareSummary(1500, 0)).toEqual({ diff: 1500, pct: null });
+    expect(compareSummary(0, 0)).toEqual({ diff: 0, pct: null });
+    expect(compareSummary(1120, 1000)).toEqual({ diff: 120, pct: 12 });
+    expect(compareSummary(950, 1000)).toEqual({ diff: -50, pct: -5 });
+  });
+});
+
+describe('categoryCompare', () => {
+  it('依增減金額絕對值由大到小排序、子分類併入父分類且不計入轉帳', () => {
+    const categories: Category[] = [
+      { id: 'cat-food', name: '飲食', icon: '🍽️', kind: 'expense', parentId: null, sortOrder: 1, archived: false, ...baseMeta },
+      { id: 'cat-lunch', name: '午餐', icon: '🍱', kind: 'expense', parentId: 'cat-food', sortOrder: 1, archived: false, ...baseMeta },
+      { id: 'cat-dinner', name: '晚餐', icon: '🍜', kind: 'expense', parentId: 'cat-food', sortOrder: 2, archived: false, ...baseMeta },
+      { id: 'cat-traffic', name: '交通', icon: '🚇', kind: 'expense', parentId: null, sortOrder: 2, archived: false, ...baseMeta },
+      { id: 'cat-salary', name: '薪資', icon: '💰', kind: 'income', parentId: null, sortOrder: 1, archived: false, ...baseMeta },
+    ];
+
+    const currentRange = periodRange('month', '2026-11-01');
+    const prevRange = shiftPeriod(currentRange, -1);
+
+    const txs: Transaction[] = [
+      // 本期：飲食 500（午餐 300、晚餐 200），交通 100
+      makeTx({ id: '1', kind: 'expense', date: '2026-11-05', amount: 300, categoryId: 'cat-lunch' }),
+      makeTx({ id: '2', kind: 'expense', date: '2026-11-06', amount: 200, categoryId: 'cat-dinner' }),
+      makeTx({ id: '3', kind: 'expense', date: '2026-11-07', amount: 100, categoryId: 'cat-traffic' }),
+      // 轉帳與收入不計入
+      makeTx({ id: '4', kind: 'transfer', date: '2026-11-08', amount: 50000, toAccountId: 'acc-bank', categoryId: null }),
+      makeTx({ id: '5', kind: 'income', date: '2026-11-09', amount: 40000, categoryId: 'cat-salary' }),
+      // 上期：飲食 200（午餐 200），交通 800 -> 交通 diff = -700（|diff|=700）應排第一，飲食 diff = +300 排第二
+      makeTx({ id: '6', kind: 'expense', date: '2026-10-05', amount: 200, categoryId: 'cat-lunch' }),
+      makeTx({ id: '7', kind: 'expense', date: '2026-10-10', amount: 800, categoryId: 'cat-traffic' }),
+    ];
+
+    const rows = categoryCompare(txs, categories, currentRange, prevRange);
+    expect(rows).toHaveLength(2);
+    expect(rows[0]).toMatchObject({
+      categoryId: 'cat-traffic',
+      current: 100,
+      previous: 800,
+      diff: -700,
+      pct: -87.5,
+      children: [],
+    });
+    expect(rows[1]).toMatchObject({
+      categoryId: 'cat-food',
+      current: 500,
+      previous: 200,
+      diff: 300,
+      pct: 150,
+    });
+    expect(rows[1]?.children).toEqual([
+      {
+        categoryId: 'cat-dinner',
+        name: '晚餐',
+        icon: '🍜',
+        current: 200,
+        previous: 0,
+        diff: 200,
+        pct: null,
+      },
+      {
+        categoryId: 'cat-lunch',
+        name: '午餐',
+        icon: '🍱',
+        current: 300,
+        previous: 200,
+        diff: 100,
+        pct: 50,
+      },
+    ]);
+  });
+});
+
+describe('periodTrend', () => {
+  it('支援季模式最近 8 季與去年同期支出對照，並排除轉帳', () => {
+    const endRange = periodRange('quarter', '2026-11-01');
+    const txs: Transaction[] = [
+      makeTx({ id: '1', kind: 'income', date: '2026-10-10', amount: 80000, categoryId: 'cat-salary' }),
+      makeTx({ id: '2', kind: 'expense', date: '2026-10-12', amount: 12000 }),
+      makeTx({ id: '3', kind: 'expense', date: '2025-11-05', amount: 9500 }),
+      makeTx({ id: '4', kind: 'transfer', date: '2026-10-15', amount: 50000, toAccountId: 'acc-bank', categoryId: null }),
+    ];
+
+    const trend = periodTrend(txs, 'quarter', endRange, 8);
+    expect(trend).toHaveLength(8);
+    expect(trend[7]).toEqual({
+      key: '2026-Q4',
+      shortLabel: '26 Q4',
+      label: '2026 年 第 4 季（10–12 月）',
+      income: 80000,
+      expense: 12000,
+      lastYearExpense: 9500,
+    });
+  });
+});
+
+describe('selectQuickNotePresets', () => {
+  const categories: Category[] = [
+    { id: 'cat-food', name: '飲食', icon: '🍽️', kind: 'expense', parentId: null, sortOrder: 1, archived: false, ...baseMeta },
+    { id: 'cat-lunch', name: '午餐', icon: '🍱', kind: 'expense', parentId: 'cat-food', sortOrder: 1, archived: false, ...baseMeta },
+    { id: 'cat-transport', name: '交通', icon: '🚇', kind: 'expense', parentId: null, sortOrder: 2, archived: false, ...baseMeta },
+  ];
+
+  function makePreset(overrides: Partial<NotePreset>): NotePreset {
+    return {
+      id: 'p-1',
+      text: '便當',
+      categoryId: null,
+      useCount: 1,
+      lastUsedAt: 1000,
+      sortOrder: 1,
+      ...baseMeta,
+      ...overrides,
+    };
+  }
+
+  it('依分類（含父分類）優先、再依 useCount、lastUsedAt 排序，最多 12 個並排除已刪除', () => {
+    const presets: NotePreset[] = [
+      makePreset({ id: 'g-low', text: '全域少用', categoryId: null, useCount: 1, lastUsedAt: 5000 }),
+      makePreset({ id: 'g-high', text: '全域常用', categoryId: null, useCount: 99, lastUsedAt: 9000 }),
+      makePreset({ id: 'other-cat', text: '捷運', categoryId: 'cat-transport', useCount: 50 }),
+      makePreset({ id: 'deleted-cat', text: '已刪除', categoryId: 'cat-lunch', useCount: 100, deleted: true }),
+      makePreset({ id: 'parent-cat', text: '父分類備註', categoryId: 'cat-food', useCount: 3, lastUsedAt: 2000 }),
+      makePreset({ id: 'exact-old', text: '子分類舊', categoryId: 'cat-lunch', useCount: 2, lastUsedAt: 1000 }),
+      makePreset({ id: 'exact-new', text: '子分類新', categoryId: 'cat-lunch', useCount: 2, lastUsedAt: 3000 }),
+    ];
+
+    const result = selectQuickNotePresets({
+      presets,
+      categories,
+      categoryId: 'cat-lunch',
+    });
+
+    expect(result.map((p) => p.id)).toEqual([
+      'parent-cat',
+      'exact-new',
+      'exact-old',
+      'g-high',
+      'g-low',
+    ]);
+
+    const manyPresets = Array.from({ length: 15 }, (_, idx) =>
+      makePreset({ id: `m-${idx}`, text: `備註-${idx}`, categoryId: null, useCount: 20 - idx }),
+    );
+    expect(selectQuickNotePresets({ presets: manyPresets, categories, categoryId: null })).toHaveLength(12);
+  });
+
+  it('支援依輸入文字即時包含篩選（不分大小寫）', () => {
+    const presets: NotePreset[] = [
+      makePreset({ id: '1', text: 'Starbucks 拿鐵', categoryId: 'cat-food' }),
+      makePreset({ id: '2', text: '7-11 咖啡', categoryId: 'cat-food' }),
+      makePreset({ id: '3', text: '牛肉麵', categoryId: 'cat-food' }),
+    ];
+
+    const filtered = selectQuickNotePresets({
+      presets,
+      categories,
+      categoryId: 'cat-food',
+      query: 'star',
+    });
+    expect(filtered.map((p) => p.id)).toEqual(['1']);
   });
 });

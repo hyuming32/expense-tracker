@@ -3,6 +3,10 @@
 @tailwind utilities;
 
 @layer base {
+  html {
+    color-scheme: light dark;
+  }
+
   html,
   body {
     -webkit-tap-highlight-color: transparent;

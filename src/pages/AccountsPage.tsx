@@ -1,4 +1,5 @@
 import { useMemo, useState } from 'react';
+import type { AmountColors } from '../db/repository';
 import type { Account, AccountType, Category, Transaction } from '../db/types';
 import { accountBalance, formatCurrency } from '../domain';
 import { TransactionsPage } from './TransactionsPage';
@@ -10,6 +11,7 @@ interface AccountsPageProps {
   transactions: readonly Transaction[];
   accountMap: ReadonlyMap<string, Account>;
   categoryMap: ReadonlyMap<string, Category>;
+  amountColors: AmountColors;
   onEditTransaction: (tx: Transaction) => void;
 }
 
@@ -26,6 +28,7 @@ export function AccountsPage({
   transactions,
   accountMap,
   categoryMap,
+  amountColors,
   onEditTransaction,
 }: AccountsPageProps) {
   const [selectedAccountId, setSelectedAccountId] = useState<string | null>(null);
@@ -52,6 +55,7 @@ export function AccountsPage({
         categories={categories}
         accountMap={accountMap}
         categoryMap={categoryMap}
+        amountColors={amountColors}
         onEditTransaction={onEditTransaction}
         initialAccountId={selectedAccountId}
         onBack={() => setSelectedAccountId(null)}
@@ -107,10 +111,9 @@ export function AccountsPage({
                     )}
                     <span
                       className={`text-sm font-semibold tabular-nums ${
-                        balance < 0
-                          ? 'text-red-600 dark:text-red-400'
-                          : 'text-slate-900 dark:text-slate-100'
+                        balance < 0 ? '' : 'text-slate-900 dark:text-slate-100'
                       }`}
+                      style={balance < 0 ? { color: amountColors.expense } : undefined}
                     >
                       {formatCurrency(balance)}
                     </span>

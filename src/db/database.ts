@@ -1,12 +1,16 @@
 import Dexie, { type EntityTable, type Table } from 'dexie';
 import { getDeviceId } from './deviceId';
-import type { Account, Category, MetaEntry, OutboxEntry, Transaction } from './types';
+import type { Account, Category, MetaEntry, NotePreset, OutboxEntry, Transaction } from './types';
 
 export const META_KEYS = {
   DEVICE_ID: 'deviceId',
   LAST_ACCOUNT_ID: 'lastAccountId',
   LAST_EXPENSE_CATEGORY_ID: 'lastExpenseCategoryId',
   LAST_INCOME_CATEGORY_ID: 'lastIncomeCategoryId',
+  COLOR_EXPENSE: 'color.expense',
+  COLOR_INCOME: 'color.income',
+  REPORT_PERIOD_KIND: 'reportPeriodKind',
+  AUTO_ADD_NOTE_PRESETS: 'autoAddNotePresets',
   SYNC_LOCAL_SEQ: 'localSeq',
   SYNC_LAST_SYNC_AT: 'lastSyncAt',
   SYNC_SEEN_PREFIX: 'seen.',
@@ -56,6 +60,7 @@ export class ExpenseDatabase extends Dexie {
   accounts!: EntityTable<Account, 'id'>;
   categories!: EntityTable<Category, 'id'>;
   transactions!: EntityTable<Transaction, 'id'>;
+  notePresets!: EntityTable<NotePreset, 'id'>;
   meta!: Table<MetaEntry, string>;
   outbox!: Table<OutboxEntry, string>;
 
@@ -253,6 +258,21 @@ export class ExpenseDatabase extends Dexie {
           metaToPut.length > 0 ? metaTable.bulkPut(metaToPut) : Promise.resolve(),
         ]);
       });
+    this.version(4).stores({
+      accounts: 'id, updatedAt, deleted, sortOrder',
+      categories: 'id, kind, parentId, updatedAt, deleted, sortOrder',
+      transactions: 'id, kind, date, accountId, toAccountId, categoryId, invoiceNo, updatedAt, deleted',
+      meta: 'key',
+      outbox: 'key, table, recordId, updatedAt',
+    });
+    this.version(5).stores({
+      accounts: 'id, updatedAt, deleted, sortOrder',
+      categories: 'id, kind, parentId, updatedAt, deleted, sortOrder',
+      transactions: 'id, kind, date, accountId, toAccountId, categoryId, invoiceNo, updatedAt, deleted',
+      notePresets: 'id, categoryId, useCount, lastUsedAt, sortOrder, updatedAt, deleted',
+      meta: 'key',
+      outbox: 'key, table, recordId, updatedAt',
+    });
   }
 }
 

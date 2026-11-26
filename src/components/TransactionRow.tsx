@@ -1,3 +1,4 @@
+import type { AmountColors } from '../db/repository';
 import type { Account, Category, Transaction } from '../db/types';
 import { formatCurrency } from '../domain';
 
@@ -5,20 +6,16 @@ interface TransactionRowProps {
   transaction: Transaction;
   categoryMap: ReadonlyMap<string, Category>;
   accountMap: ReadonlyMap<string, Account>;
+  amountColors: AmountColors;
   onSelect: (tx: Transaction) => void;
   showDate?: boolean;
 }
-
-const AMOUNT_COLOR_CLASS: Record<Transaction['kind'], string> = {
-  expense: 'text-red-600 dark:text-red-400',
-  income: 'text-emerald-600 dark:text-emerald-400',
-  transfer: 'text-slate-500 dark:text-slate-400',
-};
 
 export function TransactionRow({
   transaction,
   categoryMap,
   accountMap,
+  amountColors,
   onSelect,
   showDate = false,
 }: TransactionRowProps) {
@@ -69,7 +66,18 @@ export function TransactionRow({
         </div>
       </div>
 
-      <span className={`shrink-0 text-sm font-semibold tabular-nums ${AMOUNT_COLOR_CLASS[transaction.kind]}`}>
+      <span
+        className={`shrink-0 text-sm font-semibold tabular-nums ${
+          transaction.kind === 'transfer' ? 'text-slate-500 dark:text-slate-400' : ''
+        }`}
+        style={
+          transaction.kind === 'expense'
+            ? { color: amountColors.expense }
+            : transaction.kind === 'income'
+              ? { color: amountColors.income }
+              : undefined
+        }
+      >
         {formatCurrency(transaction.amount)}
       </span>
     </button>
