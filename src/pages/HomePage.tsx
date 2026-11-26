@@ -1,4 +1,4 @@
-import { Fragment, useEffect, useMemo, useRef, useState } from 'react';
+import { Fragment, useMemo, useRef, useState } from 'react';
 import { Link } from 'react-router-dom';
 import {
   type BeforeInstallPromptEvent,
@@ -46,16 +46,7 @@ import {
   type QuickTextResult,
   shiftDate,
 } from '../domain';
-import {
-  detectInstallPlatform,
-  getHomeReminderCard,
-  type InstallPlatform,
-} from '../domain/onboarding';
-import {
-  chooseVoiceInputMode,
-  describeSpeechError,
-  KEYBOARD_DICTATION_TIP,
-} from '../domain/voiceInput';
+import { getHomeReminderCard, type InstallPlatform } from '../domain/onboarding';
 import { useOutboxCount } from '../hooks/useExpenseData';
 import {
   formatSyncStatusText,
@@ -65,34 +56,6 @@ import {
   triggerSync,
 } from '../sync/syncManager';
 
-interface SpeechRecognitionResultEvent {
-  results: ArrayLike<ArrayLike<{ transcript: string }>>;
-}
-
-interface BrowserSpeechRecognition {
-  lang: string;
-  interimResults: boolean;
-  maxAlternatives: number;
-  onresult: ((event: SpeechRecognitionResultEvent) => void) | null;
-  onerror: ((event: { error?: string }) => void) | null;
-  onend: (() => void) | null;
-  start: () => void;
-  stop: () => void;
-  abort: () => void;
-}
-
-type SpeechRecognitionConstructor = new () => BrowserSpeechRecognition;
-
-function getSpeechRecognitionCtor(): SpeechRecognitionConstructor | null {
-  if (typeof window === 'undefined') {
-    return null;
-  }
-  const win = window as unknown as {
-    SpeechRecognition?: SpeechRecognitionConstructor;
-    webkitSpeechRecognition?: SpeechRecognitionConstructor;
-  };
-  return win.SpeechRecognition ?? win.webkitSpeechRecognition ?? null;
-}
 
 interface HomePageProps {
   transactions: readonly Transaction[];
@@ -200,27 +163,8 @@ export function HomePage({
   const longPressTimerRef = useRef<number | null>(null);
   const longPressTriggeredRef = useRef(false);
   const [quickText, setQuickText] = useState('');
-  const [isListening, setIsListening] = useState(false);
   const [submittingQuickText, setSubmittingQuickText] = useState(false);
   const [installSheetOpen, setInstallSheetOpen] = useState(false);
-  const recognitionRef = useRef<BrowserSpeechRecognition | null>(null);
-  const quickTextInputRef = useRef<HTMLInputElement | null>(null);
-  const [voiceTip, setVoiceTip] = useState('');
-  const voiceMode = useMemo(
-    () =>
-      typeof navigator === 'undefined'
-        ? 'none'
-        : chooseVoiceInputMode(
-            detectInstallPlatform({
-              userAgent: navigator.userAgent,
-              platform: navigator.platform,
-              maxTouchPoints: navigator.maxTouchPoints,
-            }),
-            getSpeechRecognitionCtor() !== null,
-          ),
-    [],
-  );
-  const speechSupported = voiceMode !== 'none';
 
   const reminderCard = useMemo(() => {
     if (!onboardingMeta) {
@@ -259,18 +203,6 @@ export function HomePage({
     });
   }, [quickText, categories, accounts, places, notePresets, today, defaultAccountId]);
 
-  useEffect(() => {
-    return () => {
-      if (recognitionRef.current) {
-        try {
-          recognitionRef.current.abort();
-        } catch {
-          // 忽略語音辨識清理階段錯誤
-        }
-        recognitionRef.current = null;
-      }
-    };
-  }, []);
 
   function clearLongPressTimer() {
     if (longPressTimerRef.current !== null) {
@@ -310,62 +242,6 @@ export function HomePage({
     onOpenCreate(buildDraftFromParsed(parsedQuickText));
   }
 
-  function handleToggleVoiceInput() {
-    if (voiceMode === 'keyboard-dictation') {
-      // iPhone：Web Speech API 不穩定，改用系統鍵盤聽寫
-      quickTextInputRef.current?.focus();
-      setVoiceTip(KEYBOARD_DICTATION_TIP);
-      return;
-    }
-    setVoiceTip('');
-    if (isListening && recognitionRef.current) {
-      try {
-        recognitionRef.current.stop();
-      } catch {
-        setIsListening(false);
-      }
-      return;
-    }
-    const SpeechCtor = getSpeechRecognitionCtor();
-    if (!SpeechCtor) {
-      return;
-    }
-    try {
-      const recognition = new SpeechCtor();
-      recognition.lang = 'zh-TW';
-      recognition.interimResults = false;
-      recognition.maxAlternatives = 1;
-      let gotResult = false;
-      recognition.onresult = (event) => {
-        gotResult = true;
-        const transcript = event.results[0]?.[0]?.transcript?.trim();
-        if (transcript) {
-          setQuickText((prev) => (prev.trim() ? `${prev.trim()} ${transcript}` : transcript));
-        }
-      };
-      let errorShown = false;
-      recognition.onerror = (event) => {
-        errorShown = true;
-        setVoiceTip(describeSpeechError(event?.error));
-        setIsListening(false);
-        recognitionRef.current = null;
-      };
-      recognition.onend = () => {
-        if (!gotResult && !errorShown) {
-          setVoiceTip(describeSpeechError('no-speech'));
-        }
-        setIsListening(false);
-        recognitionRef.current = null;
-      };
-      recognitionRef.current = recognition;
-      setIsListening(true);
-      recognition.start();
-    } catch {
-      setVoiceTip(describeSpeechError(undefined));
-      setIsListening(false);
-      recognitionRef.current = null;
-    }
-  }
 
   const shortcutsVisible = useMemo(
     () => homeLayout.find((item) => item.key === 'shortcuts')?.visible ?? true,
@@ -501,15 +377,9 @@ export function HomePage({
           <section className="space-y-2">
         <div className="flex items-center gap-2 rounded-2xl border border-slate-200 bg-white px-3 py-2 shadow-sm focus-within:border-emerald-500 dark:border-slate-800 dark:bg-slate-900 dark:focus-within:border-emerald-500">
           <input
-            ref={quickTextInputRef}
             type="text"
             value={quickText}
-            onChange={(e) => {
-              setQuickText(e.target.value);
-              if (voiceTip) {
-                setVoiceTip('');
-              }
-            }}
+            onChange={(e) => setQuickText(e.target.value)}
             onKeyDown={(e) => {
               if (e.key === 'Enter' && !e.nativeEvent.isComposing) {
                 e.preventDefault();
@@ -520,21 +390,6 @@ export function HomePage({
             aria-label="一句話記帳"
             className="min-w-0 flex-1 bg-transparent text-sm text-slate-900 placeholder:text-slate-400 focus:outline-none dark:text-slate-100 dark:placeholder:text-slate-500"
           />
-          {speechSupported && (
-            <button
-              type="button"
-              onClick={handleToggleVoiceInput}
-              aria-label={isListening ? '停止語音輸入' : '語音輸入'}
-              title={isListening ? '聆聽中，點擊停止' : '語音輸入（中文）'}
-              className={`shrink-0 rounded-xl px-2.5 py-1.5 text-sm transition-colors ${
-                isListening
-                  ? 'animate-pulse bg-red-100 text-red-600 dark:bg-red-950/60 dark:text-red-300'
-                  : 'text-slate-500 hover:bg-slate-100 dark:text-slate-400 dark:hover:bg-slate-800'
-              }`}
-            >
-              🎤
-            </button>
-          )}
           <button
             type="button"
             onClick={() => void handleSubmitQuickText()}
@@ -544,12 +399,6 @@ export function HomePage({
             記下
           </button>
         </div>
-
-        {voiceTip && (
-          <p className="rounded-xl bg-amber-50 px-3 py-2 text-xs leading-relaxed text-amber-800 dark:bg-amber-950/40 dark:text-amber-200">
-            {voiceTip}
-          </p>
-        )}
 
         {parsedQuickText && (() => {
           const matchedCategory = parsedQuickText.categoryId
