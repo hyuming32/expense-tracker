@@ -118,6 +118,8 @@ export function TransactionSheet({
   const longPressTriggeredRef = useRef(false);
   const placesRef = useRef(places);
   placesRef.current = places;
+  const currenciesRef = useRef(currencies);
+  currenciesRef.current = currencies;
 
   const [kind, setKind] = useState<TransactionKind>('expense');
   const [amountExpr, setAmountExpr] = useState('');
@@ -348,9 +350,26 @@ export function TransactionSheet({
       const otherAcc = accounts.find((a) => a.id !== defaultAcc)?.id ?? '';
 
       setKind('expense');
-      setSelectedCurrencyCode(mainCurrency.code);
-      setRateText('');
-      setExactInitialRate(null);
+      const rememberedCurrency =
+        lastUsed.lastCurrencyCode && lastUsed.lastCurrencyCode !== mainCurrency.code
+          ? currenciesRef.current.find(
+              (c) =>
+                c.code === lastUsed.lastCurrencyCode &&
+                !c.deleted &&
+                !c.archived &&
+                !c.isMain,
+            )
+          : undefined;
+      if (rememberedCurrency) {
+        const display = formatRateDisplay(rememberedCurrency.rate);
+        setSelectedCurrencyCode(rememberedCurrency.code);
+        setRateText(display);
+        setExactInitialRate({ display, exact: rememberedCurrency.rate });
+      } else {
+        setSelectedCurrencyCode(mainCurrency.code);
+        setRateText('');
+        setExactInitialRate(null);
+      }
       setAmountExpr('');
       setKeypadOpen(true);
       setAccountId(defaultAcc);

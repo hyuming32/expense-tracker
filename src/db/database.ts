@@ -23,6 +23,7 @@ export const META_KEYS = {
   LAST_EXPENSE_CATEGORY_ID: 'lastExpenseCategoryId',
   LAST_INCOME_CATEGORY_ID: 'lastIncomeCategoryId',
   LAST_PLACE_ID: 'lastPlaceId',
+  LAST_CURRENCY: 'lastCurrency',
   AUTO_SELECT_LAST_PLACE: 'autoSelectLastPlace',
   COLOR_EXPENSE: 'color.expense',
   COLOR_INCOME: 'color.income',

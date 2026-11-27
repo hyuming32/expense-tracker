@@ -585,6 +585,12 @@ export async function saveTransaction(
         }
       }
       await database.meta.put({ key: META_KEYS.LAST_ACCOUNT_ID, value: record.accountId });
+      if (isNewTx && input.currency !== undefined) {
+        await database.meta.put({
+          key: META_KEYS.LAST_CURRENCY,
+          value: normalizedCurrency ?? '',
+        });
+      }
       if (record.kind === 'expense' && record.categoryId) {
         await database.meta.put({ key: META_KEYS.LAST_EXPENSE_CATEGORY_ID, value: record.categoryId });
       } else if (record.kind === 'income' && record.categoryId) {
