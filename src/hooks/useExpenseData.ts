@@ -54,6 +54,7 @@ export interface LastUsedMeta {
   lastExpenseCategoryId: string | null;
   lastIncomeCategoryId: string | null;
   lastPlaceId: string | null;
+  lastCurrencyCode: string | null;
 }
 
 /**
@@ -110,23 +111,26 @@ export function useTransactions(): Transaction[] {
 export function useLastUsedMeta(): LastUsedMeta {
   return (
     useLiveQuery(async () => {
-      const [acc, expCat, incCat, place] = await Promise.all([
+      const [acc, expCat, incCat, place, cur] = await Promise.all([
         db.meta.get(META_KEYS.LAST_ACCOUNT_ID),
         db.meta.get(META_KEYS.LAST_EXPENSE_CATEGORY_ID),
         db.meta.get(META_KEYS.LAST_INCOME_CATEGORY_ID),
         db.meta.get(META_KEYS.LAST_PLACE_ID),
+        db.meta.get(META_KEYS.LAST_CURRENCY),
       ]);
       return {
         lastAccountId: acc?.value ?? null,
         lastExpenseCategoryId: expCat?.value ?? null,
         lastIncomeCategoryId: incCat?.value ?? null,
         lastPlaceId: place?.value ?? null,
+        lastCurrencyCode: cur?.value ? cur.value : null,
       };
     }, []) ?? {
       lastAccountId: null,
       lastExpenseCategoryId: null,
       lastIncomeCategoryId: null,
       lastPlaceId: null,
+      lastCurrencyCode: null,
     }
   );
 }

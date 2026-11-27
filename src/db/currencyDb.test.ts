@@ -2,12 +2,13 @@ import 'fake-indexeddb/auto';
 import { describe, expect, it } from 'vitest';
 import { convertToMain, formatRateDisplay, isValidRate } from '../domain/currency';
 import { planCsvImport } from '../domain/csvImport';
-import { ExpenseDatabase, ensureSeeded } from './database';
+import { ExpenseDatabase, META_KEYS, ensureSeeded } from './database';
 import {
   archiveCurrency,
   exportBackupData,
   importCsvPlan,
   parseBackupPayload,
+  recordShortcutTransaction,
   restoreBackupData,
   saveAccount,
   saveBudget,
@@ -317,6 +318,107 @@ describe('多幣別與匯率資料庫邏輯（v13）', () => {
       originalAmount: 21200,
       rate: 0.215,
     });
+
+    await testDb.delete();
+  });
+
+  it('LAST_CURRENCY 僅在新增且明確傳入 currency 時更新，編輯與捷徑記帳不覆蓋', async () => {
+    const testDb = new ExpenseDatabase(`test-last-currency-${Date.now()}`);
+    await ensureSeeded(testDb);
+    await saveCurrency({ code: 'JPY', name: '日圓', decimals: 0, rate: 0.21 }, testDb);
+
+    // 1. 一開始沒有記錄
+    expect(await testDb.meta.get(META_KEYS.LAST_CURRENCY)).toBeUndefined();
+
+    // 2. 新增日圓帳 → 記為 'JPY'
+    const jpyTx = await saveTransaction(
+      {
+        kind: 'expense',
+        date: '2026-11-27',
+        amount: 210,
+        currency: 'JPY',
+        originalAmount: 1000,
+        rate: 0.21,
+        accountId: 'seed-acc-cash',
+        toAccountId: null,
+        categoryId: 'seed-cat-food',
+        note: '拉麵',
+      },
+      testDb,
+    );
+    expect((await testDb.meta.get(META_KEYS.LAST_CURRENCY))?.value).toBe('JPY');
+
+    // 3. 新增主幣別帳（currency: null）→ 記為 ''
+    await saveTransaction(
+      {
+        kind: 'expense',
+        date: '2026-11-27',
+        amount: 100,
+        currency: null,
+        originalAmount: null,
+        rate: null,
+        accountId: 'seed-acc-cash',
+        toAccountId: null,
+        categoryId: 'seed-cat-food',
+        note: '便當',
+      },
+      testDb,
+    );
+    expect((await testDb.meta.get(META_KEYS.LAST_CURRENCY))?.value).toBe('');
+
+    // 4. 編輯舊的日圓帳 → 仍是 ''
+    await saveTransaction(
+      {
+        id: jpyTx.id,
+        kind: 'expense',
+        date: '2026-11-27',
+        amount: 220,
+        currency: 'JPY',
+        originalAmount: 1000,
+        rate: 0.22,
+        accountId: 'seed-acc-cash',
+        toAccountId: null,
+        categoryId: 'seed-cat-food',
+        note: '拉麵加蛋',
+      },
+      testDb,
+    );
+    expect((await testDb.meta.get(META_KEYS.LAST_CURRENCY))?.value).toBe('');
+
+    // 5. 再新增日圓帳 → 'JPY'
+    await saveTransaction(
+      {
+        kind: 'expense',
+        date: '2026-11-27',
+        amount: 420,
+        currency: 'JPY',
+        originalAmount: 2000,
+        rate: 0.21,
+        accountId: 'seed-acc-cash',
+        toAccountId: null,
+        categoryId: 'seed-cat-food',
+        note: '藥妝',
+      },
+      testDb,
+    );
+    expect((await testDb.meta.get(META_KEYS.LAST_CURRENCY))?.value).toBe('JPY');
+
+    // 6. 用 saveShortcut 建捷徑並 recordShortcutTransaction 記一筆 → 仍是 'JPY'
+    const shortcut = await saveShortcut(
+      {
+        label: '早餐',
+        icon: '🥐',
+        kind: 'expense',
+        amount: 65,
+        accountId: 'seed-acc-cash',
+        toAccountId: null,
+        categoryId: 'seed-cat-food',
+        note: null,
+      },
+      testDb,
+    );
+    await recordShortcutTransaction(shortcut, '2026-11-27', testDb);
+    expect((await testDb.meta.get(META_KEYS.LAST_CURRENCY))?.value).toBe('JPY');
 
     await testDb.delete();
   });
