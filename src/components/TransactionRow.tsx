@@ -1,6 +1,7 @@
-import { useMoney } from '../contexts/PrivacyContext';
+import { useMoney, usePrivacy } from '../contexts/PrivacyContext';
 import type { AmountColors } from '../db/repository';
 import type { Account, Category, Place, Transaction } from '../db/types';
+import { formatMoney as formatForeignMoney, getHiddenAmountText } from '../domain';
 
 interface TransactionRowProps {
   transaction: Transaction;
@@ -22,6 +23,7 @@ export function TransactionRow({
   showDate = false,
 }: TransactionRowProps) {
   const formatMoney = useMoney();
+  const { hideAmounts } = usePrivacy();
   const category = transaction.categoryId ? categoryMap.get(transaction.categoryId) : undefined;
   const parentCategory = category?.parentId ? categoryMap.get(category.parentId) : undefined;
   const account = accountMap.get(transaction.accountId);
@@ -91,20 +93,29 @@ export function TransactionRow({
         </div>
       </div>
 
-      <span
-        className={`shrink-0 text-sm font-semibold tabular-nums ${
-          transaction.kind === 'transfer' ? 'text-slate-500 dark:text-slate-400' : ''
-        }`}
-        style={
-          transaction.kind === 'expense'
-            ? { color: amountColors.expense }
-            : transaction.kind === 'income'
-              ? { color: amountColors.income }
-              : undefined
-        }
-      >
-        {formatMoney(transaction.amount)}
-      </span>
+      <div className="shrink-0 text-right">
+        <div
+          className={`text-sm font-semibold tabular-nums ${
+            transaction.kind === 'transfer' ? 'text-slate-500 dark:text-slate-400' : ''
+          }`}
+          style={
+            transaction.kind === 'expense'
+              ? { color: amountColors.expense }
+              : transaction.kind === 'income'
+                ? { color: amountColors.income }
+                : undefined
+          }
+        >
+          {formatMoney(transaction.amount)}
+        </div>
+        {transaction.currency && transaction.originalAmount != null && (
+          <div className="text-[11px] tabular-nums text-slate-400 dark:text-slate-500">
+            {hideAmounts
+              ? getHiddenAmountText(transaction.currency)
+              : formatForeignMoney(transaction.originalAmount, transaction.currency)}
+          </div>
+        )}
+      </div>
     </button>
   );
 }

@@ -9,6 +9,7 @@ import {
   saveBudget,
   saveCarrierCard,
   saveCategory,
+  saveCurrency,
   saveLotteryDraw,
   saveMemberCard,
   saveNotePreset,
@@ -758,5 +759,27 @@ describe('syncOnce 雙裝置與快照同步', () => {
     expect(cardsB.find((c) => c.id === 'card-carrier')?.code).toBe('/BBB2222');
     expect(cardsA).toHaveLength(2);
     expect(cardsB).toHaveLength(2);
+  });
+
+  it('兩台裝置各自新增相同幣別代碼（如 JPY）並同步，因固定 id 不會重複且保留較新匯率', async () => {
+    const drive = new MemoryDriveStore();
+    const dbA = createTestDb('currency-a');
+    const dbB = createTestDb('currency-b');
+
+    await saveCurrency({ code: 'JPY', name: '日圓', decimals: 0, rate: 0.21 }, dbA);
+    await new Promise((r) => setTimeout(r, 5));
+    await saveCurrency({ code: 'JPY', name: '日圓', decimals: 0, rate: 0.22 }, dbB);
+
+    await syncOnce({ database: dbA, driveStore: drive, deviceId: 'device-a' });
+    await syncOnce({ database: dbB, driveStore: drive, deviceId: 'device-b' });
+    await syncOnce({ database: dbA, driveStore: drive, deviceId: 'device-a' });
+
+    const curA = await dbA.currencies.toArray();
+    const curB = await dbB.currencies.toArray();
+    expect(curA).toHaveLength(1);
+    expect(curB).toHaveLength(1);
+    expect(curA[0]?.id).toBe('JPY');
+    expect(curA[0]?.rate).toBe(0.22);
+    expect(curB[0]?.rate).toBe(0.22);
   });
 });

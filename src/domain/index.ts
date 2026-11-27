@@ -44,6 +44,7 @@ export type {
   CsvImportPlan,
   CsvNewAccount,
   CsvNewCategory,
+  CsvNewCurrency,
 } from './csvImport';
 export { validateTransaction } from './validation';
 export type { TransactionValidationInput } from './validation';
@@ -51,13 +52,39 @@ export {
   formatCurrency,
   formatDateWithWeekday,
   formatDisplayCurrency,
+  formatMoney,
   formatMonthLabel,
   getCurrentMonthString,
   getCurrentTimeString,
+  getDisplayCurrency,
+  getHiddenAmountText,
   getTodayDateString,
   HIDDEN_AMOUNT_TEXT,
+  setDisplayCurrency,
   shiftMonth,
 } from './format';
+export {
+  COMMON_CURRENCIES,
+  convertToMain,
+  CURRENCY_NAME_MAX_LENGTH,
+  formatRateDisplay,
+  getCurrencySymbol,
+  getDefaultCurrencyDecimals,
+  getDefaultCurrencyName,
+  getMainCurrency,
+  hasAtMostDecimals,
+  isValidCurrencyCode,
+  isValidRate,
+  planMainCurrencySwitch,
+  roundToDecimals,
+  ZERO_DECIMAL_CURRENCY_CODES,
+} from './currency';
+export type {
+  CommonCurrencySpec,
+  MainCurrencyInfo,
+  MainCurrencySwitchInput,
+  MainCurrencySwitchPlan,
+} from './currency';
 export { formatInvoiceNote, isInvoiceRightQr, parseInvoiceQr } from './invoice';
 export type { InvoiceItem, ParsedInvoice } from './invoice';
 export { DEFAULT_QUICK_NOTE_LIMIT, selectQuickNotePresets } from './notePresets';

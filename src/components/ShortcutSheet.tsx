@@ -5,6 +5,7 @@ import {
   softDeleteShortcut,
 } from '../db/repository';
 import type { Account, Category, Shortcut, TransactionKind } from '../db/types';
+import { hasAtMostDecimals, type MainCurrencyInfo } from '../domain';
 import type { LastUsedMeta } from '../hooks/useExpenseData';
 
 export interface ShortcutDraft {
@@ -26,8 +27,16 @@ interface ShortcutSheetProps {
   categories: readonly Category[];
   lastUsed: LastUsedMeta;
   amountColors: AmountColors;
+  mainCurrency?: MainCurrencyInfo;
   onClose: () => void;
 }
+
+const DEFAULT_MAIN_CURRENCY: MainCurrencyInfo = {
+  code: 'TWD',
+  name: '新台幣',
+  decimals: 0,
+  symbol: 'NT$',
+};
 
 const KIND_TABS: Array<{ value: TransactionKind; label: string }> = [
   { value: 'expense', label: '支出' },
@@ -46,6 +55,7 @@ export function ShortcutSheet({
   categories,
   lastUsed,
   amountColors,
+  mainCurrency = DEFAULT_MAIN_CURRENCY,
   onClose,
 }: ShortcutSheetProps) {
   const [kind, setKind] = useState<TransactionKind>('expense');
@@ -198,8 +208,16 @@ export function ShortcutSheet({
     let parsedAmount: number | null = null;
     if (trimmedAmount) {
       const n = Number(trimmedAmount);
-      if (!Number.isInteger(n) || n <= 0) {
-        setError('金額需為正整數（或留空代表點擊時輸入）');
+      if (
+        !Number.isFinite(n) ||
+        n <= 0 ||
+        !hasAtMostDecimals(n, mainCurrency.decimals)
+      ) {
+        setError(
+          mainCurrency.decimals <= 0
+            ? '金額需為正整數（或留空代表點擊時輸入）'
+            : `金額需為正數且最多 ${mainCurrency.decimals} 位小數（或留空代表點擊時輸入）`,
+        );
         return;
       }
       parsedAmount = n;
@@ -337,11 +355,22 @@ export function ShortcutSheet({
             <input
               id="shortcut-amount"
               type="text"
-              inputMode="numeric"
-              pattern="[0-9]*"
+              inputMode={mainCurrency.decimals > 0 ? 'decimal' : 'numeric'}
               placeholder="留空代表每次輸入金額"
               value={amountText}
-              onChange={(e) => setAmountText(e.target.value.replace(/[^\d]/g, ''))}
+              onChange={(e) => {
+                if (mainCurrency.decimals <= 0) {
+                  setAmountText(e.target.value.replace(/[^\d]/g, ''));
+                } else {
+                  const cleaned = e.target.value.replace(/[^\d.]/g, '');
+                  const dotIdx = cleaned.indexOf('.');
+                  setAmountText(
+                    dotIdx === -1
+                      ? cleaned
+                      : cleaned.slice(0, dotIdx + 1) + cleaned.slice(dotIdx + 1).replace(/\./g, ''),
+                  );
+                }
+              }}
               style={
                 kind === 'expense'
                   ? { color: amountColors.expense }

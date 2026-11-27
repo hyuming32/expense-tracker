@@ -2,14 +2,17 @@ interface AmountCalculatorKeypadProps {
   onToken: (token: string) => void;
   onEvaluate: () => void;
   onDone: () => void;
+  allowDecimal?: boolean;
 }
 
-const KEYPAD_BUTTONS: ReadonlyArray<{
+interface KeypadButton {
   label: string;
   value: string;
   variant: 'digit' | 'operator' | 'action' | 'equal' | 'done';
   colSpan?: number;
-}> = [
+}
+
+const BASE_TOP_BUTTONS: ReadonlyArray<KeypadButton> = [
   { label: 'C', value: 'C', variant: 'action' },
   { label: '÷', value: '÷', variant: 'operator' },
   { label: '×', value: '×', variant: 'operator' },
@@ -26,9 +29,19 @@ const KEYPAD_BUTTONS: ReadonlyArray<{
   { label: '2', value: '2', variant: 'digit' },
   { label: '3', value: '3', variant: 'digit' },
   { label: '=', value: '=', variant: 'equal' },
+];
+
+const INTEGER_BOTTOM_BUTTONS: ReadonlyArray<KeypadButton> = [
   { label: '0', value: '0', variant: 'digit' },
   { label: '00', value: '00', variant: 'digit' },
   { label: '完成', value: 'DONE', variant: 'done', colSpan: 2 },
+];
+
+const DECIMAL_BOTTOM_BUTTONS: ReadonlyArray<KeypadButton> = [
+  { label: '0', value: '0', variant: 'digit' },
+  { label: '.', value: '.', variant: 'digit' },
+  { label: '00', value: '00', variant: 'digit' },
+  { label: '完成', value: 'DONE', variant: 'done' },
 ];
 
 const VARIANT_CLASSES: Record<
@@ -54,14 +67,19 @@ export function AmountCalculatorKeypad({
   onToken,
   onEvaluate,
   onDone,
+  allowDecimal = false,
 }: AmountCalculatorKeypadProps) {
+  const buttons = allowDecimal
+    ? [...BASE_TOP_BUTTONS, ...DECIMAL_BOTTOM_BUTTONS]
+    : [...BASE_TOP_BUTTONS, ...INTEGER_BOTTOM_BUTTONS];
+
   return (
     <div
       className="mt-2 grid grid-cols-4 gap-1.5 rounded-xl border border-slate-200 bg-slate-50 p-2 dark:border-slate-700 dark:bg-slate-900/80"
       role="group"
       aria-label="金額計算機鍵盤"
     >
-      {KEYPAD_BUTTONS.map((btn) => (
+      {buttons.map((btn) => (
         <button
           key={btn.label}
           type="button"

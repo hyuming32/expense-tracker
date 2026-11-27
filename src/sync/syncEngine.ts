@@ -5,6 +5,7 @@ import type {
   BaseRecord,
   Budget,
   Category,
+  CurrencyRate,
   LotteryDraw,
   NoSpendDay,
   NotePreset,
@@ -34,6 +35,7 @@ export interface SyncRecordsPayload {
   budgets?: Budget[];
   noSpendDays?: NoSpendDay[];
   cards?: WalletCard[];
+  currencies?: CurrencyRate[];
 }
 
 export interface ChangeBatchFile {
@@ -148,6 +150,7 @@ async function applyRemoteRecords(
       database.budgets,
       database.noSpendDays,
       database.cards,
+      database.currencies,
       database.meta,
     ],
     async () => {
@@ -163,6 +166,7 @@ async function applyRemoteRecords(
         appliedBudgets,
         appliedNoSpendDays,
         appliedCards,
+        appliedCurrencies,
       ] = await Promise.all([
         mergeTableRecords(database.accounts, records.accounts),
         mergeTableRecords(database.categories, records.categories),
@@ -175,6 +179,7 @@ async function applyRemoteRecords(
         mergeTableRecords(database.budgets, records.budgets ?? []),
         mergeTableRecords(database.noSpendDays, records.noSpendDays ?? []),
         mergeTableRecords(database.cards, records.cards ?? []),
+        mergeTableRecords(database.currencies, records.currencies ?? []),
       ]);
 
       for (const item of seenUpdates) {
@@ -196,7 +201,8 @@ async function applyRemoteRecords(
         appliedLotteryDraws.length +
         appliedBudgets.length +
         appliedNoSpendDays.length +
-        appliedCards.length;
+        appliedCards.length +
+        appliedCurrencies.length;
 
       return { appliedCount, appliedTransactions };
     },
@@ -218,6 +224,7 @@ async function buildOutboxRecords(
   const budgetIds: string[] = [];
   const noSpendDayIds: string[] = [];
   const cardIds: string[] = [];
+  const currencyIds: string[] = [];
 
   for (const entry of entries) {
     if (entry.table === 'accounts') {
@@ -240,6 +247,8 @@ async function buildOutboxRecords(
       noSpendDayIds.push(entry.recordId);
     } else if (entry.table === 'cards') {
       cardIds.push(entry.recordId);
+    } else if (entry.table === 'currencies') {
+      currencyIds.push(entry.recordId);
     } else {
       transactionIds.push(entry.recordId);
     }
@@ -257,6 +266,7 @@ async function buildOutboxRecords(
     budgetsRaw,
     noSpendDaysRaw,
     cardsRaw,
+    currenciesRaw,
   ] = await Promise.all([
     accountIds.length > 0
       ? database.accounts.bulkGet(accountIds)
@@ -291,6 +301,9 @@ async function buildOutboxRecords(
     cardIds.length > 0
       ? database.cards.bulkGet(cardIds)
       : Promise.resolve<Array<WalletCard | undefined>>([]),
+    currencyIds.length > 0
+      ? database.currencies.bulkGet(currencyIds)
+      : Promise.resolve<Array<CurrencyRate | undefined>>([]),
   ]);
 
   const accounts: Account[] = [];
@@ -359,6 +372,12 @@ async function buildOutboxRecords(
       cards.push(item);
     }
   }
+  const currencies: CurrencyRate[] = [];
+  for (const item of currenciesRaw) {
+    if (item) {
+      currencies.push(item);
+    }
+  }
 
   return {
     accounts,
@@ -372,6 +391,7 @@ async function buildOutboxRecords(
     budgets,
     noSpendDays,
     cards,
+    currencies,
   };
 }
 
@@ -489,6 +509,7 @@ export async function syncOnce(options: SyncOnceOptions): Promise<SyncOnceResult
       budgets,
       noSpendDays,
       cards,
+      currencies,
       allMeta,
     ] = await Promise.all([
       database.accounts.toArray(),
@@ -502,6 +523,7 @@ export async function syncOnce(options: SyncOnceOptions): Promise<SyncOnceResult
       database.budgets.toArray(),
       database.noSpendDays.toArray(),
       database.cards.toArray(),
+      database.currencies.toArray(),
       database.meta.toArray(),
     ]);
 
@@ -536,6 +558,7 @@ export async function syncOnce(options: SyncOnceOptions): Promise<SyncOnceResult
         budgets,
         noSpendDays,
         cards,
+        currencies,
       },
     };
     const snapshotJson = JSON.stringify(snapshot);

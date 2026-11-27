@@ -667,7 +667,8 @@ export function TransactionsPage({
                 <div className="grid grid-cols-2 gap-2">
                   <input
                     type="number"
-                    inputMode="numeric"
+                    inputMode="decimal"
+                    step="any"
                     min="0"
                     placeholder="最低金額"
                     value={draftMinAmountText}
@@ -676,7 +677,8 @@ export function TransactionsPage({
                   />
                   <input
                     type="number"
-                    inputMode="numeric"
+                    inputMode="decimal"
+                    step="any"
                     min="0"
                     placeholder="最高金額"
                     value={draftMaxAmountText}

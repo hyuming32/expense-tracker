@@ -21,6 +21,17 @@ import {
   normalizeCarrier,
   pickCardColor,
 } from '../domain/carrier';
+import {
+  CURRENCY_NAME_MAX_LENGTH,
+  getDefaultCurrencyDecimals,
+  getDefaultCurrencyName,
+  getMainCurrency,
+  hasAtMostDecimals,
+  isValidCurrencyCode,
+  isValidRate,
+  planMainCurrencySwitch,
+  roundToDecimals,
+} from '../domain/currency';
 import { type BarcodeFormat, guessFormat } from '../lib/barcode';
 import { parsePinRecordJson, type PinRecord } from '../lib/pinLock';
 import { db, type ExpenseDatabase, META_KEYS } from './database';
@@ -31,6 +42,7 @@ import type {
   Budget,
   Category,
   CategoryKind,
+  CurrencyRate,
   LotteryDraw,
   MetaEntry,
   NoSpendDay,
@@ -88,6 +100,9 @@ export interface SaveTransactionInput {
   date: string;
   time?: string | null;
   amount: number;
+  currency?: string | null;
+  originalAmount?: number | null;
+  rate?: number | null;
   accountId: string;
   toAccountId: string | null;
   categoryId: string | null;
@@ -159,6 +174,7 @@ export interface BackupPayload {
   budgets?: Budget[];
   noSpendDays?: NoSpendDay[];
   cards?: WalletCard[];
+  currencies?: CurrencyRate[];
   meta?: MetaEntry[];
 }
 
@@ -174,6 +190,7 @@ export interface RestoreSummary {
   budgets: number;
   noSpendDays: number;
   cards: number;
+  currencies: number;
 }
 
 export interface AmountColors {
@@ -463,6 +480,7 @@ export async function saveTransaction(
   const normalizedTime = input.time?.trim() ? input.time.trim() : null;
   const normalizedPlaceId = input.placeId?.trim() ? input.placeId.trim() : null;
   const normalizedTags = input.tags ? normalizeTags(input.tags) : [];
+  const normalizedCurrency = input.currency?.trim() ? input.currency.trim().toUpperCase() : null;
 
   const record: Transaction = {
     id: input.id ?? uuidv7(),
@@ -477,6 +495,19 @@ export async function saveTransaction(
     note: input.note?.trim() ? input.note.trim() : null,
     ...(normalizedTags.length > 0 ? { tags: normalizedTags } : {}),
     ...(normalizedInvoiceNo ? { invoiceNo: normalizedInvoiceNo } : {}),
+    ...(normalizedCurrency
+      ? {
+          currency: normalizedCurrency,
+          originalAmount: input.originalAmount ?? null,
+          rate: input.rate ?? null,
+        }
+      : input.currency === null
+        ? {
+            currency: null,
+            originalAmount: null,
+            rate: null,
+          }
+        : {}),
     updatedAt: now,
     deviceId,
     deleted: false,
@@ -488,10 +519,20 @@ export async function saveTransaction(
       database.transactions,
       database.notePresets,
       database.places,
+      database.currencies,
       database.meta,
       database.outbox,
     ],
     async () => {
+      const existingTx = input.id ? await database.transactions.get(input.id) : undefined;
+      const isNewTx = !existingTx;
+
+      if (!normalizedCurrency && existingTx?.currency) {
+        record.currency = null;
+        record.originalAmount = null;
+        record.rate = null;
+      }
+
       if (normalizedInvoiceNo) {
         const duplicate = await database.transactions
           .where('invoiceNo')
@@ -505,6 +546,44 @@ export async function saveTransaction(
 
       await database.transactions.put(record);
       await database.outbox.put(createOutboxEntry('transactions', record.id, now));
+
+      if (isNewTx && normalizedCurrency && typeof input.rate === 'number' && isValidRate(input.rate)) {
+        const allCurrencies = await database.currencies.toArray();
+        const mainCurrency = getMainCurrency(allCurrencies);
+        if (normalizedCurrency !== mainCurrency.code) {
+          const existingCur = allCurrencies.find(
+            (c) => c.id === normalizedCurrency || c.code === normalizedCurrency,
+          );
+          if (existingCur && !existingCur.deleted && !existingCur.isMain) {
+            if (existingCur.rate !== input.rate) {
+              await database.currencies.put({
+                ...existingCur,
+                rate: input.rate,
+                updatedAt: now,
+                deviceId,
+              });
+              await database.outbox.put(createOutboxEntry('currencies', existingCur.id, now));
+            }
+          } else if (!existingCur || existingCur.deleted) {
+            const maxSort = allCurrencies.reduce((max, item) => Math.max(max, item.sortOrder), 0);
+            const newCur: CurrencyRate = {
+              id: normalizedCurrency,
+              code: normalizedCurrency,
+              name: existingCur?.name || getDefaultCurrencyName(normalizedCurrency),
+              rate: input.rate,
+              decimals: existingCur?.decimals ?? getDefaultCurrencyDecimals(normalizedCurrency),
+              isMain: false,
+              sortOrder: existingCur?.sortOrder ?? maxSort + 1,
+              archived: false,
+              updatedAt: now,
+              deviceId,
+              deleted: false,
+            };
+            await database.currencies.put(newCur);
+            await database.outbox.put(createOutboxEntry('currencies', newCur.id, now));
+          }
+        }
+      }
       await database.meta.put({ key: META_KEYS.LAST_ACCOUNT_ID, value: record.accountId });
       if (record.kind === 'expense' && record.categoryId) {
         await database.meta.put({ key: META_KEYS.LAST_EXPENSE_CATEGORY_ID, value: record.categoryId });
@@ -776,7 +855,11 @@ export async function saveAccount(
 ): Promise<Account> {
   const now = Date.now();
   const deviceId = getDeviceId();
-  const existing = input.id ? await database.accounts.get(input.id) : undefined;
+  const [existing, allCurrencies] = await Promise.all([
+    input.id ? database.accounts.get(input.id) : Promise.resolve(undefined),
+    database.currencies.toArray(),
+  ]);
+  const mainDecimals = getMainCurrency(allCurrencies).decimals;
 
   let sortOrder = input.sortOrder ?? existing?.sortOrder;
   if (sortOrder === undefined) {
@@ -788,7 +871,7 @@ export async function saveAccount(
     id: input.id ?? uuidv7(),
     name: input.name.trim(),
     type: input.type,
-    initialBalance: Math.trunc(input.initialBalance),
+    initialBalance: roundToDecimals(input.initialBalance, mainDecimals),
     sortOrder,
     archived: input.archived ?? existing?.archived ?? false,
     updatedAt: now,
@@ -888,6 +971,7 @@ export async function exportBackupData(database: ExpenseDatabase = db): Promise<
     budgets,
     noSpendDays,
     cards,
+    currencies,
     meta,
   ] = await Promise.all([
     database.accounts.toArray(),
@@ -901,6 +985,7 @@ export async function exportBackupData(database: ExpenseDatabase = db): Promise<
     database.budgets.toArray(),
     database.noSpendDays.toArray(),
     database.cards.toArray(),
+    database.currencies.toArray(),
     database.meta.toArray(),
   ]);
 
@@ -921,6 +1006,7 @@ export async function exportBackupData(database: ExpenseDatabase = db): Promise<
     budgets,
     noSpendDays,
     cards,
+    currencies,
     meta: exportableMeta,
   };
 }
@@ -958,6 +1044,7 @@ export function parseBackupPayload(raw: unknown): BackupPayload {
     budgets: Array.isArray(obj.budgets) ? (obj.budgets as Budget[]) : [],
     noSpendDays: Array.isArray(obj.noSpendDays) ? (obj.noSpendDays as NoSpendDay[]) : [],
     cards: Array.isArray(obj.cards) ? (obj.cards as WalletCard[]) : [],
+    currencies: Array.isArray(obj.currencies) ? (obj.currencies as CurrencyRate[]) : [],
     meta: Array.isArray(obj.meta) ? (obj.meta as MetaEntry[]) : undefined,
   };
 }
@@ -978,6 +1065,7 @@ export async function restoreBackupData(
   const incomingBudgets = payload.budgets ?? [];
   const incomingNoSpendDays = payload.noSpendDays ?? [];
   const incomingCards = payload.cards ?? [];
+  const incomingCurrencies = payload.currencies ?? [];
 
   await database.transaction(
     'rw',
@@ -993,6 +1081,7 @@ export async function restoreBackupData(
       database.budgets,
       database.noSpendDays,
       database.cards,
+      database.currencies,
       database.outbox,
     ],
     async () => {
@@ -1008,6 +1097,7 @@ export async function restoreBackupData(
         existingBudgets,
         existingNoSpendDays,
         existingCards,
+        existingCurrencies,
       ] = await Promise.all([
         database.accounts.toArray(),
         database.categories.toArray(),
@@ -1020,6 +1110,7 @@ export async function restoreBackupData(
         database.budgets.toArray(),
         database.noSpendDays.toArray(),
         database.cards.toArray(),
+        database.currencies.toArray(),
       ]);
 
       const mergedAccounts = mergeBackup(existingAccounts, payload.accounts);
@@ -1033,6 +1124,7 @@ export async function restoreBackupData(
       const mergedBudgets = mergeBackup(existingBudgets, incomingBudgets);
       const mergedNoSpendDays = mergeBackup(existingNoSpendDays, incomingNoSpendDays);
       const mergedCards = mergeBackup(existingCards, incomingCards);
+      const mergedCurrencies = mergeBackup(existingCurrencies, incomingCurrencies);
 
       const outboxEntries: OutboxEntry[] = [
         ...payload.accounts.map((item) => createOutboxEntry('accounts', item.id, now)),
@@ -1046,6 +1138,7 @@ export async function restoreBackupData(
         ...incomingBudgets.map((item) => createOutboxEntry('budgets', item.id, now)),
         ...incomingNoSpendDays.map((item) => createOutboxEntry('noSpendDays', item.id, now)),
         ...incomingCards.map((item) => createOutboxEntry('cards', item.id, now)),
+        ...incomingCurrencies.map((item) => createOutboxEntry('currencies', item.id, now)),
       ];
 
       await Promise.all([
@@ -1060,6 +1153,7 @@ export async function restoreBackupData(
         database.budgets.bulkPut(mergedBudgets),
         database.noSpendDays.bulkPut(mergedNoSpendDays),
         database.cards.bulkPut(mergedCards),
+        database.currencies.bulkPut(mergedCurrencies),
         outboxEntries.length > 0 ? database.outbox.bulkPut(outboxEntries) : Promise.resolve(),
       ]);
     },
@@ -1079,6 +1173,7 @@ export async function restoreBackupData(
     budgets: incomingBudgets.length,
     noSpendDays: incomingNoSpendDays.length,
     cards: incomingCards.length,
+    currencies: incomingCurrencies.length,
   };
 }
 
@@ -1087,6 +1182,7 @@ export interface CsvImportResult {
   createdAccountsCount: number;
   createdCategoriesCount: number;
   createdPlacesCount: number;
+  createdCurrenciesCount?: number;
 }
 
 /**
@@ -1110,16 +1206,26 @@ export async function importCsvPlan(
   let createdAccountsCount = 0;
   let createdCategoriesCount = 0;
   let createdPlacesCount = 0;
+  let createdCurrenciesCount = 0;
 
   await database.transaction(
     'rw',
-    [database.accounts, database.categories, database.places, database.transactions, database.outbox],
+    [
+      database.accounts,
+      database.categories,
+      database.places,
+      database.currencies,
+      database.transactions,
+      database.outbox,
+    ],
     async () => {
-      const [existingAccounts, existingCategories, existingPlaces] = await Promise.all([
-        database.accounts.filter((a) => !a.deleted).toArray(),
-        database.categories.filter((c) => !c.deleted).toArray(),
-        database.places.filter((p) => !p.deleted).toArray(),
-      ]);
+      const [existingAccounts, existingCategories, existingPlaces, existingCurrencies] =
+        await Promise.all([
+          database.accounts.filter((a) => !a.deleted).toArray(),
+          database.categories.filter((c) => !c.deleted).toArray(),
+          database.places.filter((p) => !p.deleted).toArray(),
+          database.currencies.toArray(),
+        ]);
 
       const accountByName = new Map(existingAccounts.map((a) => [a.name.trim(), a]));
       let nextAccountSortOrder =
@@ -1264,6 +1370,39 @@ export async function importCsvPlan(
         createdPlacesCount += 1;
       }
 
+      const currenciesToPut: CurrencyRate[] = [];
+      const activeCurrencyCodes = new Set(
+        existingCurrencies.filter((c) => !c.deleted).map((c) => c.code.toUpperCase()),
+      );
+      const mainCurrencyCode = getMainCurrency(existingCurrencies).code;
+      let nextCurrencySortOrder =
+        existingCurrencies.reduce((max, item) => Math.max(max, item.sortOrder), 0) + 1;
+
+      for (const spec of plan.newCurrencies ?? []) {
+        const code = spec.code.trim().toUpperCase();
+        if (code === mainCurrencyCode || activeCurrencyCodes.has(code)) {
+          continue;
+        }
+        const record: CurrencyRate = {
+          id: code,
+          code,
+          name: spec.name.slice(0, CURRENCY_NAME_MAX_LENGTH),
+          rate: spec.rate,
+          decimals: spec.decimals,
+          isMain: false,
+          sortOrder: nextCurrencySortOrder,
+          archived: false,
+          updatedAt: now,
+          deviceId,
+          deleted: false,
+        };
+        nextCurrencySortOrder += 1;
+        activeCurrencyCodes.add(code);
+        currenciesToPut.push(record);
+        outboxEntries.push(createOutboxEntry('currencies', record.id, now));
+        createdCurrenciesCount += 1;
+      }
+
       const transactionsToPut: Transaction[] = [];
 
       for (const item of plan.items) {
@@ -1312,6 +1451,13 @@ export async function importCsvPlan(
           note: item.note,
           ...(item.tags.length > 0 ? { tags: item.tags } : {}),
           ...(item.invoiceNo ? { invoiceNo: item.invoiceNo } : {}),
+          ...(item.currency
+            ? {
+                currency: item.currency,
+                originalAmount: item.originalAmount ?? null,
+                rate: item.rate ?? null,
+              }
+            : {}),
           updatedAt: now,
           deviceId,
           deleted: false,
@@ -1325,6 +1471,7 @@ export async function importCsvPlan(
         accountsToPut.length > 0 ? database.accounts.bulkPut(accountsToPut) : Promise.resolve(),
         categoriesToPut.length > 0 ? database.categories.bulkPut(categoriesToPut) : Promise.resolve(),
         placesToPut.length > 0 ? database.places.bulkPut(placesToPut) : Promise.resolve(),
+        currenciesToPut.length > 0 ? database.currencies.bulkPut(currenciesToPut) : Promise.resolve(),
         database.transactions.bulkPut(transactionsToPut),
         database.outbox.bulkPut(outboxEntries),
       ]);
@@ -1338,6 +1485,7 @@ export async function importCsvPlan(
     createdAccountsCount,
     createdCategoriesCount,
     createdPlacesCount,
+    ...(createdCurrenciesCount > 0 ? { createdCurrenciesCount } : {}),
   };
 }
 
@@ -1374,12 +1522,16 @@ export async function saveRecurringRule(
 ): Promise<RecurringRule> {
   const now = Date.now();
   const deviceId = getDeviceId();
-  const existing = input.id ? await database.recurringRules.get(input.id) : undefined;
+  const [existing, allCurrencies] = await Promise.all([
+    input.id ? database.recurringRules.get(input.id) : Promise.resolve(undefined),
+    database.currencies.toArray(),
+  ]);
+  const mainDecimals = getMainCurrency(allCurrencies).decimals;
 
   const record: RecurringRule = {
     id: input.id ?? uuidv7(),
     kind: input.kind,
-    amount: Math.trunc(input.amount),
+    amount: roundToDecimals(input.amount, mainDecimals),
     accountId: input.accountId,
     toAccountId: input.kind === 'transfer' ? input.toAccountId : null,
     categoryId: input.kind === 'transfer' ? null : input.categoryId,
@@ -1745,11 +1897,18 @@ export async function saveShortcut(
     throw new Error('請選擇分類');
   }
 
+  const allCurrencies = await database.currencies.toArray();
+  const mainDecimals = getMainCurrency(allCurrencies).decimals;
+
   let normalizedAmount: number | null = null;
   if (input.amount !== null) {
-    const rounded = Math.round(input.amount);
-    if (!Number.isFinite(input.amount) || rounded <= 0) {
-      throw new Error('金額需為正整數');
+    const rounded = roundToDecimals(input.amount, mainDecimals);
+    if (
+      !Number.isFinite(input.amount) ||
+      rounded <= 0 ||
+      !hasAtMostDecimals(input.amount, mainDecimals)
+    ) {
+      throw new Error(mainDecimals <= 0 ? '金額需為正整數' : `金額需為正數（最多 ${mainDecimals} 位小數）`);
     }
     normalizedAmount = rounded;
   }
@@ -2403,7 +2562,8 @@ export async function saveBudgets(
   const savedRecords: Budget[] = [];
   let changed = false;
 
-  await database.transaction('rw', database.budgets, database.outbox, async () => {
+  await database.transaction('rw', database.budgets, database.currencies, database.outbox, async () => {
+    const mainDecimals = getMainCurrency(await database.currencies.toArray()).decimals;
     for (const input of inputs) {
       const id = buildBudgetId(input.categoryId);
       const rawAmount = input.amount;
@@ -2423,14 +2583,22 @@ export async function saveBudgets(
         continue;
       }
 
-      if (!Number.isFinite(rawAmount) || !Number.isInteger(rawAmount) || rawAmount < 0) {
-        throw new Error('預算金額須為正整數');
+      if (
+        !Number.isFinite(rawAmount) ||
+        rawAmount < 0 ||
+        !hasAtMostDecimals(rawAmount, mainDecimals)
+      ) {
+        throw new Error(
+          mainDecimals <= 0
+            ? '預算金額須為正整數'
+            : `預算金額須為正數（最多 ${mainDecimals} 位小數）`,
+        );
       }
 
       const record: Budget = {
         id,
         categoryId: input.categoryId,
-        amount: rawAmount,
+        amount: roundToDecimals(rawAmount, mainDecimals),
         updatedAt: now,
         deviceId,
         deleted: false,
@@ -2957,4 +3125,295 @@ export async function reorderCards(
   if (changed) {
     notifyLocalMutation(database);
   }
+}
+
+export interface SaveCurrencyInput {
+  code: string;
+  name?: string;
+  rate: number;
+  decimals?: number;
+  archived?: boolean;
+  sortOrder?: number;
+}
+
+/**
+ * 讀取所有未刪除的幣別設定（依 sortOrder 排序）。
+ */
+export async function getCurrencies(database: ExpenseDatabase = db): Promise<CurrencyRate[]> {
+  const rows = await database.currencies.orderBy('sortOrder').toArray();
+  return rows.filter((c) => !c.deleted);
+}
+
+/**
+ * 新增或更新幣別（固定 id = 大寫 3 碼代碼，寫入 outbox；主幣別匯率固定為 1）。
+ * 注意：修改最新匯率不會重算任何既有交易。
+ */
+export async function saveCurrency(
+  input: SaveCurrencyInput,
+  database: ExpenseDatabase = db,
+): Promise<CurrencyRate> {
+  const code = input.code.trim().toUpperCase();
+  if (!isValidCurrencyCode(code)) {
+    throw new Error('幣別代碼需為 3 個大寫英文字母（例如 JPY）');
+  }
+
+  const rawName = (input.name ?? getDefaultCurrencyName(code)).trim();
+  if (!rawName) {
+    throw new Error('請輸入幣別名稱');
+  }
+  const name = rawName.slice(0, CURRENCY_NAME_MAX_LENGTH);
+
+  const decimals =
+    input.decimals === 0 || input.decimals === 2
+      ? input.decimals
+      : getDefaultCurrencyDecimals(code);
+
+  const now = Date.now();
+  const deviceId = getDeviceId();
+  let saved!: CurrencyRate;
+
+  await database.transaction('rw', database.currencies, database.outbox, async () => {
+    const allRows = await database.currencies.toArray();
+    const existing = allRows.find((c) => c.id === code || c.code === code);
+    const currentMain = getMainCurrency(allRows);
+    const isMain = existing?.isMain ?? (allRows.some((c) => !c.deleted && c.isMain) ? false : code === currentMain.code && false);
+
+    const effectiveRate = isMain ? 1 : input.rate;
+    if (!isMain && !isValidRate(effectiveRate)) {
+      throw new Error('匯率需為大於 0 的數字');
+    }
+
+    let sortOrder = input.sortOrder ?? existing?.sortOrder;
+    if (sortOrder === undefined) {
+      const maxOrder = allRows
+        .filter((c) => !c.deleted)
+        .reduce((max, item) => Math.max(max, item.sortOrder), 0);
+      sortOrder = maxOrder + 1;
+    }
+
+    saved = {
+      id: code,
+      code,
+      name,
+      rate: effectiveRate,
+      decimals,
+      isMain,
+      sortOrder,
+      archived: isMain ? false : (input.archived ?? (existing?.deleted ? false : existing?.archived) ?? false),
+      updatedAt: now,
+      deviceId,
+      deleted: false,
+    };
+
+    await database.currencies.put(saved);
+    await database.outbox.put(createOutboxEntry('currencies', saved.id, now));
+  });
+
+  notifyLocalMutation(database);
+  return saved;
+}
+
+/**
+ * 封存或啟用外幣（主幣別不可封存）。
+ */
+export async function archiveCurrency(
+  code: string,
+  archived: boolean,
+  database: ExpenseDatabase = db,
+): Promise<void> {
+  const normalizedCode = code.trim().toUpperCase();
+  const now = Date.now();
+  const deviceId = getDeviceId();
+  let updated = false;
+
+  await database.transaction('rw', database.currencies, database.outbox, async () => {
+    const existing = await database.currencies.get(normalizedCode);
+    if (!existing || existing.deleted) {
+      return;
+    }
+    if (existing.isMain && archived) {
+      throw new Error('無法封存目前主幣別');
+    }
+    await database.currencies.put({
+      ...existing,
+      archived,
+      updatedAt: now,
+      deviceId,
+    });
+    await database.outbox.put(createOutboxEntry('currencies', existing.id, now));
+    updated = true;
+  });
+
+  if (updated) {
+    notifyLocalMutation(database);
+  }
+}
+
+/**
+ * 軟刪除幣別（主幣別或已有交易紀錄使用者不可刪除）。
+ */
+export async function softDeleteCurrency(
+  code: string,
+  database: ExpenseDatabase = db,
+): Promise<void> {
+  const normalizedCode = code.trim().toUpperCase();
+  const now = Date.now();
+  const deviceId = getDeviceId();
+  let updated = false;
+
+  await database.transaction(
+    'rw',
+    database.currencies,
+    database.transactions,
+    database.outbox,
+    async () => {
+      const existing = await database.currencies.get(normalizedCode);
+      if (!existing || existing.deleted) {
+        return;
+      }
+      if (existing.isMain) {
+        throw new Error('無法刪除目前主幣別');
+      }
+      const usedTxCount = await database.transactions
+        .filter((tx) => !tx.deleted && tx.currency === normalizedCode)
+        .count();
+      if (usedTxCount > 0) {
+        throw new Error('此幣別已有交易紀錄使用，僅可封存');
+      }
+      await database.currencies.put({
+        ...existing,
+        deleted: true,
+        updatedAt: now,
+        deviceId,
+      });
+      await database.outbox.put(createOutboxEntry('currencies', existing.id, now));
+      updated = true;
+    },
+  );
+
+  if (updated) {
+    notifyLocalMutation(database);
+  }
+}
+
+/**
+ * 交換兩個幣別的排序順序。
+ */
+export async function swapCurrencySortOrder(
+  idA: string,
+  idB: string,
+  database: ExpenseDatabase = db,
+): Promise<void> {
+  const now = Date.now();
+  const deviceId = getDeviceId();
+  let updated = false;
+
+  await database.transaction('rw', database.currencies, database.outbox, async () => {
+    const [a, b] = await Promise.all([database.currencies.get(idA), database.currencies.get(idB)]);
+    if (!a || !b) {
+      return;
+    }
+    const orderA = a.sortOrder === b.sortOrder ? a.sortOrder : b.sortOrder;
+    const orderB = a.sortOrder === b.sortOrder ? b.sortOrder + 1 : a.sortOrder;
+
+    await database.currencies.bulkPut([
+      { ...a, sortOrder: orderA, updatedAt: now, deviceId },
+      { ...b, sortOrder: orderB, updatedAt: now, deviceId },
+    ]);
+    await database.outbox.bulkPut([
+      createOutboxEntry('currencies', a.id, now),
+      createOutboxEntry('currencies', b.id, now),
+    ]);
+    updated = true;
+  });
+
+  if (updated) {
+    notifyLocalMutation(database);
+  }
+}
+
+/**
+ * 在單一資料庫交易中切換主幣別，換算所有交易、帳戶初始餘額、預算、週期規則、捷徑與幣別匯率並全部排入 outbox。
+ */
+export async function switchMainCurrency(
+  input: {
+    newCode: string;
+    newName?: string;
+    newDecimals?: number;
+    rate: number;
+  },
+  database: ExpenseDatabase = db,
+): Promise<{ convertedTransactions: number }> {
+  const now = Date.now();
+  const deviceId = getDeviceId();
+  let convertedTransactions = 0;
+
+  await database.transaction(
+    'rw',
+    [
+      database.transactions,
+      database.accounts,
+      database.budgets,
+      database.recurringRules,
+      database.shortcuts,
+      database.currencies,
+      database.outbox,
+    ],
+    async () => {
+      const [transactions, accounts, budgets, recurringRules, shortcuts, currencies] =
+        await Promise.all([
+          database.transactions.toArray(),
+          database.accounts.toArray(),
+          database.budgets.toArray(),
+          database.recurringRules.toArray(),
+          database.shortcuts.toArray(),
+          database.currencies.toArray(),
+        ]);
+
+      const plan = planMainCurrencySwitch({
+        newCode: input.newCode,
+        newName: input.newName,
+        newDecimals: input.newDecimals,
+        rate: input.rate,
+        transactions,
+        accounts,
+        budgets,
+        recurringRules,
+        shortcuts,
+        currencies,
+        now,
+        deviceId,
+      });
+
+      convertedTransactions = plan.convertedActiveTransactionCount;
+
+      const outboxEntries: OutboxEntry[] = [
+        ...plan.transactions.map((item) => createOutboxEntry('transactions', item.id, now)),
+        ...plan.accounts.map((item) => createOutboxEntry('accounts', item.id, now)),
+        ...plan.budgets.map((item) => createOutboxEntry('budgets', item.id, now)),
+        ...plan.recurringRules.map((item) => createOutboxEntry('recurringRules', item.id, now)),
+        ...plan.shortcuts.map((item) => createOutboxEntry('shortcuts', item.id, now)),
+        ...plan.currencies.map((item) => createOutboxEntry('currencies', item.id, now)),
+      ];
+
+      await Promise.all([
+        plan.transactions.length > 0
+          ? database.transactions.bulkPut(plan.transactions)
+          : Promise.resolve(),
+        plan.accounts.length > 0 ? database.accounts.bulkPut(plan.accounts) : Promise.resolve(),
+        plan.budgets.length > 0 ? database.budgets.bulkPut(plan.budgets) : Promise.resolve(),
+        plan.recurringRules.length > 0
+          ? database.recurringRules.bulkPut(plan.recurringRules)
+          : Promise.resolve(),
+        plan.shortcuts.length > 0 ? database.shortcuts.bulkPut(plan.shortcuts) : Promise.resolve(),
+        plan.currencies.length > 0
+          ? database.currencies.bulkPut(plan.currencies)
+          : Promise.resolve(),
+        outboxEntries.length > 0 ? database.outbox.bulkPut(outboxEntries) : Promise.resolve(),
+      ]);
+    },
+  );
+
+  notifyLocalMutation(database);
+  return { convertedTransactions };
 }
