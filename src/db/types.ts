@@ -35,8 +35,14 @@ export interface Transaction extends BaseRecord {
   date: string;
   /** 本地時間字串 HH:mm（選填，可空） */
   time?: string | null;
-  /** 正整數（新台幣元） */
+  /** 金額（永遠為主幣別金額，已依主幣別小數位換算） */
   amount: number;
+  /** 外幣 ISO 3 碼代碼（選填；null 或未設定代表主幣別） */
+  currency?: string | null;
+  /** 外幣原幣金額（外幣交易時必填） */
+  originalAmount?: number | null;
+  /** 當下匯率快照（1 單位原幣 = rate 單位主幣別） */
+  rate?: number | null;
   accountId: string;
   /** 僅轉帳使用 */
   toAccountId: string | null;
@@ -165,6 +171,21 @@ export interface WalletCard extends BaseRecord {
   lastUsedAt: number;
 }
 
+export interface CurrencyRate extends BaseRecord {
+  /** 3 個大寫英文字母代碼（id 與 code 相同） */
+  code: string;
+  /** 幣別名稱（最長 10 字） */
+  name: string;
+  /** 最新匯率：1 單位此幣 = rate 單位主幣別（主幣別固定為 1） */
+  rate: number;
+  /** 小數位數（0 或 2） */
+  decimals: number;
+  /** 是否為主幣別（全表最多一筆為 true） */
+  isMain: boolean;
+  sortOrder: number;
+  archived: boolean;
+}
+
 export interface MetaEntry {
   key: string;
   value: string;
@@ -181,7 +202,8 @@ export type SyncTableName =
   | 'lotteryDraws'
   | 'budgets'
   | 'noSpendDays'
-  | 'cards';
+  | 'cards'
+  | 'currencies';
 
 export interface OutboxEntry {
   /** 複合主鍵 `${table}:${recordId}`，避免同一筆紀錄重複排隊 */

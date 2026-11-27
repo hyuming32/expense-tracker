@@ -3,10 +3,19 @@ import type {
   AccountType,
   Category,
   CategoryKind,
+  CurrencyRate,
   Place,
   Transaction,
   TransactionKind,
 } from '../db/types';
+import {
+  getDefaultCurrencyDecimals,
+  getDefaultCurrencyName,
+  getMainCurrency,
+  hasAtMostDecimals,
+  isValidCurrencyCode,
+  isValidRate,
+} from './currency';
 import { normalizePlaceName } from './places';
 import { normalizeTags } from './tags';
 
@@ -24,6 +33,9 @@ export interface CsvImportItem {
   note: string | null;
   tags: string[];
   invoiceNo: string | null;
+  currency?: string;
+  originalAmount?: number;
+  rate?: number;
 }
 
 export interface CsvNewAccount {
@@ -37,6 +49,13 @@ export interface CsvNewCategory {
   parentName: string | null;
 }
 
+export interface CsvNewCurrency {
+  code: string;
+  name: string;
+  decimals: 0 | 2;
+  rate: number;
+}
+
 export interface CsvImportError {
   rowNumber: number;
   reason: string;
@@ -47,6 +66,7 @@ export interface CsvImportPlan {
   newAccounts: CsvNewAccount[];
   newCategories: CsvNewCategory[];
   newPlaces: string[];
+  newCurrencies: CsvNewCurrency[];
   skippedDuplicates: number;
   errors: CsvImportError[];
   totalRows: number;
@@ -57,6 +77,8 @@ export interface CsvImportExistingData {
   categories: readonly Category[];
   accounts: readonly Account[];
   places?: readonly Place[];
+  currencies?: readonly CurrencyRate[];
+  mainDecimals?: number;
 }
 
 interface ParsedCsvRow {
@@ -178,6 +200,8 @@ function buildDuplicateSignature(
   accountName: string,
   toAccountName: string,
   note: string,
+  currency: string = '',
+  originalAmount: number | string = '',
 ): string {
   return JSON.stringify([
     date,
@@ -188,6 +212,8 @@ function buildDuplicateSignature(
     accountName,
     toAccountName,
     note,
+    currency,
+    originalAmount,
   ]);
 }
 
@@ -221,6 +247,10 @@ export function planCsvImport(csvText: string, existing: CsvImportExistingData):
   const activeAccounts = existing.accounts.filter((a) => !a.deleted);
   const activeCategories = existing.categories.filter((c) => !c.deleted);
   const activePlaces = (existing.places ?? []).filter((p) => !p.deleted);
+  const activeCurrencies = (existing.currencies ?? []).filter((c) => !c.deleted);
+  const mainCurrency = getMainCurrency(activeCurrencies);
+  const mainDecimals = existing.mainDecimals ?? mainCurrency.decimals;
+  const currencyMap = new Map(activeCurrencies.map((c) => [c.code.toUpperCase(), c]));
   const accountById = new Map(existing.accounts.map((a) => [a.id, a]));
   const categoryById = new Map(existing.categories.map((c) => [c.id, c]));
 
@@ -281,6 +311,8 @@ export function planCsvImport(csvText: string, existing: CsvImportExistingData):
         accountName,
         toAccountName,
         (tx.note ?? '').trim(),
+        tx.currency ?? '',
+        tx.originalAmount ?? '',
       ),
     );
 
@@ -305,6 +337,8 @@ export function planCsvImport(csvText: string, existing: CsvImportExistingData):
   const newCategoryKeys = new Set<string>();
   const newPlaces: string[] = [];
   const newPlaceNames = new Set<string>();
+  const newCurrencies: CsvNewCurrency[] = [];
+  const newCurrencyCodes = new Set<string>();
   const errors: CsvImportError[] = [];
   let skippedDuplicates = 0;
 
@@ -363,8 +397,57 @@ export function planCsvImport(csvText: string, existing: CsvImportExistingData):
 
     const amountRaw = getCell(row.cells, '金額').trim();
     const amount = Number(amountRaw);
-    if (!/^\d+$/.test(amountRaw) || !Number.isSafeInteger(amount) || amount <= 0) {
-      errors.push({ rowNumber: row.lineNumber, reason: '金額需為正整數' });
+    const amountValid =
+      mainDecimals <= 0
+        ? /^\d+$/.test(amountRaw) && Number.isSafeInteger(amount) && amount > 0
+        : /^\d+(?:\.\d+)?$/.test(amountRaw) &&
+          Number.isFinite(amount) &&
+          amount > 0 &&
+          hasAtMostDecimals(amount, mainDecimals);
+    if (!amountValid) {
+      errors.push({
+        rowNumber: row.lineNumber,
+        reason: mainDecimals <= 0 ? '金額需為正整數' : `金額需為正數且最多 ${mainDecimals} 位小數`,
+      });
+      continue;
+    }
+
+    const rawCurrency = getCell(row.cells, '幣別').trim().toUpperCase();
+    const rawOriginalAmount = getCell(row.cells, '原幣金額').trim();
+    const rawRate = getCell(row.cells, '匯率').trim();
+
+    let txCurrency: string | undefined;
+    let txOriginalAmount: number | undefined;
+    let txRate: number | undefined;
+
+    if (rawCurrency) {
+      if (!isValidCurrencyCode(rawCurrency)) {
+        errors.push({ rowNumber: row.lineNumber, reason: '幣別代碼需為 3 碼大寫英文' });
+        continue;
+      }
+      const existingCur = currencyMap.get(rawCurrency);
+      const curDecimals = existingCur ? existingCur.decimals : getDefaultCurrencyDecimals(rawCurrency);
+      const parsedOriginal = Number(rawOriginalAmount);
+      if (
+        !rawOriginalAmount ||
+        !/^\d+(?:\.\d+)?$/.test(rawOriginalAmount) ||
+        !Number.isFinite(parsedOriginal) ||
+        parsedOriginal <= 0 ||
+        !hasAtMostDecimals(parsedOriginal, curDecimals)
+      ) {
+        errors.push({ rowNumber: row.lineNumber, reason: '外幣交易的原幣金額格式不正確' });
+        continue;
+      }
+      const parsedRate = Number(rawRate);
+      if (!rawRate || !isValidRate(parsedRate)) {
+        errors.push({ rowNumber: row.lineNumber, reason: '外幣交易的匯率格式不正確' });
+        continue;
+      }
+      txCurrency = rawCurrency;
+      txOriginalAmount = parsedOriginal;
+      txRate = parsedRate;
+    } else if (rawOriginalAmount || rawRate) {
+      errors.push({ rowNumber: row.lineNumber, reason: '填寫原幣金額或匯率時，幣別不可為空' });
       continue;
     }
 
@@ -416,6 +499,8 @@ export function planCsvImport(csvText: string, existing: CsvImportExistingData):
       accountName,
       toAccountName ?? '',
       note ?? '',
+      txCurrency ?? '',
+      txOriginalAmount ?? '',
     );
 
     if (existingSignatures.has(sig) || (invoiceNo !== null && existingInvoices.has(invoiceNo))) {
@@ -438,6 +523,21 @@ export function planCsvImport(csvText: string, existing: CsvImportExistingData):
     if (placeName) {
       ensurePlace(placeName);
     }
+    if (
+      txCurrency &&
+      txRate !== undefined &&
+      txCurrency !== mainCurrency.code &&
+      !currencyMap.has(txCurrency) &&
+      !newCurrencyCodes.has(txCurrency)
+    ) {
+      newCurrencyCodes.add(txCurrency);
+      newCurrencies.push({
+        code: txCurrency,
+        name: getDefaultCurrencyName(txCurrency),
+        decimals: getDefaultCurrencyDecimals(txCurrency),
+        rate: txRate,
+      });
+    }
 
     items.push({
       rowNumber: row.lineNumber,
@@ -453,6 +553,13 @@ export function planCsvImport(csvText: string, existing: CsvImportExistingData):
       note,
       tags,
       invoiceNo,
+      ...(txCurrency
+        ? {
+            currency: txCurrency,
+            originalAmount: txOriginalAmount,
+            rate: txRate,
+          }
+        : {}),
     });
   }
 
@@ -461,6 +568,7 @@ export function planCsvImport(csvText: string, existing: CsvImportExistingData):
     newAccounts,
     newCategories,
     newPlaces,
+    newCurrencies,
     skippedDuplicates,
     errors,
     totalRows: dataRows.length,

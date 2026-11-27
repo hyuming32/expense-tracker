@@ -30,6 +30,7 @@ import type {
   Account,
   Budget,
   Category,
+  CurrencyRate,
   LotteryDraw,
   NoSpendDay,
   NotePreset,
@@ -39,7 +40,14 @@ import type {
   Transaction,
   WalletCard,
 } from '../db/types';
-import { compareTransactionsByDateTimeDesc, getTodayDateString, type PeriodKind } from '../domain';
+import {
+  compareTransactionsByDateTimeDesc,
+  getMainCurrency,
+  getTodayDateString,
+  type MainCurrencyInfo,
+  type PeriodKind,
+  setDisplayCurrency,
+} from '../domain';
 
 export interface LastUsedMeta {
   lastAccountId: string | null;
@@ -321,4 +329,27 @@ export function useCards(): WalletCard[] {
       return sortWalletCards(rows);
     }, []) ?? []
   );
+}
+
+/**
+ * 訂閱所有未刪除的幣別與匯率設定（依 sortOrder 排序），並同步全域顯示幣別。
+ */
+export function useCurrencies(): CurrencyRate[] {
+  return (
+    useLiveQuery(async () => {
+      const rows = await db.currencies.orderBy('sortOrder').toArray();
+      const active = rows.filter((c) => !c.deleted);
+      setDisplayCurrency(getMainCurrency(active), active);
+      return active;
+    }, []) ?? []
+  );
+}
+
+/**
+ * 依幣別清單取得目前主幣別資訊並同步全域顯示幣別。
+ */
+export function useMainCurrency(currencies: readonly CurrencyRate[]): MainCurrencyInfo {
+  const main = getMainCurrency(currencies);
+  setDisplayCurrency(main, currencies);
+  return main;
 }

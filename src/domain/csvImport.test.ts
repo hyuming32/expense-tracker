@@ -400,4 +400,60 @@ describe('planCsvImport', () => {
     expect(roundtripPlan.items).toHaveLength(1);
     expect(roundtripPlan.items[0]?.tags).toEqual(['日本旅遊', '可報帳']);
   });
+
+  it('CSV 匯出與匯入支援「幣別」「原幣金額」「匯率」三欄並自動規劃新建幣別', () => {
+    const txs: Transaction[] = [
+      {
+        id: 'tx-jpy-1',
+        kind: 'expense',
+        date: '2026-11-27',
+        time: '12:00',
+        amount: 4558,
+        currency: 'JPY',
+        originalAmount: 21200,
+        rate: 0.215,
+        accountId: 'acc-cash',
+        toAccountId: null,
+        categoryId: 'cat-lunch',
+        note: '東京燒肉',
+        updatedAt: 1000,
+        deviceId: 'dev-1',
+        deleted: false,
+      },
+      {
+        id: 'tx-twd-1',
+        kind: 'expense',
+        date: '2026-11-26',
+        amount: 100,
+        accountId: 'acc-cash',
+        toAccountId: null,
+        categoryId: 'cat-lunch',
+        note: '早餐',
+        updatedAt: 900,
+        deviceId: 'dev-1',
+        deleted: false,
+      },
+    ];
+
+    const exported = toCsv(txs, baseCategories, baseAccounts);
+    expect(exported).toContain('幣別,原幣金額,匯率');
+    expect(exported).toContain(',JPY,21200,0.215');
+
+    const roundtrip = planCsvImport(exported, {
+      transactions: [],
+      categories: baseCategories,
+      accounts: baseAccounts,
+    });
+    expect(roundtrip.errors).toEqual([]);
+    expect(roundtrip.newCurrencies).toEqual([
+      { code: 'JPY', name: '日圓', decimals: 0, rate: 0.215 },
+    ]);
+    expect(roundtrip.items[0]).toMatchObject({
+      amount: 4558,
+      currency: 'JPY',
+      originalAmount: 21200,
+      rate: 0.215,
+    });
+    expect(roundtrip.items[1]?.currency).toBeUndefined();
+  });
 });

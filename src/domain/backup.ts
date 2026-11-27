@@ -27,6 +27,9 @@ const CSV_HEADER = [
   '備註',
   '標籤',
   '發票號碼',
+  '幣別',
+  '原幣金額',
+  '匯率',
 ];
 
 function escapeCsvCell(value: string): string {
@@ -69,6 +72,12 @@ export function toCsv(
       tx.kind === 'transfer' && tx.toAccountId ? (accountMap.get(tx.toAccountId)?.name ?? '') : '';
     const placeName = tx.placeId ? (placeMap.get(tx.placeId)?.name ?? '') : '';
 
+    const hasForeignCurrency = Boolean(tx.currency && tx.currency.trim());
+    const currencyCode = hasForeignCurrency ? tx.currency!.trim().toUpperCase() : '';
+    const originalAmountStr =
+      hasForeignCurrency && tx.originalAmount != null ? String(tx.originalAmount) : '';
+    const rateStr = hasForeignCurrency && tx.rate != null ? String(tx.rate) : '';
+
     const row = [
       tx.date,
       tx.time ?? '',
@@ -82,6 +91,9 @@ export function toCsv(
       tx.note ?? '',
       (tx.tags ?? []).join('、'),
       tx.invoiceNo ?? '',
+      currencyCode,
+      originalAmountStr,
+      rateStr,
     ];
 
     lines.push(row.map(escapeCsvCell).join(','));

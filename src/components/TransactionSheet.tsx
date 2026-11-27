@@ -6,22 +6,40 @@ import {
   DuplicateNotePresetError,
   DuplicatePlaceNameError,
   findActiveTransactionByInvoiceNo,
+  saveCurrency,
   saveNotePreset,
   savePlace,
   saveTransaction,
   softDeleteNotePreset,
   softDeleteTransaction,
 } from '../db/repository';
-import type { Account, Category, NotePreset, Place, Transaction, TransactionKind } from '../db/types';
+import type {
+  Account,
+  Category,
+  CurrencyRate,
+  NotePreset,
+  Place,
+  Transaction,
+  TransactionKind,
+} from '../db/types';
 import {
   appendCalcToken,
+  COMMON_CURRENCIES,
+  convertToMain,
+  CURRENCY_NAME_MAX_LENGTH,
   evaluateExpression,
   findPlaceBySellerId,
   formatInvoiceNote,
+  formatMoney,
+  formatRateDisplay,
   getCurrentTimeString,
+  getDefaultCurrencyDecimals,
   getTodayDateString,
   hasCalcOperator,
+  isValidCurrencyCode,
+  isValidRate,
   isValidSellerId,
+  type MainCurrencyInfo,
   MAX_TAGS_PER_TRANSACTION,
   normalizeTags,
   PLACE_NAME_MAX_LENGTH,
@@ -54,6 +72,8 @@ interface TransactionSheetProps {
   accounts: readonly Account[];
   categories: readonly Category[];
   places: readonly Place[];
+  currencies?: readonly CurrencyRate[];
+  mainCurrency?: MainCurrencyInfo;
   recentTags?: readonly string[];
   autoSelectLastPlace: boolean;
   lastUsed: LastUsedMeta;
@@ -62,6 +82,13 @@ interface TransactionSheetProps {
   onClose: () => void;
   onSaved?: (tx: Transaction) => void;
 }
+
+const DEFAULT_MAIN_CURRENCY: MainCurrencyInfo = {
+  code: 'TWD',
+  name: '新台幣',
+  decimals: 0,
+  symbol: 'NT$',
+};
 
 const KIND_TABS: Array<{ value: TransactionKind; label: string }> = [
   { value: 'expense', label: '支出' },
@@ -76,6 +103,8 @@ export function TransactionSheet({
   accounts,
   categories,
   places,
+  currencies = [],
+  mainCurrency = DEFAULT_MAIN_CURRENCY,
   recentTags = [],
   autoSelectLastPlace,
   lastUsed,
@@ -93,6 +122,19 @@ export function TransactionSheet({
   const [kind, setKind] = useState<TransactionKind>('expense');
   const [amountExpr, setAmountExpr] = useState('');
   const [keypadOpen, setKeypadOpen] = useState(true);
+  const [selectedCurrencyCode, setSelectedCurrencyCode] = useState(mainCurrency.code);
+  const [rateText, setRateText] = useState('');
+  const [exactInitialRate, setExactInitialRate] = useState<{
+    display: string;
+    exact: number;
+  } | null>(null);
+  const [currencyMenuOpen, setCurrencyMenuOpen] = useState(false);
+  const [addingCurrency, setAddingCurrency] = useState(false);
+  const [newCurCode, setNewCurCode] = useState('');
+  const [newCurName, setNewCurName] = useState('');
+  const [newCurDecimals, setNewCurDecimals] = useState<0 | 2>(2);
+  const [newCurRate, setNewCurRate] = useState('');
+  const [currencyError, setCurrencyError] = useState<string | null>(null);
   const [accountId, setAccountId] = useState('');
   const [toAccountId, setToAccountId] = useState('');
   const [categoryId, setCategoryId] = useState<string | null>(null);
@@ -166,6 +208,31 @@ export function TransactionSheet({
     [places, placeId],
   );
 
+  const activeForeignCurrencies = useMemo(
+    () =>
+      currencies.filter(
+        (c) => !c.deleted && !c.archived && !c.isMain && c.code !== mainCurrency.code,
+      ),
+    [currencies, mainCurrency.code],
+  );
+
+  const availableCommonCurrencies = useMemo(() => {
+    const usedCodes = new Set([
+      mainCurrency.code,
+      ...currencies.filter((c) => !c.deleted && !c.archived).map((c) => c.code),
+    ]);
+    return COMMON_CURRENCIES.filter((c) => !usedCodes.has(c.code));
+  }, [currencies, mainCurrency.code]);
+
+  const isForeignCurrency = selectedCurrencyCode !== mainCurrency.code;
+  const selectedCurrencyRecord = useMemo(
+    () => currencies.find((c) => c.code === selectedCurrencyCode && !c.deleted),
+    [currencies, selectedCurrencyCode],
+  );
+  const inputDecimals = isForeignCurrency
+    ? (selectedCurrencyRecord?.decimals ?? getDefaultCurrencyDecimals(selectedCurrencyCode))
+    : mainCurrency.decimals;
+
   // 開啟面板或切換編輯對象時初始化表單
   useEffect(() => {
     if (!open) {
@@ -187,6 +254,13 @@ export function TransactionSheet({
     setAutoMatchedPlaceId(null);
     setSellerBindPrompt(false);
     setSellerRebindCandidate(null);
+    setCurrencyMenuOpen(false);
+    setAddingCurrency(false);
+    setNewCurCode('');
+    setNewCurName('');
+    setNewCurDecimals(2);
+    setNewCurRate('');
+    setCurrencyError(null);
 
     const resolveDefaultPlaceId = (): string | null => {
       if (!autoSelectLastPlace || !lastUsed.lastPlaceId) {
@@ -199,8 +273,23 @@ export function TransactionSheet({
     };
 
     if (editingTransaction) {
+      const txCurrency = editingTransaction.currency?.trim().toUpperCase() || null;
+      const isEditingForeign = Boolean(txCurrency && txCurrency !== mainCurrency.code);
       setKind(editingTransaction.kind);
-      setAmountExpr(String(editingTransaction.amount));
+      setSelectedCurrencyCode(isEditingForeign ? txCurrency! : mainCurrency.code);
+      setAmountExpr(
+        isEditingForeign
+          ? String(editingTransaction.originalAmount ?? editingTransaction.amount)
+          : String(editingTransaction.amount),
+      );
+      if (isEditingForeign && editingTransaction.rate != null) {
+        const display = formatRateDisplay(editingTransaction.rate);
+        setRateText(display);
+        setExactInitialRate({ display, exact: editingTransaction.rate });
+      } else {
+        setRateText('');
+        setExactInitialRate(null);
+      }
       setKeypadOpen(false);
       setAccountId(editingTransaction.accountId);
       setToAccountId(editingTransaction.toAccountId ?? '');
@@ -229,6 +318,9 @@ export function TransactionSheet({
           : (accounts.find((a) => a.id !== validAcc)?.id ?? '');
 
       setKind(initialDraft.kind);
+      setSelectedCurrencyCode(mainCurrency.code);
+      setRateText('');
+      setExactInitialRate(null);
       setAmountExpr(initialDraft.amount !== null && initialDraft.amount > 0 ? String(initialDraft.amount) : '');
       setKeypadOpen(true);
       setAccountId(validAcc);
@@ -256,6 +348,9 @@ export function TransactionSheet({
       const otherAcc = accounts.find((a) => a.id !== defaultAcc)?.id ?? '';
 
       setKind('expense');
+      setSelectedCurrencyCode(mainCurrency.code);
+      setRateText('');
+      setExactInitialRate(null);
       setAmountExpr('');
       setKeypadOpen(true);
       setAccountId(defaultAcc);
@@ -285,7 +380,7 @@ export function TransactionSheet({
       amountDisplayRef.current?.focus();
     }, 30);
     return () => window.clearTimeout(timer);
-  }, [open, editingTransaction, initialDraft, accounts, categories, lastUsed, autoSelectLastPlace]);
+  }, [open, editingTransaction, initialDraft, accounts, categories, lastUsed, autoSelectLastPlace, mainCurrency.code]);
 
   // 電腦實體鍵盤支援（焦點不在備註／日期／下拉選單時接收數字與四則運算鍵）
   useEffect(() => {
@@ -332,7 +427,7 @@ export function TransactionSheet({
 
       if (e.key === '=' || (e.key === 'Enter' && hasCalcOperator(amountExpr))) {
         e.preventDefault();
-        const res = evaluateExpression(amountExpr);
+        const res = evaluateExpression(amountExpr, inputDecimals);
         if (res.ok) {
           setAmountExpr(String(res.value));
         }
@@ -341,11 +436,28 @@ export function TransactionSheet({
 
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [open, scannerOpen, amountExpr]);
+  }, [open, scannerOpen, amountExpr, inputDecimals]);
 
-  const calcPreview = useMemo(() => evaluateExpression(amountExpr), [amountExpr]);
-  const resolvedAmount = useMemo(() => resolveAmountExpression(amountExpr), [amountExpr]);
+  const calcPreview = useMemo(
+    () => evaluateExpression(amountExpr, inputDecimals),
+    [amountExpr, inputDecimals],
+  );
+  const resolvedAmount = useMemo(
+    () => resolveAmountExpression(amountExpr, inputDecimals),
+    [amountExpr, inputDecimals],
+  );
   const showCalcPreview = hasCalcOperator(amountExpr);
+
+  const trimmedRateText = rateText.trim();
+  const parsedRate =
+    exactInitialRate && trimmedRateText === exactInitialRate.display
+      ? exactInitialRate.exact
+      : Number(trimmedRateText);
+  const rateValid = !isForeignCurrency || isValidRate(parsedRate);
+  const convertedMainAmount =
+    isForeignCurrency && resolvedAmount.ok && rateValid
+      ? convertToMain(resolvedAmount.value, parsedRate, mainCurrency.decimals)
+      : null;
 
   if (!open) {
     return null;
@@ -394,6 +506,9 @@ export function TransactionSheet({
     setScannerOpen(false);
     setErrors([]);
     setDuplicateMessage(null);
+    setSelectedCurrencyCode(mainCurrency.code);
+    setRateText('');
+    setExactInitialRate(null);
     setAmountExpr(String(parsed.amount));
     setDate(parsed.date);
     setTime(getCurrentTimeString());
@@ -479,11 +594,88 @@ export function TransactionSheet({
     setSellerRebindCandidate(null);
   }
 
+  function handleSelectCurrency(code: string) {
+    setCurrencyMenuOpen(false);
+    setAddingCurrency(false);
+    setCurrencyError(null);
+    if (code === mainCurrency.code) {
+      setSelectedCurrencyCode(mainCurrency.code);
+      setRateText('');
+      setExactInitialRate(null);
+      return;
+    }
+    setSelectedCurrencyCode(code);
+    const found = currencies.find((c) => c.code === code && !c.deleted);
+    if (found) {
+      const display = formatRateDisplay(found.rate);
+      setRateText(display);
+      setExactInitialRate({ display, exact: found.rate });
+    } else {
+      setRateText('');
+      setExactInitialRate(null);
+    }
+  }
+
+  function handlePickCommonNewCurrency(code: string) {
+    const spec = COMMON_CURRENCIES.find((c) => c.code === code);
+    if (!spec) {
+      return;
+    }
+    setNewCurCode(spec.code);
+    setNewCurName(spec.name);
+    setNewCurDecimals(spec.decimals);
+    setCurrencyError(null);
+  }
+
+  async function handleCreateQuickCurrency() {
+    const code = newCurCode.trim().toUpperCase();
+    if (!isValidCurrencyCode(code)) {
+      setCurrencyError('幣別代碼需為 3 個大寫英文字母（例如 JPY）');
+      return;
+    }
+    if (code === mainCurrency.code) {
+      setCurrencyError(`${code} 已是目前主幣別`);
+      return;
+    }
+    const name = newCurName.trim().slice(0, CURRENCY_NAME_MAX_LENGTH);
+    if (!name) {
+      setCurrencyError('請輸入幣別名稱');
+      return;
+    }
+    const rateNum = Number(newCurRate.trim());
+    if (!isValidRate(rateNum)) {
+      setCurrencyError('匯率需為大於 0 的數字');
+      return;
+    }
+
+    try {
+      const saved = await saveCurrency({
+        code,
+        name,
+        decimals: newCurDecimals,
+        rate: rateNum,
+        archived: false,
+      });
+      const display = formatRateDisplay(saved.rate);
+      setSelectedCurrencyCode(saved.code);
+      setRateText(display);
+      setExactInitialRate({ display, exact: saved.rate });
+      setAddingCurrency(false);
+      setCurrencyMenuOpen(false);
+      setNewCurCode('');
+      setNewCurName('');
+      setNewCurRate('');
+      setCurrencyError(null);
+    } catch (err) {
+      setCurrencyError(err instanceof Error ? err.message : '新增幣別失敗');
+    }
+  }
+
   function handleCalcEvaluate() {
     if (!amountExpr) {
       return;
     }
-    const res = evaluateExpression(amountExpr);
+    const res = evaluateExpression(amountExpr, inputDecimals);
     if (res.ok) {
       setAmountExpr(String(res.value));
     }
@@ -491,7 +683,7 @@ export function TransactionSheet({
 
   function handleCalcDone() {
     if (amountExpr && hasCalcOperator(amountExpr)) {
-      const res = evaluateExpression(amountExpr);
+      const res = evaluateExpression(amountExpr, inputDecimals);
       if (res.ok) {
         setAmountExpr(String(res.value));
       }
@@ -511,18 +703,32 @@ export function TransactionSheet({
       return;
     }
 
-    const finalAmount = resolvedAmount.value;
-    setAmountExpr(String(finalAmount));
+    const inputAmount = resolvedAmount.value;
+    setAmountExpr(String(inputAmount));
+
+    let finalMainAmount = inputAmount;
+    if (isForeignCurrency) {
+      if (!isValidRate(parsedRate)) {
+        setErrors(['匯率需為大於 0 的數字']);
+        return;
+      }
+      finalMainAmount = convertToMain(inputAmount, parsedRate, mainCurrency.decimals);
+      if (finalMainAmount <= 0) {
+        setErrors(['換算後主幣別金額需大於 0']);
+        return;
+      }
+    }
+
     const payload = {
       kind,
       date,
-      amount: finalAmount,
+      amount: finalMainAmount,
       accountId,
       toAccountId: kind === 'transfer' ? toAccountId || null : null,
       categoryId: kind === 'transfer' ? null : categoryId,
     };
 
-    const validationErrors = validateTransaction(payload);
+    const validationErrors = validateTransaction(payload, mainCurrency.decimals);
     if (validationErrors.length > 0) {
       setErrors(validationErrors);
       return;
@@ -546,6 +752,9 @@ export function TransactionSheet({
       const saved = await saveTransaction({
         id: editingTransaction?.id,
         ...payload,
+        currency: isForeignCurrency ? selectedCurrencyCode : null,
+        originalAmount: isForeignCurrency ? inputAmount : null,
+        rate: isForeignCurrency ? parsedRate : null,
         time: time || null,
         placeId: placeId || null,
         note: note || null,
@@ -688,11 +897,13 @@ export function TransactionSheet({
         </div>
 
         <form onSubmit={handleSubmit} className="space-y-4">
-          {/* 金額顯示欄＋自訂計算機鍵盤 */}
+          {/* 金額顯示欄＋幣別選擇＋自訂計算機鍵盤 */}
           <div>
             <div className="mb-1 flex items-center justify-between">
               <span className="text-xs font-medium text-slate-500 dark:text-slate-400">
-                金額（NT$）
+                {isForeignCurrency
+                  ? `原幣金額（${selectedCurrencyCode}）`
+                  : `金額（${mainCurrency.symbol.trimEnd()}）`}
               </span>
               <button
                 type="button"
@@ -703,11 +914,29 @@ export function TransactionSheet({
               </button>
             </div>
             <div className="flex items-center gap-2">
+              <button
+                type="button"
+                aria-label="選擇幣別"
+                onClick={() => {
+                  setCurrencyMenuOpen((prev) => !prev);
+                  setAddingCurrency(false);
+                  setCurrencyError(null);
+                }}
+                className={`flex min-h-[52px] shrink-0 items-center gap-1 rounded-xl border px-3 py-2 text-sm font-semibold transition-colors ${
+                  isForeignCurrency
+                    ? 'border-emerald-500 bg-emerald-50 text-emerald-700 dark:border-emerald-400 dark:bg-emerald-950/60 dark:text-emerald-300'
+                    : 'border-slate-200 bg-white text-slate-700 hover:bg-slate-50 dark:border-slate-700 dark:bg-slate-800 dark:text-slate-200 dark:hover:bg-slate-700'
+                }`}
+              >
+                <span>{selectedCurrencyCode}</span>
+                <span className="text-[10px]">▾</span>
+              </button>
+
               <div
                 ref={amountDisplayRef}
                 tabIndex={0}
                 role="textbox"
-                aria-label="金額（NT$）"
+                aria-label={isForeignCurrency ? `原幣金額（${selectedCurrencyCode}）` : '金額'}
                 aria-readonly="true"
                 onClick={() => setKeypadOpen(true)}
                 onKeyDown={(e) => {
@@ -778,6 +1007,207 @@ export function TransactionSheet({
                 </button>
               )}
             </div>
+
+            {currencyMenuOpen && (
+              <div className="mt-2 rounded-xl border border-slate-200 bg-white p-2 shadow-sm dark:border-slate-700 dark:bg-slate-800">
+                <div className="space-y-1">
+                  <button
+                    type="button"
+                    onClick={() => handleSelectCurrency(mainCurrency.code)}
+                    className={`flex w-full items-center justify-between rounded-lg px-2.5 py-2 text-left text-xs transition-colors ${
+                      selectedCurrencyCode === mainCurrency.code
+                        ? 'bg-emerald-50 font-semibold text-emerald-700 dark:bg-emerald-950/60 dark:text-emerald-300'
+                        : 'text-slate-700 hover:bg-slate-50 dark:text-slate-200 dark:hover:bg-slate-700'
+                    }`}
+                  >
+                    <span>
+                      {mainCurrency.code} · {mainCurrency.name}（主幣別）
+                    </span>
+                    <span className="text-[11px] text-slate-400">預設</span>
+                  </button>
+
+                  {activeForeignCurrencies.map((cur) => (
+                    <button
+                      key={cur.code}
+                      type="button"
+                      onClick={() => handleSelectCurrency(cur.code)}
+                      className={`flex w-full items-center justify-between rounded-lg px-2.5 py-2 text-left text-xs transition-colors ${
+                        selectedCurrencyCode === cur.code
+                          ? 'bg-emerald-50 font-semibold text-emerald-700 dark:bg-emerald-950/60 dark:text-emerald-300'
+                          : 'text-slate-700 hover:bg-slate-50 dark:text-slate-200 dark:hover:bg-slate-700'
+                      }`}
+                    >
+                      <span>
+                        {cur.code} · {cur.name}
+                      </span>
+                      <span className="tabular-nums text-[11px] text-slate-400 dark:text-slate-400">
+                        1 = {formatRateDisplay(cur.rate)} {mainCurrency.code}
+                      </span>
+                    </button>
+                  ))}
+
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setAddingCurrency((prev) => !prev);
+                      setCurrencyError(null);
+                    }}
+                    className="flex w-full items-center rounded-lg border border-dashed border-slate-300 px-2.5 py-2 text-left text-xs font-medium text-emerald-700 hover:bg-emerald-50/60 dark:border-slate-600 dark:text-emerald-400 dark:hover:bg-slate-700"
+                  >
+                    ＋ 新增幣別
+                  </button>
+                </div>
+
+                {addingCurrency && (
+                  <div className="mt-2 space-y-2.5 rounded-xl border border-slate-200 bg-slate-50 p-3 dark:border-slate-700 dark:bg-slate-900/70">
+                    {availableCommonCurrencies.length > 0 && (
+                      <div>
+                        <div className="mb-1 text-[11px] font-medium text-slate-500 dark:text-slate-400">
+                          常用幣別快選
+                        </div>
+                        <div className="flex flex-wrap gap-1.5">
+                          {availableCommonCurrencies.map((c) => (
+                            <button
+                              key={c.code}
+                              type="button"
+                              onClick={() => handlePickCommonNewCurrency(c.code)}
+                              className={`rounded-full border px-2 py-0.5 text-[11px] transition-colors ${
+                                newCurCode === c.code
+                                  ? 'border-emerald-500 bg-emerald-50 font-medium text-emerald-700 dark:border-emerald-400 dark:bg-emerald-950/60 dark:text-emerald-300'
+                                  : 'border-slate-200 bg-white text-slate-700 hover:bg-slate-100 dark:border-slate-700 dark:bg-slate-800 dark:text-slate-200 dark:hover:bg-slate-700'
+                              }`}
+                            >
+                              {c.code} {c.name}
+                            </button>
+                          ))}
+                        </div>
+                      </div>
+                    )}
+
+                    <div className="grid grid-cols-3 gap-2">
+                      <div>
+                        <label className="mb-1 block text-[11px] text-slate-500 dark:text-slate-400">
+                          代碼（3 碼）
+                        </label>
+                        <input
+                          type="text"
+                          aria-label="新幣別代碼"
+                          maxLength={3}
+                          placeholder="JPY"
+                          value={newCurCode}
+                          onChange={(e) => {
+                            const val = e.target.value.toUpperCase().replace(/[^A-Z]/g, '');
+                            setNewCurCode(val);
+                            if (val.length === 3) {
+                              setNewCurDecimals(getDefaultCurrencyDecimals(val));
+                            }
+                          }}
+                          className="w-full rounded-lg border border-slate-200 bg-white px-2.5 py-1.5 text-xs uppercase text-slate-900 placeholder:text-slate-400 outline-none focus:border-emerald-500 focus:bg-white dark:border-slate-700 dark:bg-slate-800 dark:text-slate-100 dark:placeholder:text-slate-500 dark:focus:border-emerald-400 dark:focus:bg-slate-800"
+                        />
+                      </div>
+                      <div>
+                        <label className="mb-1 block text-[11px] text-slate-500 dark:text-slate-400">
+                          名稱
+                        </label>
+                        <input
+                          type="text"
+                          aria-label="新幣別名稱"
+                          maxLength={CURRENCY_NAME_MAX_LENGTH}
+                          placeholder="日圓"
+                          value={newCurName}
+                          onChange={(e) => setNewCurName(e.target.value)}
+                          className="w-full rounded-lg border border-slate-200 bg-white px-2.5 py-1.5 text-xs text-slate-900 placeholder:text-slate-400 outline-none focus:border-emerald-500 focus:bg-white dark:border-slate-700 dark:bg-slate-800 dark:text-slate-100 dark:placeholder:text-slate-500 dark:focus:border-emerald-400 dark:focus:bg-slate-800"
+                        />
+                      </div>
+                      <div>
+                        <label className="mb-1 block text-[11px] text-slate-500 dark:text-slate-400">
+                          小數位
+                        </label>
+                        <select
+                          aria-label="新幣別小數位"
+                          value={newCurDecimals}
+                          onChange={(e) => setNewCurDecimals(Number(e.target.value) === 0 ? 0 : 2)}
+                          className="w-full rounded-lg border border-slate-200 bg-white px-2 py-1.5 text-xs text-slate-900 outline-none focus:border-emerald-500 focus:bg-white dark:border-slate-700 dark:bg-slate-800 dark:text-slate-100 dark:focus:border-emerald-400 dark:focus:bg-slate-800"
+                        >
+                          <option value={0}>0 位（整數）</option>
+                          <option value={2}>2 位小數</option>
+                        </select>
+                      </div>
+                    </div>
+
+                    <div className="flex items-center gap-2">
+                      <span className="shrink-0 text-xs text-slate-600 dark:text-slate-300">
+                        匯率 1 {newCurCode || '外幣'} =
+                      </span>
+                      <input
+                        type="text"
+                        inputMode="decimal"
+                        aria-label="新幣別匯率"
+                        placeholder="0.215"
+                        value={newCurRate}
+                        onChange={(e) => setNewCurRate(e.target.value)}
+                        className="min-w-0 flex-1 rounded-lg border border-slate-200 bg-white px-2.5 py-1.5 text-right text-xs tabular-nums text-slate-900 placeholder:text-slate-400 outline-none focus:border-emerald-500 focus:bg-white dark:border-slate-700 dark:bg-slate-800 dark:text-slate-100 dark:placeholder:text-slate-500 dark:focus:border-emerald-400 dark:focus:bg-slate-800"
+                      />
+                      <span className="shrink-0 text-xs text-slate-600 dark:text-slate-300">
+                        {mainCurrency.code}
+                      </span>
+                    </div>
+
+                    {currencyError && (
+                      <div className="text-xs text-red-600 dark:text-red-400">{currencyError}</div>
+                    )}
+
+                    <div className="flex justify-end gap-2">
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setAddingCurrency(false);
+                          setCurrencyError(null);
+                        }}
+                        className="rounded-lg px-2.5 py-1 text-xs text-slate-600 hover:bg-slate-200 dark:text-slate-300 dark:hover:bg-slate-700"
+                      >
+                        取消
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => void handleCreateQuickCurrency()}
+                        className="rounded-lg bg-emerald-600 px-3 py-1 text-xs font-medium text-white hover:bg-emerald-700"
+                      >
+                        建立並使用
+                      </button>
+                    </div>
+                  </div>
+                )}
+              </div>
+            )}
+
+            {isForeignCurrency && (
+              <div className="mt-2 flex flex-wrap items-center justify-between gap-2 rounded-xl border border-slate-200 bg-slate-50 px-3 py-2 text-xs dark:border-slate-700 dark:bg-slate-800/70">
+                <div className="flex items-center gap-1.5">
+                  <span className="text-slate-600 dark:text-slate-300">
+                    匯率 1 {selectedCurrencyCode} =
+                  </span>
+                  <input
+                    type="text"
+                    inputMode="decimal"
+                    aria-label="匯率"
+                    placeholder="0.215"
+                    value={rateText}
+                    onChange={(e) => setRateText(e.target.value)}
+                    className="w-24 rounded-lg border border-slate-200 bg-white px-2 py-1 text-right text-xs font-semibold tabular-nums text-slate-900 placeholder:text-slate-400 outline-none focus:border-emerald-500 focus:bg-white dark:border-slate-700 dark:bg-slate-800 dark:text-slate-100 dark:placeholder:text-slate-500 dark:focus:border-emerald-400 dark:focus:bg-slate-800"
+                  />
+                  <span className="text-slate-600 dark:text-slate-300">{mainCurrency.code}</span>
+                </div>
+                <div className="font-semibold tabular-nums text-emerald-700 dark:text-emerald-400">
+                  {convertedMainAmount !== null
+                    ? `≈ ${formatMoney(convertedMainAmount, mainCurrency.code, mainCurrency.decimals)}`
+                    : rateText.trim() !== '' && !rateValid
+                      ? '匯率格式不正確'
+                      : `≈ ${formatMoney(0, mainCurrency.code, mainCurrency.decimals)}`}
+                </div>
+              </div>
+            )}
+
             {amountExpr !== '' && !resolvedAmount.ok && (
               <div className="mt-1.5 text-xs font-medium text-red-600 dark:text-red-400">
                 {resolvedAmount.error}
@@ -785,6 +1215,7 @@ export function TransactionSheet({
             )}
             {keypadOpen && (
               <AmountCalculatorKeypad
+                allowDecimal={inputDecimals > 0}
                 onToken={(token) => setAmountExpr((prev) => appendCalcToken(prev, token))}
                 onEvaluate={handleCalcEvaluate}
                 onDone={handleCalcDone}
@@ -1342,7 +1773,7 @@ export function TransactionSheet({
 
             <button
               type="submit"
-              disabled={submitting || !resolvedAmount.ok}
+              disabled={submitting || !resolvedAmount.ok || (isForeignCurrency && !rateValid)}
               className="ml-auto flex-1 rounded-xl bg-emerald-600 px-4 py-2.5 text-sm font-semibold text-white shadow-sm hover:bg-emerald-700 disabled:cursor-not-allowed disabled:opacity-50 dark:bg-emerald-500 dark:hover:bg-emerald-600"
             >
               儲存

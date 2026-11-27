@@ -4,6 +4,7 @@ import type {
   Account,
   Budget,
   Category,
+  CurrencyRate,
   LotteryDraw,
   MetaEntry,
   NoSpendDay,
@@ -96,6 +97,7 @@ export class ExpenseDatabase extends Dexie {
   budgets!: EntityTable<Budget, 'id'>;
   noSpendDays!: EntityTable<NoSpendDay, 'id'>;
   cards!: EntityTable<WalletCard, 'id'>;
+  currencies!: EntityTable<CurrencyRate, 'id'>;
   meta!: Table<MetaEntry, string>;
   outbox!: Table<OutboxEntry, string>;
 
@@ -396,6 +398,23 @@ export class ExpenseDatabase extends Dexie {
       budgets: 'id, categoryId, updatedAt, deleted',
       noSpendDays: 'id, date, updatedAt, deleted',
       cards: 'id, type, sortOrder, lastUsedAt, updatedAt, deleted',
+      meta: 'key',
+      outbox: 'key, table, recordId, updatedAt',
+    });
+    this.version(13).stores({
+      accounts: 'id, updatedAt, deleted, sortOrder',
+      categories: 'id, kind, parentId, updatedAt, deleted, sortOrder',
+      transactions:
+        'id, kind, date, accountId, toAccountId, categoryId, placeId, invoiceNo, recurringId, occurrenceDate, updatedAt, deleted',
+      notePresets: 'id, categoryId, useCount, lastUsedAt, sortOrder, updatedAt, deleted',
+      recurringRules: 'id, frequency, paused, startDate, endDate, updatedAt, deleted',
+      shortcuts: 'id, sortOrder, updatedAt, deleted',
+      places: 'id, useCount, lastUsedAt, sortOrder, archived, updatedAt, deleted',
+      lotteryDraws: 'id, period, updatedAt, deleted',
+      budgets: 'id, categoryId, updatedAt, deleted',
+      noSpendDays: 'id, date, updatedAt, deleted',
+      cards: 'id, type, sortOrder, lastUsedAt, updatedAt, deleted',
+      currencies: 'id, code, isMain, sortOrder, archived, updatedAt, deleted',
       meta: 'key',
       outbox: 'key, table, recordId, updatedAt',
     });

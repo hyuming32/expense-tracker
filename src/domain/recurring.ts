@@ -1,4 +1,5 @@
 import type { RecurringFrequency, RecurringRule, TransactionKind } from '../db/types';
+import { hasAtMostDecimals } from './currency';
 
 export const MAX_RECURRING_BACKFILL = 24;
 
@@ -242,11 +243,20 @@ export interface RecurringRuleValidationInput {
 /**
  * 驗證週期性收支規則表單欄位，回傳繁體中文錯誤訊息陣列。
  */
-export function validateRecurringRule(input: RecurringRuleValidationInput): string[] {
+export function validateRecurringRule(
+  input: RecurringRuleValidationInput,
+  maxDecimals = 0,
+): string[] {
   const errors: string[] = [];
 
-  if (!Number.isInteger(input.amount) || input.amount <= 0) {
-    errors.push('金額必須為大於 0 的整數');
+  if (maxDecimals <= 0) {
+    if (!Number.isInteger(input.amount) || input.amount <= 0) {
+      errors.push('金額必須為大於 0 的整數');
+    }
+  } else if (!Number.isFinite(input.amount) || input.amount <= 0) {
+    errors.push('金額必須為大於 0 的數字');
+  } else if (!hasAtMostDecimals(input.amount, maxDecimals)) {
+    errors.push(`金額最多 ${maxDecimals} 位小數`);
   }
   if (!input.accountId) {
     errors.push('請選擇帳戶');

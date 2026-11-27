@@ -12,7 +12,11 @@ import type {
   RecurringRule,
   TransactionKind,
 } from '../db/types';
-import { getTodayDateString, validateRecurringRule } from '../domain';
+import {
+  getTodayDateString,
+  type MainCurrencyInfo,
+  validateRecurringRule,
+} from '../domain';
 import type { LastUsedMeta } from '../hooks/useExpenseData';
 
 export interface RecurringRuleDraft {
@@ -39,9 +43,17 @@ interface RecurringRuleSheetProps {
   categories: readonly Category[];
   lastUsed: LastUsedMeta;
   amountColors: AmountColors;
+  mainCurrency?: MainCurrencyInfo;
   onClose: () => void;
   onSaved?: (rule: RecurringRule) => void;
 }
+
+const DEFAULT_MAIN_CURRENCY: MainCurrencyInfo = {
+  code: 'TWD',
+  name: '新台幣',
+  decimals: 0,
+  symbol: 'NT$',
+};
 
 const KIND_TABS: Array<{ value: TransactionKind; label: string }> = [
   { value: 'expense', label: '支出' },
@@ -73,6 +85,7 @@ export function RecurringRuleSheet({
   categories,
   lastUsed,
   amountColors,
+  mainCurrency = DEFAULT_MAIN_CURRENCY,
   onClose,
   onSaved,
 }: RecurringRuleSheetProps) {
@@ -243,7 +256,7 @@ export function RecurringRuleSheet({
       endDate: normalizedEndDate,
     };
 
-    const validationErrors = validateRecurringRule(payload);
+    const validationErrors = validateRecurringRule(payload, mainCurrency.decimals);
     if (validationErrors.length > 0) {
       setErrors(validationErrors);
       return;
@@ -338,16 +351,27 @@ export function RecurringRuleSheet({
               htmlFor="rec-amount"
               className="mb-1 block text-xs font-medium text-slate-500 dark:text-slate-400"
             >
-              金額（NT$）
+              金額（{mainCurrency.symbol.trimEnd()}）
             </label>
             <input
               id="rec-amount"
               type="text"
-              inputMode="numeric"
-              pattern="[0-9]*"
+              inputMode={mainCurrency.decimals > 0 ? 'decimal' : 'numeric'}
               placeholder="0"
               value={amountText}
-              onChange={(e) => setAmountText(e.target.value.replace(/[^\d]/g, ''))}
+              onChange={(e) => {
+                if (mainCurrency.decimals <= 0) {
+                  setAmountText(e.target.value.replace(/[^\d]/g, ''));
+                } else {
+                  const cleaned = e.target.value.replace(/[^\d.]/g, '');
+                  const dotIdx = cleaned.indexOf('.');
+                  setAmountText(
+                    dotIdx === -1
+                      ? cleaned
+                      : cleaned.slice(0, dotIdx + 1) + cleaned.slice(dotIdx + 1).replace(/\./g, ''),
+                  );
+                }
+              }}
               style={
                 kind === 'expense'
                   ? { color: amountColors.expense }

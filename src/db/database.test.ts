@@ -131,7 +131,7 @@ describe('JSON 備份匯出與還原', () => {
     ]);
 
     const backup = await exportBackupData(sourceDb);
-    expect(backup.schemaVersion).toBe(12);
+    expect(backup.schemaVersion).toBe(13);
     expect(backup.transactions).toHaveLength(2);
     expect(backup.transactions.some((t) => t.id === 'tx-deleted' && t.deleted)).toBe(true);
     expect(backup.transactions.find((t) => t.id === 'tx-active')?.invoiceNo).toBe('AB12345678');
@@ -661,7 +661,7 @@ describe('常用備註與自動學習（v5）', () => {
     await softDeleteNotePreset(deletedPreset.id, srcDb);
 
     const backup = await exportBackupData(srcDb);
-    expect(backup.schemaVersion).toBe(12);
+    expect(backup.schemaVersion).toBe(13);
     expect(backup.notePresets).toHaveLength(2);
 
     const dstDb = new ExpenseDatabase(`test-notepreset-backup-dst-${Date.now()}`);
@@ -1251,7 +1251,7 @@ describe('地點與時間資料庫邏輯（v8）', () => {
 
     const place = await savePlace({ name: '公館夜市', icon: '🏮', sellerIds: ['87654321'] }, v8Db);
     const backup = await exportBackupData(v8Db);
-    expect(backup.schemaVersion).toBe(12);
+    expect(backup.schemaVersion).toBe(13);
     expect(backup.places).toHaveLength(1);
 
     const parsed = parseBackupPayload(JSON.parse(JSON.stringify(backup)));

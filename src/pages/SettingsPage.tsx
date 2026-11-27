@@ -6,6 +6,7 @@ import {
   type AmountColors,
   archiveAccount,
   archiveCategory,
+  archiveCurrency,
   archivePlace,
   type BackupPayload,
   clearPinRecord,
@@ -23,6 +24,7 @@ import {
   saveAmountColors,
   saveBudgets,
   saveCategory,
+  saveCurrency,
   saveHomeLayout,
   saveNotePreset,
   savePinRecord,
@@ -31,15 +33,18 @@ import {
   setAutoSelectLastPlace,
   setSyncSchedule,
   softDeleteCategory,
+  softDeleteCurrency,
   softDeleteNotePreset,
   softDeletePlace,
   softDeleteRecurringRule,
   softDeleteShortcut,
   swapAccountSortOrder,
   swapCategorySortOrder,
+  swapCurrencySortOrder,
   swapNotePresetSortOrder,
   swapPlaceSortOrder,
   swapShortcutSortOrder,
+  switchMainCurrency,
   type SyncSchedule,
 } from '../db/repository';
 import type {
@@ -48,6 +53,7 @@ import type {
   Budget,
   Category,
   CategoryKind,
+  CurrencyRate,
   NotePreset,
   Place,
   RecurringRule,
@@ -55,17 +61,28 @@ import type {
   Transaction,
 } from '../db/types';
 import {
+  COMMON_CURRENCIES,
   type CsvImportPlan,
+  CURRENCY_NAME_MAX_LENGTH,
+  formatCurrency,
+  formatRateDisplay,
   formatRecurringFrequency,
+  getDefaultCurrencyDecimals,
+  getDefaultCurrencyName,
   getNextOccurrenceDate,
   getRecurringRuleStatus,
   getTodayDateString,
+  hasAtMostDecimals,
   HOME_SECTION_META,
   type HomeLayoutItem,
   type HomeSectionKey,
+  isValidCurrencyCode,
+  isValidRate,
   isValidSellerId,
+  type MainCurrencyInfo,
   PLACE_NAME_MAX_LENGTH,
   planCsvImport,
+  roundToDecimals,
   toCsv,
 } from '../domain';
 import {
@@ -94,6 +111,8 @@ interface SettingsPageProps {
   categories: readonly Category[];
   places: readonly Place[];
   budgets: readonly Budget[];
+  currencies?: readonly CurrencyRate[];
+  mainCurrency?: MainCurrencyInfo;
   autoSelectLastPlace: boolean;
   homeLayout: readonly HomeLayoutItem<HomeSectionKey>[];
   transactions: readonly Transaction[];
@@ -109,11 +128,29 @@ interface SettingsPageProps {
   onReplayOnboarding: () => void;
 }
 
+const DEFAULT_MAIN_CURRENCY: MainCurrencyInfo = {
+  code: 'TWD',
+  name: '新台幣',
+  decimals: 0,
+  symbol: 'NT$',
+};
+
 const ACCOUNT_TYPE_LABELS: Record<AccountType, string> = {
   cash: '現金',
   bank: '銀行帳戶',
   credit: '信用卡',
 };
+
+function sanitizeBudgetInput(raw: string, decimals: number): string {
+  if (decimals <= 0) {
+    return raw.replace(/[^\d]/g, '');
+  }
+  const cleaned = raw.replace(/[^\d.]/g, '');
+  const dotIdx = cleaned.indexOf('.');
+  return dotIdx === -1
+    ? cleaned
+    : cleaned.slice(0, dotIdx + 1) + cleaned.slice(dotIdx + 1).replace(/\./g, '');
+}
 
 function getCompactDateStamp(): string {
   return getTodayDateString().replace(/-/g, '');
@@ -124,6 +161,8 @@ export function SettingsPage({
   categories,
   places,
   budgets,
+  currencies = [],
+  mainCurrency = DEFAULT_MAIN_CURRENCY,
   autoSelectLastPlace,
   homeLayout,
   transactions,
@@ -258,6 +297,30 @@ export function SettingsPage({
   const [placeSellerIds, setPlaceSellerIds] = useState<string[]>([]);
   const [newSellerIdInput, setNewSellerIdInput] = useState('');
 
+  const [curFormOpen, setCurFormOpen] = useState(false);
+  const [editingCurCode, setEditingCurCode] = useState<string | null>(null);
+  const [curCode, setCurCode] = useState('');
+  const [curName, setCurName] = useState('');
+  const [curDecimals, setCurDecimals] = useState<0 | 2>(2);
+  const [curRate, setCurRate] = useState('');
+  const [curExactRate, setCurExactRate] = useState<{ display: string; exact: number } | null>(null);
+
+  const [switchOpen, setSwitchOpen] = useState(false);
+  const [switchStep, setSwitchStep] = useState<'input' | 'backing-up' | 'backup-failed'>('input');
+  const [switchTargetCode, setSwitchTargetCode] = useState('');
+  const [switchCustomMode, setSwitchCustomMode] = useState(false);
+  const [switchCustomCode, setSwitchCustomCode] = useState('');
+  const [switchCustomName, setSwitchCustomName] = useState('');
+  const [switchCustomDecimals, setSwitchCustomDecimals] = useState<0 | 2>(2);
+  const [switchRateText, setSwitchRateText] = useState('');
+  const [switchExactRate, setSwitchExactRate] = useState<{
+    display: string;
+    exact: number;
+  } | null>(null);
+  const [switchError, setSwitchError] = useState<string | null>(null);
+  const [switchBackupErrors, setSwitchBackupErrors] = useState<string[]>([]);
+  const [switchBusy, setSwitchBusy] = useState(false);
+
   const [pendingBackup, setPendingBackup] = useState<BackupPayload | null>(null);
   const [cloudRestoreOpen, setCloudRestoreOpen] = useState(false);
   const [pendingCsvPlan, setPendingCsvPlan] = useState<CsvImportPlan | null>(null);
@@ -320,10 +383,18 @@ export function SettingsPage({
           return null;
         }
         const num = Number(trimmed);
-        if (!Number.isInteger(num) || num < 0) {
-          throw new Error(`${label}需為非負整數`);
+        if (
+          !Number.isFinite(num) ||
+          num < 0 ||
+          !hasAtMostDecimals(num, mainCurrency.decimals)
+        ) {
+          throw new Error(
+            mainCurrency.decimals <= 0
+              ? `${label}需為非負整數`
+              : `${label}需為非負數字（最多 ${mainCurrency.decimals} 位小數）`,
+          );
         }
-        return num;
+        return roundToDecimals(num, mainCurrency.decimals);
       };
 
       const inputs = [
@@ -376,6 +447,42 @@ export function SettingsPage({
     }
     return set;
   }, [transactions]);
+
+  const usedCurrencyCodes = useMemo(() => {
+    const set = new Set<string>();
+    for (const tx of transactions) {
+      if (!tx.deleted && tx.currency) {
+        set.add(tx.currency.trim().toUpperCase());
+      }
+    }
+    return set;
+  }, [transactions]);
+
+  const foreignCurrencies = useMemo(
+    () =>
+      currencies
+        .filter((c) => !c.deleted && !c.isMain && c.code !== mainCurrency.code)
+        .sort((a, b) => a.sortOrder - b.sortOrder),
+    [currencies, mainCurrency.code],
+  );
+
+  const switchCandidateCurrencies = useMemo(() => {
+    const map = new Map<string, { code: string; name: string; decimals: 0 | 2; rate?: number }>();
+    for (const c of foreignCurrencies) {
+      map.set(c.code, {
+        code: c.code,
+        name: c.name,
+        decimals: c.decimals === 0 ? 0 : 2,
+        rate: c.rate,
+      });
+    }
+    for (const c of COMMON_CURRENCIES) {
+      if (c.code !== mainCurrency.code && !map.has(c.code)) {
+        map.set(c.code, { code: c.code, name: c.name, decimals: c.decimals });
+      }
+    }
+    return Array.from(map.values());
+  }, [foreignCurrencies, mainCurrency.code]);
 
   const sortedPlaces = useMemo(
     () => [...places].sort((a, b) => a.sortOrder - b.sortOrder),
@@ -518,7 +625,7 @@ export function SettingsPage({
         id: editingAccId ?? undefined,
         name: accName,
         type: accType,
-        initialBalance: Math.trunc(parsedBalance),
+        initialBalance: roundToDecimals(parsedBalance, mainCurrency.decimals),
       });
       setAccFormOpen(false);
       setStatusMessage(editingAccId ? '已更新帳戶' : '已新增帳戶');
@@ -647,6 +754,260 @@ export function SettingsPage({
     } catch (err) {
       setErrorMessage(err instanceof Error ? err.message : '儲存地點失敗');
     }
+  }
+
+  function openCreateCurrency() {
+    setEditingCurCode(null);
+    setCurCode('');
+    setCurName('');
+    setCurDecimals(2);
+    setCurRate('');
+    setCurExactRate(null);
+    setCurFormOpen(true);
+    setErrorMessage(null);
+  }
+
+  function openEditCurrency(cur: CurrencyRate) {
+    const display = formatRateDisplay(cur.rate);
+    setEditingCurCode(cur.code);
+    setCurCode(cur.code);
+    setCurName(cur.name);
+    setCurDecimals(cur.decimals === 0 ? 0 : 2);
+    setCurRate(display);
+    setCurExactRate({ display, exact: cur.rate });
+    setCurFormOpen(true);
+    setErrorMessage(null);
+  }
+
+  async function handleSaveCurrency(e: React.FormEvent) {
+    e.preventDefault();
+    const code = curCode.trim().toUpperCase();
+    if (!isValidCurrencyCode(code)) {
+      setErrorMessage('幣別代碼需為 3 個大寫英文字母（例如 JPY）');
+      return;
+    }
+    if (code === mainCurrency.code) {
+      setErrorMessage(`${code} 已是目前主幣別`);
+      return;
+    }
+    if (!curName.trim()) {
+      setErrorMessage('請輸入幣別名稱');
+      return;
+    }
+    const trimmedCurRate = curRate.trim();
+    const rateNum =
+      curExactRate && trimmedCurRate === curExactRate.display
+        ? curExactRate.exact
+        : Number(trimmedCurRate);
+    if (!isValidRate(rateNum)) {
+      setErrorMessage('匯率需為大於 0 的數字');
+      return;
+    }
+    try {
+      await saveCurrency({
+        code,
+        name: curName.trim(),
+        decimals: curDecimals,
+        rate: rateNum,
+      });
+      setCurFormOpen(false);
+      setStatusMessage(editingCurCode ? `已更新 ${code} 最新匯率` : `已新增幣別 ${code}`);
+      setErrorMessage(null);
+    } catch (err) {
+      setErrorMessage(err instanceof Error ? err.message : '儲存幣別失敗');
+    }
+  }
+
+  async function handleDeleteCurrency(code: string) {
+    try {
+      await softDeleteCurrency(code);
+      setStatusMessage(`已刪除幣別 ${code}`);
+      setErrorMessage(null);
+    } catch (err) {
+      setErrorMessage(err instanceof Error ? err.message : '無法刪除幣別');
+    }
+  }
+
+  function openSwitchMainCurrency() {
+    const firstCandidate = switchCandidateCurrencies[0];
+    setSwitchOpen(true);
+    setSwitchStep('input');
+    setSwitchCustomMode(!firstCandidate);
+    setSwitchTargetCode(firstCandidate?.code ?? '');
+    setSwitchCustomCode('');
+    setSwitchCustomName('');
+    setSwitchCustomDecimals(2);
+    if (firstCandidate?.rate !== undefined) {
+      const display = formatRateDisplay(firstCandidate.rate);
+      setSwitchRateText(display);
+      setSwitchExactRate({ display, exact: firstCandidate.rate });
+    } else {
+      setSwitchRateText('');
+      setSwitchExactRate(null);
+    }
+    setSwitchError(null);
+    setSwitchBackupErrors([]);
+    setSwitchBusy(false);
+  }
+
+  function handleSelectSwitchTarget(code: string) {
+    if (code === '__CUSTOM__') {
+      setSwitchCustomMode(true);
+      setSwitchTargetCode('__CUSTOM__');
+      setSwitchRateText('');
+      setSwitchExactRate(null);
+      setSwitchError(null);
+      return;
+    }
+    setSwitchCustomMode(false);
+    setSwitchTargetCode(code);
+    const matched = switchCandidateCurrencies.find((c) => c.code === code);
+    if (matched?.rate !== undefined) {
+      const display = formatRateDisplay(matched.rate);
+      setSwitchRateText(display);
+      setSwitchExactRate({ display, exact: matched.rate });
+    } else {
+      setSwitchRateText('');
+      setSwitchExactRate(null);
+    }
+    setSwitchError(null);
+  }
+
+  function resolveSwitchTarget(): { code: string; name: string; decimals: 0 | 2 } | null {
+    if (switchCustomMode) {
+      const code = switchCustomCode.trim().toUpperCase();
+      if (!isValidCurrencyCode(code)) {
+        setSwitchError('新主幣別代碼需為 3 個大寫英文字母');
+        return null;
+      }
+      if (code === mainCurrency.code) {
+        setSwitchError('新主幣別不可與目前主幣別相同');
+        return null;
+      }
+      const name = (switchCustomName.trim() || getDefaultCurrencyName(code)).slice(
+        0,
+        CURRENCY_NAME_MAX_LENGTH,
+      );
+      return { code, name, decimals: switchCustomDecimals };
+    }
+
+    const candidate = switchCandidateCurrencies.find((c) => c.code === switchTargetCode);
+    if (!candidate) {
+      setSwitchError('請選擇新的主幣別');
+      return null;
+    }
+    return { code: candidate.code, name: candidate.name, decimals: candidate.decimals };
+  }
+
+  async function executeSwitchMainCurrency(
+    target: { code: string; name: string; decimals: 0 | 2 },
+    rateNum: number,
+  ) {
+    setSwitchBusy(true);
+    setSwitchError(null);
+    try {
+      const result = await switchMainCurrency({
+        newCode: target.code,
+        newName: target.name,
+        newDecimals: target.decimals,
+        rate: rateNum,
+      });
+      setSwitchOpen(false);
+      setStatusMessage(`已切換主幣別為 ${target.name}（${target.code}），已換算 ${result.convertedTransactions} 筆帳`);
+      setErrorMessage(null);
+    } catch (err) {
+      setSwitchError(err instanceof Error ? err.message : '切換主幣別失敗');
+      setSwitchStep('input');
+    } finally {
+      setSwitchBusy(false);
+    }
+  }
+
+  async function handleStartSwitchMainCurrency() {
+    if (switchBusy) {
+      return;
+    }
+    const target = resolveSwitchTarget();
+    if (!target) {
+      return;
+    }
+    const trimmedSwitchRate = switchRateText.trim();
+    const rateNum =
+      switchExactRate && trimmedSwitchRate === switchExactRate.display
+        ? switchExactRate.exact
+        : Number(trimmedSwitchRate);
+    if (!isValidRate(rateNum)) {
+      setSwitchError('請輸入有效的匯率（大於 0 的數字）');
+      return;
+    }
+
+    setSwitchBusy(true);
+    setSwitchStep('backing-up');
+    setSwitchError(null);
+    setSwitchBackupErrors([]);
+
+    const failures: string[] = [];
+
+    try {
+      const payload = await exportBackupData();
+      const json = JSON.stringify(payload, null, 2);
+      const blob = new Blob([json], { type: 'application/json;charset=utf-8' });
+      const result = await saveFile(
+        blob,
+        `記帳備份_${getCompactDateStamp()}.json`,
+        'application/json;charset=utf-8',
+      );
+      if (result === 'cancelled') {
+        failures.push('JSON 本機備份已取消');
+      } else {
+        await recordJsonBackupTimestamp();
+      }
+    } catch (err) {
+      failures.push(`JSON 本機備份失敗：${err instanceof Error ? err.message : '未知錯誤'}`);
+    }
+
+    if (isSyncEnabled()) {
+      if (!isOnline) {
+        failures.push('Google Drive 備份失敗：目前為離線狀態');
+      } else {
+        try {
+          await backupToGoogleDrive();
+        } catch (err) {
+          failures.push(`Google Drive 備份失敗：${toFriendlySyncError(err)}`);
+        }
+      }
+    }
+
+    if (failures.length > 0) {
+      setSwitchBackupErrors(failures);
+      setSwitchStep('backup-failed');
+      setSwitchBusy(false);
+      return;
+    }
+
+    await executeSwitchMainCurrency(target, rateNum);
+  }
+
+  async function handleContinueSwitchAfterBackupFailure() {
+    if (switchBusy) {
+      return;
+    }
+    const target = resolveSwitchTarget();
+    if (!target) {
+      setSwitchStep('input');
+      return;
+    }
+    const trimmedSwitchRate = switchRateText.trim();
+    const rateNum =
+      switchExactRate && trimmedSwitchRate === switchExactRate.display
+        ? switchExactRate.exact
+        : Number(trimmedSwitchRate);
+    if (!isValidRate(rateNum)) {
+      setSwitchStep('input');
+      setSwitchError('請輸入有效的匯率（大於 0 的數字）');
+      return;
+    }
+    await executeSwitchMainCurrency(target, rateNum);
   }
 
   async function handleDeletePlace(id: string) {
@@ -779,7 +1140,14 @@ export function SettingsPage({
   async function processCsvFile(file: File) {
     try {
       const text = await file.text();
-      const plan = planCsvImport(text, { transactions, categories, accounts, places });
+      const plan = planCsvImport(text, {
+        transactions,
+        categories,
+        accounts,
+        places,
+        currencies,
+        mainDecimals: mainCurrency.decimals,
+      });
       setPendingCsvPlan(plan);
       setPendingBackup(null);
       setErrorMessage(null);
@@ -829,6 +1197,9 @@ export function SettingsPage({
       }
       if (result.createdPlacesCount > 0) {
         extras.push(`新建地點 ${result.createdPlacesCount} 個`);
+      }
+      if (result.createdCurrenciesCount && result.createdCurrenciesCount > 0) {
+        extras.push(`新建幣別 ${result.createdCurrenciesCount} 個`);
       }
       const extraText = extras.length > 0 ? `，${extras.join('、')}` : '';
       setStatusMessage(`匯入完成（新增 ${result.importedCount} 筆交易${extraText}）`);
@@ -904,7 +1275,7 @@ export function SettingsPage({
                 className="text-sm font-semibold tabular-nums"
                 style={{ color: amountColors.expense }}
               >
-                NT$1,234
+                {formatCurrency(mainCurrency.decimals > 0 ? 1234.5 : 1234)}
               </span>
               <input
                 id="color-expense"
@@ -933,7 +1304,7 @@ export function SettingsPage({
                 className="text-sm font-semibold tabular-nums"
                 style={{ color: amountColors.income }}
               >
-                NT$1,234
+                {formatCurrency(mainCurrency.decimals > 0 ? 1234.5 : 1234)}
               </span>
               <input
                 id="color-income"
@@ -950,6 +1321,428 @@ export function SettingsPage({
             </div>
           </div>
         </div>
+      </section>
+
+      {/* 幣別與匯率 */}
+      <section className="rounded-2xl border border-slate-200 bg-white p-4 dark:border-slate-800 dark:bg-slate-900">
+        <div className="mb-3 flex items-center justify-between gap-2">
+          <div>
+            <h2 className="text-sm font-semibold text-slate-900 dark:text-slate-100">幣別與匯率</h2>
+            <p className="mt-0.5 text-xs text-slate-500 dark:text-slate-400">
+              每筆外幣帳會記住當下的匯率，之後修改匯率不會改到已經記好的帳。
+            </p>
+          </div>
+          <button
+            type="button"
+            onClick={openCreateCurrency}
+            className="shrink-0 rounded-lg bg-emerald-600 px-3 py-1.5 text-xs font-medium text-white hover:bg-emerald-700"
+          >
+            ＋ 新增幣別
+          </button>
+        </div>
+
+        <div className="mb-3 flex flex-wrap items-center justify-between gap-2 rounded-xl border border-emerald-200 bg-emerald-50/70 px-3 py-2.5 dark:border-emerald-800/70 dark:bg-emerald-950/30">
+          <div>
+            <div className="text-xs text-emerald-700 dark:text-emerald-300">目前主幣別</div>
+            <div className="text-sm font-semibold text-slate-900 dark:text-slate-100">
+              {mainCurrency.name}（{mainCurrency.code} · {mainCurrency.symbol.trimEnd()}，{mainCurrency.decimals} 位小數）
+            </div>
+          </div>
+          <button
+            type="button"
+            onClick={openSwitchMainCurrency}
+            className="shrink-0 rounded-xl border border-emerald-600 bg-white px-3 py-1.5 text-xs font-medium text-emerald-700 hover:bg-emerald-50 dark:border-emerald-500 dark:bg-slate-800 dark:text-emerald-300 dark:hover:bg-slate-700"
+          >
+            變更主幣別
+          </button>
+        </div>
+
+        {curFormOpen && (
+          <form
+            onSubmit={(e) => void handleSaveCurrency(e)}
+            className="mb-3 space-y-2.5 rounded-xl border border-slate-200 bg-slate-50 p-3 dark:border-slate-700 dark:bg-slate-800/60"
+          >
+            <div className="text-xs font-semibold text-slate-700 dark:text-slate-200">
+              {editingCurCode ? `編輯幣別 ${editingCurCode}` : '新增外幣'}
+            </div>
+
+            {!editingCurCode && (
+              <div className="flex flex-wrap gap-1.5">
+                {COMMON_CURRENCIES.filter(
+                  (c) =>
+                    c.code !== mainCurrency.code &&
+                    !foreignCurrencies.some((fc) => fc.code === c.code),
+                ).map((c) => (
+                  <button
+                    key={c.code}
+                    type="button"
+                    onClick={() => {
+                      setCurCode(c.code);
+                      setCurName(c.name);
+                      setCurDecimals(c.decimals);
+                    }}
+                    className={`rounded-full border px-2 py-0.5 text-[11px] transition-colors ${
+                      curCode === c.code
+                        ? 'border-emerald-500 bg-emerald-50 font-medium text-emerald-700 dark:border-emerald-400 dark:bg-emerald-950/60 dark:text-emerald-300'
+                        : 'border-slate-200 bg-white text-slate-700 hover:bg-slate-100 dark:border-slate-700 dark:bg-slate-800 dark:text-slate-200 dark:hover:bg-slate-700'
+                    }`}
+                  >
+                    {c.code} {c.name}
+                  </button>
+                ))}
+              </div>
+            )}
+
+            <div className="grid grid-cols-3 gap-2">
+              <input
+                type="text"
+                aria-label="幣別代碼"
+                placeholder="代碼（JPY）"
+                maxLength={3}
+                disabled={Boolean(editingCurCode)}
+                value={curCode}
+                onChange={(e) => {
+                  const val = e.target.value.toUpperCase().replace(/[^A-Z]/g, '');
+                  setCurCode(val);
+                  if (val.length === 3 && !editingCurCode) {
+                    setCurDecimals(getDefaultCurrencyDecimals(val));
+                  }
+                }}
+                className="rounded-lg border border-slate-200 bg-white px-2.5 py-1.5 text-sm uppercase text-slate-900 placeholder:text-slate-400 outline-none focus:border-emerald-500 focus:bg-white disabled:opacity-60 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100 dark:placeholder:text-slate-500 dark:focus:bg-slate-900"
+              />
+              <input
+                type="text"
+                aria-label="幣別名稱"
+                placeholder="名稱（日圓）"
+                maxLength={CURRENCY_NAME_MAX_LENGTH}
+                value={curName}
+                onChange={(e) => setCurName(e.target.value)}
+                className="rounded-lg border border-slate-200 bg-white px-2.5 py-1.5 text-sm text-slate-900 placeholder:text-slate-400 outline-none focus:border-emerald-500 focus:bg-white dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100 dark:placeholder:text-slate-500 dark:focus:bg-slate-900"
+              />
+              <select
+                aria-label="幣別小數位"
+                value={curDecimals}
+                onChange={(e) => setCurDecimals(Number(e.target.value) === 0 ? 0 : 2)}
+                className="rounded-lg border border-slate-200 bg-white px-2 py-1.5 text-sm text-slate-900 outline-none focus:border-emerald-500 focus:bg-white dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100 dark:focus:bg-slate-900"
+              >
+                <option value={0}>0 位小數</option>
+                <option value={2}>2 位小數</option>
+              </select>
+            </div>
+
+            <div className="flex items-center gap-2">
+              <span className="shrink-0 text-xs text-slate-600 dark:text-slate-300">
+                最新匯率：1 {curCode || '外幣'} =
+              </span>
+              <input
+                type="text"
+                inputMode="decimal"
+                aria-label="最新匯率"
+                placeholder="0.215"
+                value={curRate}
+                onChange={(e) => setCurRate(e.target.value)}
+                className="min-w-0 flex-1 rounded-lg border border-slate-200 bg-white px-3 py-1.5 text-right text-sm tabular-nums text-slate-900 placeholder:text-slate-400 outline-none focus:border-emerald-500 focus:bg-white dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100 dark:placeholder:text-slate-500 dark:focus:bg-slate-900"
+              />
+              <span className="shrink-0 text-xs text-slate-600 dark:text-slate-300">
+                {mainCurrency.code}
+              </span>
+            </div>
+
+            <div className="flex justify-end gap-2">
+              <button
+                type="button"
+                onClick={() => setCurFormOpen(false)}
+                className="rounded-lg px-3 py-1.5 text-xs text-slate-600 hover:bg-slate-200 dark:text-slate-300 dark:hover:bg-slate-700"
+              >
+                取消
+              </button>
+              <button
+                type="submit"
+                className="rounded-lg bg-emerald-600 px-3 py-1.5 text-xs font-medium text-white hover:bg-emerald-700"
+              >
+                儲存
+              </button>
+            </div>
+          </form>
+        )}
+
+        {switchOpen && (
+          <div className="mb-3 space-y-3 rounded-xl border border-amber-300 bg-amber-50/80 p-3.5 dark:border-amber-800 dark:bg-amber-950/40">
+            <div className="flex items-center justify-between">
+              <h3 className="text-sm font-semibold text-slate-900 dark:text-slate-100">
+                變更主幣別（目前：{mainCurrency.name} {mainCurrency.code}）
+              </h3>
+              <button
+                type="button"
+                disabled={switchBusy}
+                onClick={() => setSwitchOpen(false)}
+                className="rounded px-2 py-0.5 text-xs text-slate-500 hover:bg-amber-100 dark:text-slate-300 dark:hover:bg-slate-800"
+              >
+                取消
+              </button>
+            </div>
+
+            {switchStep === 'input' && (
+              <>
+                <div>
+                  <label
+                    htmlFor="switch-main-currency-select"
+                    className="mb-1 block text-xs font-medium text-slate-700 dark:text-slate-200"
+                  >
+                    選擇新的主幣別
+                  </label>
+                  <select
+                    id="switch-main-currency-select"
+                    value={switchTargetCode}
+                    onChange={(e) => handleSelectSwitchTarget(e.target.value)}
+                    className="w-full rounded-lg border border-slate-200 bg-white px-3 py-2 text-sm text-slate-900 outline-none focus:border-emerald-500 focus:bg-white dark:border-slate-700 dark:bg-slate-800 dark:text-slate-100 dark:focus:bg-slate-800"
+                  >
+                    {switchCandidateCurrencies.map((c) => (
+                      <option key={c.code} value={c.code}>
+                        {c.code} · {c.name}（{c.decimals} 位小數）
+                      </option>
+                    ))}
+                    <option value="__CUSTOM__">自訂其他幣別…</option>
+                  </select>
+                </div>
+
+                {switchCustomMode && (
+                  <div className="grid grid-cols-3 gap-2">
+                    <input
+                      type="text"
+                      aria-label="新主幣別代碼"
+                      maxLength={3}
+                      placeholder="代碼（CHF）"
+                      value={switchCustomCode}
+                      onChange={(e) => {
+                        const val = e.target.value.toUpperCase().replace(/[^A-Z]/g, '');
+                        setSwitchCustomCode(val);
+                        if (val.length === 3) {
+                          setSwitchCustomDecimals(getDefaultCurrencyDecimals(val));
+                        }
+                      }}
+                      className="rounded-lg border border-slate-200 bg-white px-2.5 py-1.5 text-sm uppercase text-slate-900 placeholder:text-slate-400 outline-none focus:border-emerald-500 focus:bg-white dark:border-slate-700 dark:bg-slate-800 dark:text-slate-100 dark:placeholder:text-slate-500 dark:focus:bg-slate-800"
+                    />
+                    <input
+                      type="text"
+                      aria-label="新主幣別名稱"
+                      maxLength={CURRENCY_NAME_MAX_LENGTH}
+                      placeholder="名稱"
+                      value={switchCustomName}
+                      onChange={(e) => setSwitchCustomName(e.target.value)}
+                      className="rounded-lg border border-slate-200 bg-white px-2.5 py-1.5 text-sm text-slate-900 placeholder:text-slate-400 outline-none focus:border-emerald-500 focus:bg-white dark:border-slate-700 dark:bg-slate-800 dark:text-slate-100 dark:placeholder:text-slate-500 dark:focus:bg-slate-800"
+                    />
+                    <select
+                      aria-label="新主幣別小數位"
+                      value={switchCustomDecimals}
+                      onChange={(e) =>
+                        setSwitchCustomDecimals(Number(e.target.value) === 0 ? 0 : 2)
+                      }
+                      className="rounded-lg border border-slate-200 bg-white px-2 py-1.5 text-sm text-slate-900 outline-none focus:border-emerald-500 focus:bg-white dark:border-slate-700 dark:bg-slate-800 dark:text-slate-100 dark:focus:bg-slate-800"
+                    >
+                      <option value={0}>0 位</option>
+                      <option value={2}>2 位</option>
+                    </select>
+                  </div>
+                )}
+
+                <div>
+                  <label
+                    htmlFor="switch-main-rate-input"
+                    className="mb-1 block text-xs font-medium text-slate-700 dark:text-slate-200"
+                  >
+                    輸入換算匯率（必填）
+                  </label>
+                  <div className="flex items-center gap-2">
+                    <span className="shrink-0 text-xs font-medium text-slate-700 dark:text-slate-200">
+                      1{' '}
+                      {switchCustomMode
+                        ? switchCustomCode || 'NEW'
+                        : switchTargetCode || 'NEW'}{' '}
+                      =
+                    </span>
+                    <input
+                      id="switch-main-rate-input"
+                      type="text"
+                      inputMode="decimal"
+                      aria-label="主幣別切換匯率"
+                      placeholder="例如 32"
+                      value={switchRateText}
+                      onChange={(e) => setSwitchRateText(e.target.value)}
+                      className="min-w-0 flex-1 rounded-lg border border-slate-200 bg-white px-3 py-1.5 text-right text-sm font-semibold tabular-nums text-slate-900 placeholder:text-slate-400 outline-none focus:border-emerald-500 focus:bg-white dark:border-slate-700 dark:bg-slate-800 dark:text-slate-100 dark:placeholder:text-slate-500 dark:focus:bg-slate-800"
+                    />
+                    <span className="shrink-0 text-xs font-medium text-slate-700 dark:text-slate-200">
+                      {mainCurrency.code}
+                    </span>
+                  </div>
+                </div>
+
+                <p className="text-xs leading-relaxed text-amber-900 dark:text-amber-200">
+                  所有帳會用這個匯率重新換算成{' '}
+                  {switchCustomMode ? switchCustomCode || '新幣別' : switchTargetCode}
+                  ，原幣金額不會變。換算前會先自動備份。
+                </p>
+
+                {switchError && (
+                  <p className="text-xs font-medium text-red-600 dark:text-red-400">
+                    {switchError}
+                  </p>
+                )}
+
+                <div className="flex justify-end gap-2">
+                  <button
+                    type="button"
+                    onClick={() => setSwitchOpen(false)}
+                    className="rounded-lg px-3 py-1.5 text-xs text-slate-700 hover:bg-amber-100 dark:text-slate-300 dark:hover:bg-slate-800"
+                  >
+                    取消
+                  </button>
+                  <button
+                    type="button"
+                    disabled={switchBusy}
+                    onClick={() => void handleStartSwitchMainCurrency()}
+                    className="rounded-lg bg-amber-600 px-3 py-1.5 text-xs font-semibold text-white hover:bg-amber-700 disabled:opacity-50"
+                  >
+                    自動備份並開始換算
+                  </button>
+                </div>
+              </>
+            )}
+
+            {switchStep === 'backing-up' && (
+              <div className="py-2 text-xs font-medium text-amber-900 dark:text-amber-200">
+                正在執行換算前自動備份…
+              </div>
+            )}
+
+            {switchStep === 'backup-failed' && (
+              <div className="space-y-2.5">
+                <div className="text-xs font-semibold text-red-700 dark:text-red-300">
+                  換算前自動備份未完成：
+                </div>
+                <ul className="list-inside list-disc space-y-1 text-xs text-red-700 dark:text-red-300">
+                  {switchBackupErrors.map((err) => (
+                    <li key={err}>{err}</li>
+                  ))}
+                </ul>
+                <div className="flex justify-end gap-2">
+                  <button
+                    type="button"
+                    onClick={() => setSwitchOpen(false)}
+                    className="rounded-lg border border-slate-300 bg-white px-3 py-1.5 text-xs text-slate-700 hover:bg-slate-50 dark:border-slate-700 dark:bg-slate-800 dark:text-slate-200"
+                  >
+                    取消變更
+                  </button>
+                  <button
+                    type="button"
+                    disabled={switchBusy}
+                    onClick={() => void handleContinueSwitchAfterBackupFailure()}
+                    className="rounded-lg bg-red-600 px-3 py-1.5 text-xs font-semibold text-white hover:bg-red-700 disabled:opacity-50"
+                  >
+                    仍要繼續換算
+                  </button>
+                </div>
+              </div>
+            )}
+          </div>
+        )}
+
+        {foreignCurrencies.length === 0 ? (
+          <p className="py-2 text-xs text-slate-400 dark:text-slate-500">
+            尚未新增外幣，可在記帳時或點擊右上方「＋ 新增幣別」加入常用外幣。
+          </p>
+        ) : (
+          <div className="divide-y divide-slate-100 dark:divide-slate-800">
+            {foreignCurrencies.map((cur, idx) => {
+              const inUse = usedCurrencyCodes.has(cur.code);
+              return (
+                <div key={cur.code} className="flex items-center justify-between gap-2 py-2.5">
+                  <div className="min-w-0">
+                    <div className="flex items-center gap-1.5">
+                      <span
+                        className={`text-sm font-semibold ${
+                          cur.archived
+                            ? 'text-slate-400 line-through'
+                            : 'text-slate-900 dark:text-slate-100'
+                        }`}
+                      >
+                        {cur.code}
+                      </span>
+                      <span
+                        className={`truncate text-sm ${
+                          cur.archived
+                            ? 'text-slate-400 line-through'
+                            : 'text-slate-700 dark:text-slate-200'
+                        }`}
+                      >
+                        {cur.name}
+                      </span>
+                      <span className="rounded bg-slate-100 px-1.5 py-0.5 text-[10px] text-slate-500 dark:bg-slate-800 dark:text-slate-400">
+                        {cur.decimals} 位
+                      </span>
+                      {cur.archived && (
+                        <span className="rounded bg-slate-100 px-1.5 py-0.5 text-[10px] text-slate-500 dark:bg-slate-800">
+                          已封存
+                        </span>
+                      )}
+                    </div>
+                    <div className="text-xs tabular-nums text-slate-500 dark:text-slate-400">
+                      1 {cur.code} = {formatRateDisplay(cur.rate)} {mainCurrency.code}
+                    </div>
+                  </div>
+
+                  <div className="flex shrink-0 items-center gap-1 text-xs">
+                    <button
+                      type="button"
+                      disabled={idx === 0}
+                      onClick={() =>
+                        void swapCurrencySortOrder(cur.id, foreignCurrencies[idx - 1]!.id)
+                      }
+                      aria-label={`上移 ${cur.code}`}
+                      className="rounded px-1.5 py-1 text-slate-500 hover:bg-slate-100 disabled:opacity-30 dark:hover:bg-slate-800"
+                    >
+                      ↑
+                    </button>
+                    <button
+                      type="button"
+                      disabled={idx === foreignCurrencies.length - 1}
+                      onClick={() =>
+                        void swapCurrencySortOrder(cur.id, foreignCurrencies[idx + 1]!.id)
+                      }
+                      aria-label={`下移 ${cur.code}`}
+                      className="rounded px-1.5 py-1 text-slate-500 hover:bg-slate-100 disabled:opacity-30 dark:hover:bg-slate-800"
+                    >
+                      ↓
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => openEditCurrency(cur)}
+                      className="rounded px-2 py-1 text-slate-600 hover:bg-slate-100 dark:text-slate-300 dark:hover:bg-slate-800"
+                    >
+                      修改匯率
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => void archiveCurrency(cur.code, !cur.archived)}
+                      className="rounded px-2 py-1 text-amber-600 hover:bg-amber-50 dark:text-amber-400 dark:hover:bg-slate-800"
+                    >
+                      {cur.archived ? '啟用' : '封存'}
+                    </button>
+                    {!inUse && (
+                      <button
+                        type="button"
+                        onClick={() => void handleDeleteCurrency(cur.code)}
+                        className="rounded px-2 py-1 text-red-600 hover:bg-red-50 dark:text-red-400 dark:hover:bg-slate-800"
+                      >
+                        刪除
+                      </button>
+                    )}
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        )}
       </section>
 
       {/* 首頁顯示 */}
@@ -1222,14 +2015,15 @@ export function SettingsPage({
               每月總預算
             </label>
             <div className="flex items-center gap-1.5">
-              <span className="text-xs text-slate-400">NT$</span>
+              <span className="text-xs text-slate-400">{mainCurrency.symbol.trimEnd()}</span>
               <input
                 id="budget-total-input"
                 type="text"
-                inputMode="numeric"
-                pattern="[0-9]*"
+                inputMode={mainCurrency.decimals > 0 ? 'decimal' : 'numeric'}
                 value={totalBudgetInput}
-                onChange={(e) => setTotalBudgetInput(e.target.value.replace(/[^\d]/g, ''))}
+                onChange={(e) =>
+                  setTotalBudgetInput(sanitizeBudgetInput(e.target.value, mainCurrency.decimals))
+                }
                 placeholder="不設"
                 className="w-28 rounded-lg border border-slate-200 bg-white px-2.5 py-1.5 text-right text-sm tabular-nums text-slate-900 outline-none focus:border-emerald-500 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100"
               />
@@ -1250,15 +2044,14 @@ export function SettingsPage({
                   <span className="truncate">{cat.name}</span>
                 </label>
                 <div className="flex items-center gap-1.5">
-                  <span className="text-xs text-slate-400">NT$</span>
+                  <span className="text-xs text-slate-400">{mainCurrency.symbol.trimEnd()}</span>
                   <input
                     id={`budget-cat-${cat.id}`}
                     type="text"
-                    inputMode="numeric"
-                    pattern="[0-9]*"
+                    inputMode={mainCurrency.decimals > 0 ? 'decimal' : 'numeric'}
                     value={categoryBudgetInputs[cat.id] ?? ''}
                     onChange={(e) => {
-                      const val = e.target.value.replace(/[^\d]/g, '');
+                      const val = sanitizeBudgetInput(e.target.value, mainCurrency.decimals);
                       setCategoryBudgetInputs((prev) => ({ ...prev, [cat.id]: val }));
                     }}
                     placeholder="不設"
@@ -1672,11 +2465,11 @@ export function SettingsPage({
             </div>
             <div>
               <label className="mb-1 block text-xs text-slate-500 dark:text-slate-400">
-                開帳餘額（整數）
+                開帳餘額{mainCurrency.decimals === 0 ? '（整數）' : ''}
               </label>
               <input
                 type="number"
-                step="1"
+                step={mainCurrency.decimals > 0 ? '0.01' : '1'}
                 aria-label="開帳餘額"
                 value={accInitialBalance}
                 onChange={(e) => setAccInitialBalance(e.target.value)}
@@ -2387,7 +3180,8 @@ export function SettingsPage({
 
             {(pendingCsvPlan.newAccounts.length > 0 ||
               pendingCsvPlan.newCategories.length > 0 ||
-              pendingCsvPlan.newPlaces.length > 0) && (
+              pendingCsvPlan.newPlaces.length > 0 ||
+              pendingCsvPlan.newCurrencies.length > 0) && (
               <div className="mt-2 rounded-lg bg-white/70 p-2 text-xs text-amber-900 dark:bg-slate-900/50 dark:text-amber-200">
                 <div className="font-semibold">將新建</div>
                 {pendingCsvPlan.newAccounts.length > 0 && (
@@ -2410,6 +3204,11 @@ export function SettingsPage({
                 )}
                 {pendingCsvPlan.newPlaces.length > 0 && (
                   <div className="mt-1">地點：{pendingCsvPlan.newPlaces.join('、')}</div>
+                )}
+                {pendingCsvPlan.newCurrencies.length > 0 && (
+                  <div className="mt-1">
+                    幣別：{pendingCsvPlan.newCurrencies.map((c) => `${c.code}（1=${c.rate}）`).join('、')}
+                  </div>
                 )}
               </div>
             )}

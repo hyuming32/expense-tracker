@@ -1,3 +1,5 @@
+import { roundToDecimals } from './currency';
+
 export type CalcResult =
   | { ok: true; value: number }
   | { ok: false; error: string };
@@ -126,9 +128,9 @@ export function appendCalcToken(current: string, token: string): string {
 /**
  * 自行實作的算式解析器（不使用 eval / new Function）：
  * 支援先乘除後加減、連續運算、小數過程、尾端運算子自動忽略、除以 0 回傳錯誤，
- * 最終結果四捨五入為整數元。
+ * 最終結果依指定小數位（預設 0）四捨五入。
  */
-export function evaluateExpression(expression: string): CalcResult {
+export function evaluateExpression(expression: string, decimals = 0): CalcResult {
   let normalized = normalizeExpression(expression);
   if (!normalized) {
     return { ok: false, error: '請輸入金額' };
@@ -232,15 +234,15 @@ export function evaluateExpression(expression: string): CalcResult {
     return { ok: false, error: '數值超出範圍' };
   }
 
-  const rounded = Math.round(total);
+  const rounded = roundToDecimals(total, decimals);
   return { ok: true, value: rounded === 0 ? 0 : rounded };
 }
 
 /**
  * 計算算式並驗證最終記帳金額是否大於 0。
  */
-export function resolveAmountExpression(expression: string): CalcResult {
-  const evaluated = evaluateExpression(expression);
+export function resolveAmountExpression(expression: string, decimals = 0): CalcResult {
+  const evaluated = evaluateExpression(expression, decimals);
   if (!evaluated.ok) {
     return evaluated;
   }

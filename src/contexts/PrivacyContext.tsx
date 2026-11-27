@@ -5,6 +5,7 @@ import { formatDisplayCurrency } from '../domain';
 interface PrivacyContextValue {
   hideAmounts: boolean;
   defaultHideAmounts: boolean;
+  currencyKey: string;
   setHideAmounts: (hide: boolean) => void;
   toggleHideAmounts: () => void;
   setDefaultHideAmounts: (enabled: boolean) => Promise<void>;
@@ -13,6 +14,7 @@ interface PrivacyContextValue {
 const PrivacyContext = createContext<PrivacyContextValue>({
   hideAmounts: false,
   defaultHideAmounts: false,
+  currencyKey: 'TWD:0',
   setHideAmounts: () => {},
   toggleHideAmounts: () => {},
   setDefaultHideAmounts: async () => {},
@@ -20,13 +22,18 @@ const PrivacyContext = createContext<PrivacyContextValue>({
 
 interface PrivacyProviderProps {
   initialDefault: boolean | undefined;
+  currencyKey?: string;
   children: ReactNode;
 }
 
 /**
  * 提供全域「隱藏金額」狀態與切換方法的 Context Provider。
  */
-export function PrivacyProvider({ initialDefault, children }: PrivacyProviderProps) {
+export function PrivacyProvider({
+  initialDefault,
+  currencyKey = 'TWD:0',
+  children,
+}: PrivacyProviderProps) {
   const [hideAmounts, setHideAmounts] = useState(false);
   const initializedRef = useRef(false);
 
@@ -51,6 +58,7 @@ export function PrivacyProvider({ initialDefault, children }: PrivacyProviderPro
       value={{
         hideAmounts,
         defaultHideAmounts: initialDefault ?? false,
+        currencyKey,
         setHideAmounts,
         toggleHideAmounts,
         setDefaultHideAmounts,
@@ -72,10 +80,11 @@ export function usePrivacy(): PrivacyContextValue {
  * 回傳依目前隱私狀態格式化金額的函式（隱藏時顯示「NT$ ••••」）。
  */
 export function useMoney(): (amount: number) => string {
-  const { hideAmounts } = usePrivacy();
+  const { hideAmounts, currencyKey } = usePrivacy();
   return useCallback(
     (amount: number) => formatDisplayCurrency(amount, hideAmounts),
-    [hideAmounts],
+    // currencyKey 用於在主幣別切換時觸發重新渲染
+    [hideAmounts, currencyKey],
   );
 }
 

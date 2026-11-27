@@ -34,10 +34,12 @@ import {
   useAutoSelectLastPlace,
   useBudgets,
   useCards,
+  useCurrencies,
   useHideAmountsDefault,
   useHomeLayout,
   useLastUsedMeta,
   useLotteryDraws,
+  useMainCurrency,
   useNoSpendDays,
   useNotePresets,
   useOnboardingMetaState,
@@ -111,6 +113,8 @@ export function App() {
   const lotteryDraws = useLotteryDraws();
   const budgets = useBudgets();
   const cards = useCards();
+  const currencies = useCurrencies();
+  const mainCurrency = useMainCurrency(currencies);
   const noSpendDays = useNoSpendDays();
   const homeLayout = useHomeLayout();
   const pinRecord = usePinRecord();
@@ -413,7 +417,10 @@ export function App() {
   }
 
   return (
-    <PrivacyProvider initialDefault={hideAmountsDefault}>
+    <PrivacyProvider
+      initialDefault={hideAmountsDefault}
+      currencyKey={`${mainCurrency.code}:${mainCurrency.decimals}`}
+    >
       <HashRouter>
       <div className="min-h-screen bg-slate-50 dark:bg-slate-950">
         <main className="mx-auto max-w-[720px] px-4 pt-4">
@@ -537,6 +544,8 @@ export function App() {
                   categories={categories}
                   places={places}
                   budgets={budgets}
+                  currencies={currencies}
+                  mainCurrency={mainCurrency}
                   autoSelectLastPlace={autoSelectLastPlace}
                   homeLayout={homeLayout}
                   transactions={transactions}
@@ -620,6 +629,8 @@ export function App() {
           accounts={activeAccounts}
           categories={categories}
           places={places}
+          currencies={currencies}
+          mainCurrency={mainCurrency}
           recentTags={recentTags}
           autoSelectLastPlace={autoSelectLastPlace}
           lastUsed={lastUsed}
@@ -637,6 +648,7 @@ export function App() {
           categories={categories}
           lastUsed={lastUsed}
           amountColors={amountColors}
+          mainCurrency={mainCurrency}
           onClose={handleCloseShortcutSheet}
         />
 
@@ -648,6 +660,7 @@ export function App() {
           categories={categories}
           lastUsed={lastUsed}
           amountColors={amountColors}
+          mainCurrency={mainCurrency}
           onClose={handleCloseRecurringSheet}
         />
 
