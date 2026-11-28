@@ -1,6 +1,6 @@
 import 'fake-indexeddb/auto';
 import { IDBFactory } from 'fake-indexeddb';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   ensureSeeded,
   ExpenseDatabase,
@@ -27,23 +27,28 @@ import {
 import { computeBudgetStatus } from '../domain/budget';
 import { hashPin } from '../lib/pinLock';
 import {
+  buildFamilyInviteUrl,
   clearFamilyConfig,
   getActiveLedger,
   getFamilyConfig,
   isFamilyReadOnly,
+  parseJoinFamilyParam,
   setActiveLedger,
   setFamilyConfig,
 } from './familyConfig';
 import { parseFamilyLedgerFile } from './familyFile';
 import {
   createFamilyLedger,
+  getFamilySyncState,
   getMembers,
   inviteMember,
   joinFamilyLedger,
   removeMember,
+  triggerFamilySync,
 } from './familyManager';
-import { MemoryFamilyDriveStore } from './familyStore';
+import { type FamilyDriveStore, MemoryFamilyDriveStore } from './familyStore';
 import { FamilyAccessLostError, syncFamilyOnce } from './familySync';
+import { clearCachedDriveFileToken } from '../sync/auth';
 
 const createdDbs: ExpenseDatabase[] = [];
 
@@ -651,5 +656,114 @@ describe('家庭帳本資料層與同步核心', () => {
     // 清除成員預算會軟刪除
     await saveMemberBudget(USER_A.permissionId, null, personalTestDb);
     expect(await getMemberBudgets(personalTestDb)).toHaveLength(1);
+  });
+
+  it('9. familyManager 背景同步沒有權杖時狀態變 needAuth 且沒有呼叫互動式授權', async () => {
+    clearCachedDriveFileToken();
+    const initTokenClientMock = vi.fn();
+    Object.defineProperty(globalThis, 'google', {
+      configurable: true,
+      value: {
+        accounts: {
+          oauth2: {
+            initTokenClient: initTokenClientMock,
+            revoke: vi.fn(),
+          },
+        },
+      },
+    });
+
+    setFamilyConfig({
+      fileId: 'family-file-bg',
+      ledgerName: '家帳',
+      memberId: USER_A.permissionId,
+      email: USER_A.emailAddress,
+      role: 'owner',
+      status: 'active',
+      joinedAt: Date.now(),
+    });
+    setActiveLedger('family');
+
+    const ok = await triggerFamilySync({ interactive: false });
+    expect(ok).toBe(false);
+    expect(getFamilySyncState().status).toBe('needAuth');
+    expect(initTokenClientMock).not.toHaveBeenCalled();
+  });
+
+  it('10. joinFamilyLedger：有 fileId 且 download 成功時不呼叫 pickFile；download 403 時呼叫 pickFile 並傳入該 fileId', async () => {
+    const rootStore = new MemoryFamilyDriveStore(USER_A);
+    const storeA = rootStore;
+    const storeB = rootStore.asUser(USER_B);
+
+    const dbA = createIsolatedFamilyDb();
+    const dbB1 = createIsolatedFamilyDb();
+    const dbB2 = createIsolatedFamilyDb();
+
+    const configA = await createFamilyLedger(
+      { ledgerName: '我們家', myName: 'A', color: '#2563EB' },
+      { store: storeA, database: dbA },
+    );
+    await inviteMember(USER_B.emailAddress, { store: storeA });
+
+    // 情境 1：已有權限，有 fileId 且 download 成功時不呼叫 pickFile
+    const pickSuccessSpy = vi.fn(async () => ({ id: configA.fileId, name: '我們家.fun2young.json' }));
+    const configB1 = await joinFamilyLedger(
+      { myName: 'B', color: '#E11D48', fileId: configA.fileId },
+      { store: storeB, database: dbB1, pickFile: pickSuccessSpy },
+    );
+    expect(configB1.fileId).toBe(configA.fileId);
+    expect(pickSuccessSpy).not.toHaveBeenCalled();
+
+    // 情境 2：download 403 時呼叫 pickFile 並傳入該 fileId（模擬使用者透過選擇器授權後即可下載）
+    const unsharedUserC = {
+      permissionId: 'perm-user-c',
+      emailAddress: 'carol@example.com',
+      displayName: 'Carol',
+    };
+    const storeC = rootStore.asUser(unsharedUserC);
+    const originalDownload = storeC.download.bind(storeC);
+    let deniedOnce = false;
+    const storeCWithTemp403: FamilyDriveStore = {
+      about: () => storeC.about(),
+      create: (name, json) => storeC.create(name, json),
+      download: async (fid) => {
+        if (!deniedOnce) {
+          deniedOnce = true;
+          await storeA.share(configA.fileId, unsharedUserC.emailAddress);
+          // 第一次呼叫仍先回傳 403 模擬尚未透過 Picker 取得 drive.file 存取權
+          const { DriveApiError } = await import('../sync/driveStore');
+          throw new DriveApiError('Forbidden', 403);
+        }
+        return originalDownload(fid);
+      },
+      update: (fid, json) => storeC.update(fid, json),
+      findAppFiles: () => storeC.findAppFiles(),
+      share: (fid, email, joinUrl) => storeC.share(fid, email, joinUrl),
+      unshare: (fid, pid) => storeC.unshare(fid, pid),
+    };
+
+    const pick403Spy = vi.fn(async (_token: string, _options?: { fileId?: string }) => ({
+      id: configA.fileId,
+      name: '我們家.fun2young.json',
+    }));
+    const configC = await joinFamilyLedger(
+      { myName: 'C', color: '#10B981', fileId: configA.fileId },
+      { store: storeCWithTemp403, database: dbB2, pickFile: pick403Spy },
+    );
+    expect(configC.fileId).toBe(configA.fileId);
+    expect(pick403Spy).toHaveBeenCalledTimes(1);
+    expect(pick403Spy).toHaveBeenCalledWith(expect.any(String), { fileId: configA.fileId });
+  });
+
+  it('11. parseJoinFamilyParam 與 buildFamilyInviteUrl 解析與產生邀請連結', () => {
+    expect(parseJoinFamilyParam('')).toBeNull();
+    expect(parseJoinFamilyParam('?foo=bar')).toBeNull();
+    expect(parseJoinFamilyParam('?joinFamily=')).toBeNull();
+    expect(parseJoinFamilyParam('?joinFamily=%20%20')).toBeNull();
+    expect(parseJoinFamilyParam('?joinFamily=file-abc-123')).toBe('file-abc-123');
+    expect(parseJoinFamilyParam('?foo=1&joinFamily=file-xyz&bar=2')).toBe('file-xyz');
+    expect(buildFamilyInviteUrl('file-123', 'https://example.com', '/')).toBe(
+      'https://example.com/?joinFamily=file-123',
+    );
   });
 });

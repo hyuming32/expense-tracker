@@ -278,6 +278,7 @@ export function SettingsPage({
     }
   }
   const budgetSectionRef = useRef<HTMLElement | null>(null);
+  const familySectionRef = useRef<HTMLDivElement | null>(null);
   const [totalBudgetInput, setTotalBudgetInput] = useState('');
   const [categoryBudgetInputs, setCategoryBudgetInputs] = useState<Record<string, string>>({});
   const [memberBudgetInputs, setMemberBudgetInputs] = useState<Record<string, string>>({});
@@ -392,8 +393,11 @@ export function SettingsPage({
   }, [memberBudgets]);
 
   useEffect(() => {
-    if (searchParams.get('section') === 'budget' && budgetSectionRef.current) {
+    const section = searchParams.get('section');
+    if (section === 'budget' && budgetSectionRef.current) {
       budgetSectionRef.current.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    } else if (section === 'family' && familySectionRef.current) {
+      familySectionRef.current.scrollIntoView({ behavior: 'smooth', block: 'start' });
     }
   }, [searchParams]);
 
@@ -3340,7 +3344,9 @@ export function SettingsPage({
       </section>
 
       {/* 家庭帳本 */}
-      <FamilyLedgerSection isFamilyMode={isFamilyMode} members={members} />
+      <div ref={familySectionRef}>
+        <FamilyLedgerSection isFamilyMode={isFamilyMode} members={members} />
+      </div>
 
       {/* Google 同步（個人模式專用） */}
       {!isFamilyMode && (
@@ -3386,7 +3392,20 @@ export function SettingsPage({
                 <button
                   type="button"
                   disabled={syncState.status === 'syncing' || authBusy}
-                  onClick={() => void triggerSync()}
+                  onClick={() => {
+                    if (syncState.status !== 'reauth') {
+                      void triggerSync();
+                      return;
+                    }
+                    // 授權已過期：由使用者點擊觸發 Google 授權後再同步
+                    setAuthBusy(true);
+                    setErrorMessage(null);
+                    void loginAndSync()
+                      .catch((err) => {
+                        setErrorMessage(err instanceof Error ? err.message : 'Google 登入失敗');
+                      })
+                      .finally(() => setAuthBusy(false));
+                  }}
                   className={
                     syncState.status === 'error'
                       ? 'rounded-xl bg-red-600 px-3 py-2 text-xs font-medium text-white hover:bg-red-700 disabled:opacity-50'

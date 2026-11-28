@@ -122,8 +122,8 @@ function formatFamilySyncBannerText(syncState: FamilySyncState): string {
         : '已同步';
     case 'offline':
       return '離線，恢復網路後自動同步';
-    case 'reauth':
-      return '需要重新授權';
+    case 'needAuth':
+      return '有新紀錄要和家人同步';
     case 'error':
       return syncState.errorMessage ? `同步失敗：${syncState.errorMessage}` : '同步失敗';
     case 'removed':
@@ -1086,13 +1086,17 @@ export function HomePage({
               {formatFamilySyncBannerText(familySyncState)}
             </span>
             {!effectiveReadOnly &&
-              (familySyncState.status === 'reauth' || familySyncState.status === 'error') && (
+              (familySyncState.status === 'needAuth' || familySyncState.status === 'error') && (
                 <button
                   type="button"
                   onClick={() => void triggerFamilySync({ interactive: true })}
-                  className="rounded-lg bg-amber-600 px-2 py-0.5 text-[11px] font-medium text-white hover:bg-amber-700"
+                  className={
+                    familySyncState.status === 'needAuth'
+                      ? 'rounded-lg border border-slate-200 bg-white px-2.5 py-0.5 text-[11px] font-medium text-slate-700 hover:bg-slate-50 dark:border-slate-700 dark:bg-slate-800 dark:text-slate-200 dark:hover:bg-slate-700'
+                      : 'rounded-lg bg-amber-600 px-2 py-0.5 text-[11px] font-medium text-white hover:bg-amber-700'
+                  }
                 >
-                  {familySyncState.status === 'reauth' ? '重新授權' : '重試'}
+                  {familySyncState.status === 'needAuth' ? '點此同步' : '重試'}
                 </button>
               )}
           </div>

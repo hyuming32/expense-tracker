@@ -15,6 +15,7 @@ export interface FamilyConfig {
 
 const FAMILY_CONFIG_STORAGE_KEY = 'expense_tracker_family_config';
 const ACTIVE_LEDGER_STORAGE_KEY = 'expense_tracker_active_ledger';
+export const PENDING_JOIN_FILE_ID_STORAGE_KEY = 'expense_tracker_pending_join_file_id';
 
 function getLocalStorage(): Storage | null {
   if (typeof globalThis.localStorage === 'undefined') {
@@ -115,4 +116,66 @@ export function setActiveLedger(ledger: ActiveLedger): void {
 export function isFamilyReadOnly(): boolean {
   const config = getFamilyConfig();
   return config?.status === 'removed';
+}
+
+/**
+ * 解析網址查詢字串中的 joinFamily 參數，若無效或為空則回傳 null。
+ */
+export function parseJoinFamilyParam(search: string): string | null {
+  const trimmed = search.trim();
+  if (!trimmed) {
+    return null;
+  }
+  const params = new URLSearchParams(trimmed);
+  const raw = params.get('joinFamily')?.trim() ?? '';
+  return raw.length > 0 ? raw : null;
+}
+
+/**
+ * 產生家庭帳本邀請連結。
+ */
+export function buildFamilyInviteUrl(
+  fileId: string,
+  origin: string = typeof window !== 'undefined' ? window.location.origin : '',
+  baseUrl: string = import.meta.env.BASE_URL ?? '/',
+): string {
+  const normalizedBase = baseUrl.endsWith('/') ? baseUrl : `${baseUrl}/`;
+  return `${origin}${normalizedBase}?joinFamily=${encodeURIComponent(fileId)}`;
+}
+
+/**
+ * 讀取待加入的家庭帳本檔案 ID（從邀請連結寫入）。
+ */
+export function getPendingJoinFileId(): string | null {
+  const storage = getLocalStorage();
+  if (!storage) {
+    return null;
+  }
+  const raw = storage.getItem(PENDING_JOIN_FILE_ID_STORAGE_KEY)?.trim() ?? '';
+  return raw.length > 0 ? raw : null;
+}
+
+/**
+ * 儲存待加入的家庭帳本檔案 ID。
+ */
+export function setPendingJoinFileId(fileId: string): void {
+  const storage = getLocalStorage();
+  if (!storage) {
+    return;
+  }
+  const trimmed = fileId.trim();
+  if (trimmed) {
+    storage.setItem(PENDING_JOIN_FILE_ID_STORAGE_KEY, trimmed);
+  }
+}
+
+/**
+ * 清除待加入的家庭帳本檔案 ID。
+ */
+export function clearPendingJoinFileId(): void {
+  const storage = getLocalStorage();
+  if (!storage) {
+    return;
+  }
+  storage.removeItem(PENDING_JOIN_FILE_ID_STORAGE_KEY);
 }

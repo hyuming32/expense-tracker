@@ -4,8 +4,11 @@ import { useMoney } from '../contexts/PrivacyContext';
 import { db, ExpenseDatabase, FAMILY_DB_NAME } from '../db/database';
 import type { Member, Transaction } from '../db/types';
 import {
+  buildFamilyInviteUrl,
+  clearPendingJoinFileId,
   getActiveLedger,
   getFamilyConfig,
+  getPendingJoinFileId,
   isFamilyReadOnly,
   setActiveLedger,
 } from '../family/familyConfig';
@@ -21,6 +24,7 @@ import {
   updateMyProfile,
   useFamilySyncState,
 } from '../family/familyManager';
+import { pickFamilyLedgerFile } from '../family/picker';
 import { DriveAuthCancelledError } from '../sync/auth';
 import { formatSyncTimeLabel } from '../sync/syncManager';
 
@@ -54,8 +58,8 @@ function formatFamilySyncStatusText(syncState: FamilySyncState): string {
         : '已同步';
     case 'offline':
       return '離線，恢復網路後自動同步';
-    case 'reauth':
-      return '需要重新授權';
+    case 'needAuth':
+      return '點此同步家庭帳本';
     case 'error':
       return syncState.errorMessage ? `同步失敗：${syncState.errorMessage}` : '同步失敗';
     case 'removed':
@@ -164,16 +168,31 @@ export function FamilyLedgerSection({
   const myMember = familyConfig ? memberMap.get(familyConfig.memberId) : undefined;
 
   // 未設定時建立／加入表單狀態
-  const [setupMode, setSetupMode] = useState<'idle' | 'create' | 'join'>('idle');
+  const [pendingJoinFileId, setPendingJoinFileId] = useState<string | null>(() =>
+    getPendingJoinFileId(),
+  );
+  const [setupMode, setSetupMode] = useState<'idle' | 'create' | 'join'>(() =>
+    !getFamilyConfig() && getPendingJoinFileId() ? 'join' : 'idle',
+  );
   const [ledgerNameInput, setLedgerNameInput] = useState('我們家');
   const [myNameInput, setMyNameInput] = useState('');
-  const [myColorInput, setMyColorInput] = useState<string>(FAMILY_MEMBER_COLOR_PALETTE[0]);
+  const [myColorInput, setMyColorInput] = useState<string>(() =>
+    !getFamilyConfig() && getPendingJoinFileId()
+      ? FAMILY_MEMBER_COLOR_PALETTE[1]
+      : FAMILY_MEMBER_COLOR_PALETTE[0],
+  );
+  const [pickerGuide, setPickerGuide] = useState<{
+    hasFileId: boolean;
+    onContinue: () => void;
+    onCancel: () => void;
+  } | null>(null);
 
   // 已設定時編輯個人資料、邀請、移除與捨棄副本狀態
   const [editingProfile, setEditingProfile] = useState(false);
   const [profileName, setProfileName] = useState('');
   const [profileColor, setProfileColor] = useState<string>(FAMILY_MEMBER_COLOR_PALETTE[0]);
   const [inviteEmail, setInviteEmail] = useState('');
+  const [inviteSucceeded, setInviteSucceeded] = useState(false);
   const [confirmingRemoveMember, setConfirmingRemoveMember] = useState<Member | null>(null);
   const [confirmingDiscard, setConfirmingDiscard] = useState(false);
 
@@ -202,6 +221,8 @@ export function FamilyLedgerSection({
         myName: myNameInput,
         color: myColorInput,
       });
+      clearPendingJoinFileId();
+      setPendingJoinFileId(null);
       setActiveLedger('family');
       window.location.reload();
     } catch (err) {
@@ -224,13 +245,36 @@ export function FamilyLedgerSection({
     setErrorMessage(null);
     setStatusMessage(null);
     try {
-      await joinFamilyLedger({
-        myName: myNameInput,
-        color: myColorInput,
-      });
+      await joinFamilyLedger(
+        {
+          myName: myNameInput,
+          color: myColorInput,
+          fileId: pendingJoinFileId ?? undefined,
+        },
+        {
+          // 顯示白話說明卡，由使用者點擊「繼續」後才打開 Google 檔案選擇器
+          pickFile: (accessToken, options) =>
+            new Promise<{ id: string; name: string }>((resolve, reject) => {
+              setPickerGuide({
+                hasFileId: Boolean(options?.fileId),
+                onContinue: () => {
+                  setPickerGuide(null);
+                  void pickFamilyLedgerFile(accessToken, options).then(resolve, reject);
+                },
+                onCancel: () => {
+                  setPickerGuide(null);
+                  reject(new DriveAuthCancelledError('已取消選擇家庭帳本檔案'));
+                },
+              });
+            }),
+        },
+      );
+      clearPendingJoinFileId();
+      setPendingJoinFileId(null);
       setActiveLedger('family');
       window.location.reload();
     } catch (err) {
+      setPickerGuide(null);
       if (err instanceof DriveAuthCancelledError) {
         setSetupMode('idle');
       } else {
@@ -264,6 +308,41 @@ export function FamilyLedgerSection({
     }
   }
 
+  async function handleShareOrCopyInviteLink() {
+    if (!familyConfig) {
+      return;
+    }
+    const url = buildFamilyInviteUrl(familyConfig.fileId);
+    setErrorMessage(null);
+
+    if (typeof navigator !== 'undefined' && typeof navigator.share === 'function') {
+      try {
+        await navigator.share({
+          title: `加入「${familyConfig.ledgerName}」家庭帳本`,
+          text: '點擊連結即可加入我們的家庭帳本',
+          url,
+        });
+        return;
+      } catch (err) {
+        if (err instanceof Error && err.name === 'AbortError') {
+          return;
+        }
+      }
+    }
+
+    if (typeof navigator !== 'undefined' && navigator.clipboard?.writeText) {
+      try {
+        await navigator.clipboard.writeText(url);
+        setStatusMessage('已複製');
+        return;
+      } catch {
+        // 剪貼簿權限失敗時直接顯示連結文字
+      }
+    }
+
+    setStatusMessage(`邀請連結：${url}`);
+  }
+
   async function handleInviteSubmit(e: FormEvent) {
     e.preventDefault();
     if (busy) {
@@ -272,10 +351,12 @@ export function FamilyLedgerSection({
     setBusy(true);
     setErrorMessage(null);
     setStatusMessage(null);
+    setInviteSucceeded(false);
     try {
       await inviteMember(inviteEmail);
       setInviteEmail('');
-      setStatusMessage('已寄出邀請，請對方打開 App → 設定 → 家庭帳本 → 加入');
+      setInviteSucceeded(true);
+      setStatusMessage('已寄出 Google 分享通知，也可以把邀請連結傳給家人');
     } catch (err) {
       if (!(err instanceof DriveAuthCancelledError)) {
         setErrorMessage(err instanceof Error ? err.message : '寄送邀請失敗');
@@ -360,8 +441,17 @@ export function FamilyLedgerSection({
       </div>
 
       {statusMessage && (
-        <div className="mb-3 rounded-xl border border-emerald-200 bg-emerald-50 px-3.5 py-2 text-xs text-emerald-800 dark:border-emerald-800 dark:bg-emerald-950/60 dark:text-emerald-200">
-          {statusMessage}
+        <div className="mb-3 flex flex-wrap items-center justify-between gap-2 rounded-xl border border-emerald-200 bg-emerald-50 px-3.5 py-2 text-xs text-emerald-800 dark:border-emerald-800 dark:bg-emerald-950/60 dark:text-emerald-200">
+          <span>{statusMessage}</span>
+          {inviteSucceeded && familyConfig && (
+            <button
+              type="button"
+              onClick={() => void handleShareOrCopyInviteLink()}
+              className="shrink-0 rounded-lg border border-emerald-300 bg-white px-2.5 py-1 text-xs font-medium text-emerald-800 hover:bg-emerald-100 dark:border-emerald-700 dark:bg-slate-900 dark:text-emerald-200 dark:hover:bg-emerald-900/50"
+            >
+              複製邀請連結
+            </button>
+          )}
         </div>
       )}
 
@@ -469,6 +559,16 @@ export function FamilyLedgerSection({
               onSubmit={(e) => void handleJoinSubmit(e)}
               className="space-y-3 rounded-xl border border-slate-200 bg-slate-50/80 p-3 dark:border-slate-700 dark:bg-slate-800/60"
             >
+              <p className="text-xs leading-relaxed text-slate-600 dark:text-slate-300">
+                請家人在他的 App 按「邀請家人」，把連結傳給你，用那個連結打開就能一鍵加入。
+              </p>
+
+              {pendingJoinFileId && (
+                <div className="rounded-lg border border-emerald-200 bg-emerald-50/80 px-2.5 py-1.5 text-[11px] font-medium text-emerald-800 dark:border-emerald-800 dark:bg-emerald-950/50 dark:text-emerald-200">
+                  已透過邀請連結指定家庭帳本，輸入你的名字後按「加入家庭帳本」即可
+                </div>
+              )}
+
               <div>
                 <label
                   htmlFor="family-join-my-name"
@@ -479,10 +579,11 @@ export function FamilyLedgerSection({
                 <input
                   id="family-join-my-name"
                   type="text"
+                  disabled={busy}
                   value={myNameInput}
                   onChange={(e) => setMyNameInput(e.target.value)}
                   placeholder="例如：媽媽"
-                  className="w-full rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm text-slate-900 outline-none focus:border-emerald-500 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100"
+                  className="w-full rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm text-slate-900 outline-none focus:border-emerald-500 disabled:opacity-60 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100"
                 />
               </div>
 
@@ -492,26 +593,54 @@ export function FamilyLedgerSection({
                 onChange={setMyColorInput}
               />
 
-              <div className="flex items-center justify-end gap-2 pt-1">
-                <button
-                  type="button"
-                  disabled={busy}
-                  onClick={() => {
-                    setSetupMode('idle');
-                    setErrorMessage(null);
-                  }}
-                  className="rounded-xl border border-slate-200 bg-white px-3 py-1.5 text-xs font-medium text-slate-700 hover:bg-slate-50 disabled:opacity-50 dark:border-slate-700 dark:bg-slate-800 dark:text-slate-200"
-                >
-                  取消
-                </button>
-                <button
-                  type="submit"
-                  disabled={busy}
-                  className="rounded-xl bg-emerald-600 px-3.5 py-1.5 text-xs font-medium text-white hover:bg-emerald-700 disabled:opacity-50"
-                >
-                  {busy ? '加入中…' : '加入家庭帳本'}
-                </button>
-              </div>
+              {pickerGuide ? (
+                <div className="space-y-2.5 rounded-xl border border-slate-200 bg-white p-3 dark:border-slate-700 dark:bg-slate-900">
+                  <p className="text-xs leading-relaxed text-slate-700 dark:text-slate-200">
+                    {pickerGuide.hasFileId
+                      ? '接下來會出現 Google 視窗，裡面只會有一個檔案「.fun2young.json」，點它一下再按「選取」即可'
+                      : '接下來會出現 Google 視窗，請點選家人分享的帳本檔案（檔名結尾是 .fun2young.json），點它一下再按「選取」即可'}
+                  </p>
+                  <div className="flex items-center justify-end gap-2">
+                    <button
+                      type="button"
+                      onClick={pickerGuide.onCancel}
+                      className="rounded-xl border border-slate-200 bg-white px-3 py-1.5 text-xs font-medium text-slate-700 hover:bg-slate-50 dark:border-slate-700 dark:bg-slate-800 dark:text-slate-200"
+                    >
+                      取消
+                    </button>
+                    <button
+                      type="button"
+                      onClick={pickerGuide.onContinue}
+                      className="rounded-xl bg-emerald-600 px-3.5 py-1.5 text-xs font-medium text-white hover:bg-emerald-700"
+                    >
+                      繼續
+                    </button>
+                  </div>
+                </div>
+              ) : (
+                <div className="flex items-center justify-end gap-2 pt-1">
+                  <button
+                    type="button"
+                    disabled={busy}
+                    onClick={() => {
+                      clearPendingJoinFileId();
+                      setPendingJoinFileId(null);
+                      setSetupMode('idle');
+                      setErrorMessage(null);
+                    }}
+                    className="rounded-xl border border-slate-200 bg-white px-3 py-1.5 text-xs font-medium text-slate-700 hover:bg-slate-50 disabled:opacity-50 dark:border-slate-700 dark:bg-slate-800 dark:text-slate-200"
+                  >
+                    取消
+                  </button>
+                  <button
+                    type="submit"
+                    disabled={busy}
+                    className="rounded-xl bg-emerald-600 px-3.5 py-1.5 text-xs font-medium text-white hover:bg-emerald-700 disabled:opacity-50"
+                  >
+                    {busy ? '加入中…' : '加入家庭帳本'}
+                  </button>
+                </div>
+              )}
             </form>
           )}
         </div>
@@ -581,16 +710,16 @@ export function FamilyLedgerSection({
                 type="button"
                 disabled={familySyncState.status === 'syncing'}
                 onClick={() => void triggerFamilySync({ interactive: true })}
-                className={`shrink-0 rounded-xl px-3 py-1.5 text-xs font-medium text-white disabled:opacity-50 ${
-                  familySyncState.status === 'reauth'
-                    ? 'bg-amber-600 hover:bg-amber-700'
+                className={`shrink-0 rounded-xl px-3 py-1.5 text-xs font-medium disabled:opacity-50 ${
+                  familySyncState.status === 'needAuth'
+                    ? 'border border-slate-200 bg-white text-slate-700 hover:bg-slate-50 dark:border-slate-700 dark:bg-slate-800 dark:text-slate-200 dark:hover:bg-slate-700'
                     : familySyncState.status === 'error'
-                      ? 'bg-red-600 hover:bg-red-700'
-                      : 'bg-emerald-600 hover:bg-emerald-700'
+                      ? 'bg-red-600 text-white hover:bg-red-700'
+                      : 'bg-emerald-600 text-white hover:bg-emerald-700'
                 }`}
               >
-                {familySyncState.status === 'reauth'
-                  ? '重新授權'
+                {familySyncState.status === 'needAuth'
+                  ? '點此同步'
                   : familySyncState.status === 'syncing'
                     ? '同步中…'
                     : '立即同步'}
@@ -775,12 +904,22 @@ export function FamilyLedgerSection({
               onSubmit={(e) => void handleInviteSubmit(e)}
               className="space-y-2 border-t border-slate-100 pt-3 dark:border-slate-800"
             >
-              <label
-                htmlFor="family-invite-email"
-                className="block text-xs font-semibold text-slate-700 dark:text-slate-200"
-              >
-                邀請家人
-              </label>
+              <div className="flex items-center justify-between gap-2">
+                <label
+                  htmlFor="family-invite-email"
+                  className="block text-xs font-semibold text-slate-700 dark:text-slate-200"
+                >
+                  邀請家人
+                </label>
+                <button
+                  type="button"
+                  disabled={busy}
+                  onClick={() => void handleShareOrCopyInviteLink()}
+                  className="rounded-lg border border-slate-200 bg-white px-2.5 py-1 text-xs font-medium text-slate-700 hover:bg-slate-50 disabled:opacity-50 dark:border-slate-700 dark:bg-slate-800 dark:text-slate-200 dark:hover:bg-slate-700"
+                >
+                  複製邀請連結
+                </button>
+              </div>
               <div className="flex items-center gap-2">
                 <input
                   id="family-invite-email"
