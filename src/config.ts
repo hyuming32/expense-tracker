@@ -12,7 +12,7 @@ export function isGoogleClientConfigured(): boolean {
 export const GOOGLE_DRIVE_FILE_SCOPE = 'https://www.googleapis.com/auth/drive.file';
 
 /** Google Picker API Key（尚未設定時為空字串）。 */
-export const GOOGLE_PICKER_API_KEY = '';
+export const GOOGLE_PICKER_API_KEY = 'AIzaSyAj4WYTDqMEI4MLzMNSQGDowv1dRP5k4K0';
 
 /** Google Cloud 專案編號（供 Google Picker 設定 appId）。 */
 export const GOOGLE_CLOUD_PROJECT_NUMBER = '518552653919';
