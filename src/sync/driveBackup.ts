@@ -1,4 +1,4 @@
-import { db, type ExpenseDatabase, META_KEYS } from '../db/database';
+import { db, type ExpenseDatabase, META_KEYS, personalDb } from '../db/database';
 import { type BackupPayload, exportBackupData, parseBackupPayload } from '../db/repository';
 import { type RestoreDataSummary, summarizeBackupPayload } from '../domain/restore';
 import { requestDriveFileAccessToken } from './auth';
@@ -298,7 +298,9 @@ async function trashDriveFile(getToken: () => Promise<string>, fileId: string): 
 /**
  * 讀取本機記錄的上次備份到 Google Drive 時間戳記。
  */
-export async function getLastDriveBackupAt(database: ExpenseDatabase = db): Promise<number | null> {
+export async function getLastDriveBackupAt(
+  database: ExpenseDatabase = personalDb,
+): Promise<number | null> {
   const entry = await database.meta.get(META_KEYS.DRIVE_BACKUP_LAST_AT);
   if (!entry) {
     return null;
@@ -317,6 +319,7 @@ export async function backupToGoogleDrive(options?: {
   now?: Date;
 }): Promise<DriveBackupResult> {
   const database = options?.database ?? db;
+  const metaDb = options?.database ?? personalDb;
   const now = options?.now ?? new Date();
   let cachedToken: string | null = null;
   const getToken =
@@ -335,11 +338,11 @@ export async function backupToGoogleDrive(options?: {
   const json = JSON.stringify(payload, null, 2);
   const fileName = buildBackupFileName(now);
 
-  const folderId = await findOrCreateBackupFolder(getToken, database);
+  const folderId = await findOrCreateBackupFolder(getToken, metaDb);
   const uploaded = await uploadBackupFile(getToken, folderId, fileName, json);
 
   const backedUpAt = Date.now();
-  await database.meta.put({
+  await metaDb.meta.put({
     key: META_KEYS.DRIVE_BACKUP_LAST_AT,
     value: String(backedUpAt),
   });
@@ -388,7 +391,7 @@ export async function listDriveBackups(options?: {
     return selectRecentBackups(files, limit);
   }
 
-  const database = options?.database ?? db;
+  const database = options?.database ?? personalDb;
   const getToken = createCachedTokenGetter(options?.getToken);
   const folderId = await findBackupFolder(getToken, database);
   if (!folderId) {

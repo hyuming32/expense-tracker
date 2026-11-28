@@ -16,7 +16,7 @@ import {
 } from 'recharts';
 import { useMoney, usePrivacy } from '../contexts/PrivacyContext';
 import { saveReportPeriodKind, type AmountColors } from '../db/repository';
-import type { Budget, Category, Place, Transaction } from '../db/types';
+import type { Budget, Category, Member, Place, Transaction } from '../db/types';
 import {
   categoryBreakdownInRange,
   categoryCompare,
@@ -24,6 +24,7 @@ import {
   compareSummary,
   formatCurrency,
   getTodayDateString,
+  memberBreakdown,
   periodRange,
   periodSummary,
   periodTrend,
@@ -42,6 +43,8 @@ interface ReportsPageProps {
   categories: readonly Category[];
   places: readonly Place[];
   budgets: readonly Budget[];
+  members?: readonly Member[];
+  isFamilyMode?: boolean;
   amountColors: AmountColors;
 }
 
@@ -136,6 +139,8 @@ export function ReportsPage({
   categories,
   places,
   budgets,
+  members = [],
+  isFamilyMode = false,
   amountColors,
 }: ReportsPageProps) {
   const formatMoney = useMoney();
@@ -143,7 +148,7 @@ export function ReportsPage({
   const budgetByCategoryId = useMemo(() => {
     const map = new Map<string, number>();
     for (const b of budgets) {
-      if (!b.deleted && b.categoryId !== null && b.amount > 0) {
+      if (!b.deleted && !b.memberId && b.categoryId !== null && b.amount > 0) {
         map.set(b.categoryId, b.amount);
       }
     }
@@ -153,6 +158,7 @@ export function ReportsPage({
   const [periodKind, setPeriodKind] = useState<PeriodKind>(savedKind);
   const [isTagsTab, setIsTagsTab] = useState(false);
   const [selectedTag, setSelectedTag] = useState<string | null>(null);
+  const [selectedMemberId, setSelectedMemberId] = useState<string | null>(null);
   const [anchor, setAnchor] = useState<string>(getTodayDateString);
   const [expandedCategories, setExpandedCategories] = useState<Record<string, boolean>>({});
 
@@ -165,6 +171,29 @@ export function ReportsPage({
   const currentRange = useMemo(() => periodRange(periodKind, anchor), [periodKind, anchor]);
   const prevRange = useMemo(() => shiftPeriod(currentRange, -1), [currentRange]);
   const lastYearRange = useMemo(() => sameLastYear(currentRange), [currentRange]);
+
+  const memberItems = useMemo(
+    () => (isFamilyMode ? memberBreakdown(transactions, members, currentRange) : []),
+    [isFamilyMode, transactions, members, currentRange],
+  );
+  const memberTotalExpense = useMemo(
+    () => memberItems.reduce((sum, item) => sum + item.amount, 0),
+    [memberItems],
+  );
+  const selectedMemberItem = useMemo(
+    () => (selectedMemberId ? memberItems.find((m) => m.memberId === selectedMemberId) ?? null : null),
+    [selectedMemberId, memberItems],
+  );
+
+  const scopedTransactions = useMemo(() => {
+    if (!isFamilyMode || !selectedMemberId) {
+      return transactions;
+    }
+    if (selectedMemberId === 'unassigned') {
+      return transactions.filter((tx) => !tx.memberId);
+    }
+    return transactions.filter((tx) => tx.memberId === selectedMemberId);
+  }, [transactions, isFamilyMode, selectedMemberId]);
 
   const elapsedPrev = useMemo(
     () => clipToElapsed(currentRange, prevRange, today),
@@ -179,20 +208,20 @@ export function ReportsPage({
 
   // 若期間進行中，摘要與上一期／去年同期都只比較到同一天
   const currentSumForPrev = useMemo(
-    () => periodSummary(transactions, elapsedPrev.range),
-    [transactions, elapsedPrev.range],
+    () => periodSummary(scopedTransactions, elapsedPrev.range),
+    [scopedTransactions, elapsedPrev.range],
   );
   const prevSum = useMemo(
-    () => periodSummary(transactions, elapsedPrev.compareRange),
-    [transactions, elapsedPrev.compareRange],
+    () => periodSummary(scopedTransactions, elapsedPrev.compareRange),
+    [scopedTransactions, elapsedPrev.compareRange],
   );
   const currentSumForLastYear = useMemo(
-    () => periodSummary(transactions, elapsedLastYear.range),
-    [transactions, elapsedLastYear.range],
+    () => periodSummary(scopedTransactions, elapsedLastYear.range),
+    [scopedTransactions, elapsedLastYear.range],
   );
   const lastYearSum = useMemo(
-    () => periodSummary(transactions, elapsedLastYear.compareRange),
-    [transactions, elapsedLastYear.compareRange],
+    () => periodSummary(scopedTransactions, elapsedLastYear.compareRange),
+    [scopedTransactions, elapsedLastYear.compareRange],
   );
 
   const expensePrevCmp = useMemo(
@@ -223,13 +252,13 @@ export function ReportsPage({
   );
 
   const breakdown = useMemo(
-    () => categoryBreakdownInRange(transactions, categories, currentRange),
-    [transactions, categories, currentRange],
+    () => categoryBreakdownInRange(scopedTransactions, categories, currentRange),
+    [scopedTransactions, categories, currentRange],
   );
 
   const placeBreakdown = useMemo(
-    () => placeBreakdownInRange(transactions, places, currentRange, 10),
-    [transactions, places, currentRange],
+    () => placeBreakdownInRange(scopedTransactions, places, currentRange, 10),
+    [scopedTransactions, places, currentRange],
   );
 
   const totalExpense = useMemo(
@@ -240,17 +269,17 @@ export function ReportsPage({
   const categoryRows = useMemo(
     () =>
       categoryCompare(
-        transactions,
+        scopedTransactions,
         categories,
         elapsedPrev.range,
         elapsedPrev.compareRange,
       ),
-    [transactions, categories, elapsedPrev.range, elapsedPrev.compareRange],
+    [scopedTransactions, categories, elapsedPrev.range, elapsedPrev.compareRange],
   );
 
   const trend = useMemo(
-    () => periodTrend(transactions, periodKind, currentRange, TREND_COUNTS[periodKind]),
-    [transactions, periodKind, currentRange],
+    () => periodTrend(scopedTransactions, periodKind, currentRange, TREND_COUNTS[periodKind]),
+    [scopedTransactions, periodKind, currentRange],
   );
 
   const hasTrendData = useMemo(
@@ -544,6 +573,118 @@ export function ReportsPage({
           </p>
         )}
       </div>
+
+      {/* 0.5 成員支出（家庭模式） */}
+      {isFamilyMode && (
+        <section className="rounded-2xl border border-slate-200 bg-white p-4 dark:border-slate-800 dark:bg-slate-900">
+          <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
+            <h2 className="text-sm font-semibold text-slate-900 dark:text-slate-100">成員</h2>
+            {selectedMemberItem ? (
+              <button
+                type="button"
+                onClick={() => setSelectedMemberId(null)}
+                className="rounded-full bg-emerald-50 px-2.5 py-0.5 text-xs font-medium text-emerald-700 hover:bg-emerald-100 dark:bg-emerald-950/60 dark:text-emerald-300 dark:hover:bg-emerald-900/60"
+              >
+                只看：{selectedMemberItem.name}（點此取消）
+              </button>
+            ) : (
+              <span className="text-xs text-slate-400 dark:text-slate-500">
+                {memberTotalExpense > 0
+                  ? `總支出 ${formatMoney(memberTotalExpense)}・點選成員篩選`
+                  : '點選成員篩選本頁圖表'}
+              </span>
+            )}
+          </div>
+
+          {memberItems.length === 0 ? (
+            <div className="py-8 text-center text-sm text-slate-500 dark:text-slate-400">
+              這段期間還沒有支出紀錄
+            </div>
+          ) : (
+            <div className="grid gap-4 sm:grid-cols-2 sm:items-center">
+              <div className="h-52 w-full">
+                <ResponsiveContainer width="100%" height="100%">
+                  <PieChart>
+                    <Pie
+                      data={memberItems}
+                      dataKey="amount"
+                      nameKey="name"
+                      cx="50%"
+                      cy="50%"
+                      innerRadius={44}
+                      outerRadius={78}
+                      paddingAngle={2}
+                      onClick={(_, index) => {
+                        const clicked = memberItems[index];
+                        if (clicked) {
+                          setSelectedMemberId((prev) =>
+                            prev === clicked.memberId ? null : clicked.memberId,
+                          );
+                        }
+                      }}
+                    >
+                      {memberItems.map((entry) => (
+                        <Cell
+                          key={entry.memberId}
+                          fill={entry.color}
+                          opacity={
+                            selectedMemberId && selectedMemberId !== entry.memberId ? 0.35 : 1
+                          }
+                          className="cursor-pointer outline-none"
+                        />
+                      ))}
+                    </Pie>
+                    <Tooltip formatter={(value) => formatMoney(Number(value ?? 0))} />
+                  </PieChart>
+                </ResponsiveContainer>
+              </div>
+
+              <div className="space-y-1.5">
+                {memberItems.map((item) => {
+                  const selected = selectedMemberId === item.memberId;
+                  const dimmed = Boolean(selectedMemberId && !selected);
+                  return (
+                    <button
+                      key={item.memberId}
+                      type="button"
+                      onClick={() =>
+                        setSelectedMemberId((prev) =>
+                          prev === item.memberId ? null : item.memberId,
+                        )
+                      }
+                      aria-pressed={selected}
+                      className={`flex w-full items-center justify-between gap-2 rounded-xl px-2.5 py-2 text-left text-sm transition-all ${
+                        selected
+                          ? 'bg-emerald-50/80 ring-2 ring-emerald-500 dark:bg-emerald-950/40'
+                          : 'hover:bg-slate-50 dark:hover:bg-slate-800/60'
+                      } ${dimmed ? 'opacity-55' : ''}`}
+                    >
+                      <div className="flex min-w-0 items-center gap-2">
+                        <span
+                          className="h-3 w-3 shrink-0 rounded-full"
+                          style={{ backgroundColor: item.color }}
+                          aria-hidden="true"
+                        />
+                        <span className="truncate font-medium text-slate-800 dark:text-slate-200">
+                          {item.name}
+                        </span>
+                      </div>
+                      <div className="shrink-0 text-right tabular-nums">
+                        <span className="font-semibold text-slate-900 dark:text-slate-100">
+                          {formatMoney(item.amount)}
+                        </span>
+                        <span className="ml-2 text-xs text-slate-500 dark:text-slate-400">
+                          {item.percentage.toFixed(1)}%
+                        </span>
+                      </div>
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
+          )}
+        </section>
+      )}
 
       {/* 1. 摘要卡 */}
       <section className="grid grid-cols-1 gap-3 sm:grid-cols-3">

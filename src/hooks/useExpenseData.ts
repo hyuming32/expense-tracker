@@ -1,5 +1,5 @@
 import { useLiveQuery } from 'dexie-react-hooks';
-import { db, META_KEYS } from '../db/database';
+import { db, META_KEYS, personalDb } from '../db/database';
 import { getLastDriveBackupAt } from '../sync/driveBackup';
 import {
   type AmountColors,
@@ -9,6 +9,7 @@ import {
   getAutoSelectLastPlace,
   getHideAmountsDefault,
   getHomeLayout,
+  getMemberBudgets,
   getOnboardingMetaState,
   getPendingRecurringOccurrences,
   getPinRecord,
@@ -32,6 +33,7 @@ import type {
   Category,
   CurrencyRate,
   LotteryDraw,
+  Member,
   NoSpendDay,
   NotePreset,
   Place,
@@ -140,7 +142,7 @@ export function useLastUsedMeta(): LastUsedMeta {
  */
 export function useAmountColors(): AmountColors {
   return (
-    useLiveQuery(async () => getAmountColors(db), []) ?? DEFAULT_AMOUNT_COLORS
+    useLiveQuery(async () => getAmountColors(personalDb), []) ?? DEFAULT_AMOUNT_COLORS
   );
 }
 
@@ -148,7 +150,7 @@ export function useAmountColors(): AmountColors {
  * 訂閱報表頁上次選擇的期間模式（月／季／年）。
  */
 export function useReportPeriodKind(): PeriodKind {
-  return useLiveQuery(async () => getReportPeriodKind(db), []) ?? 'month';
+  return useLiveQuery(async () => getReportPeriodKind(personalDb), []) ?? 'month';
 }
 
 /**
@@ -167,7 +169,7 @@ export function useNotePresets(): NotePreset[] {
  * 訂閱是否啟用「自動加入常用備註」本機設定。
  */
 export function useAutoAddNotePresets(): boolean {
-  return useLiveQuery(async () => getAutoAddNotePresets(db), []) ?? true;
+  return useLiveQuery(async () => getAutoAddNotePresets(personalDb), []) ?? true;
 }
 
 /**
@@ -225,14 +227,14 @@ export function usePlaces(): Place[] {
  * 訂閱是否啟用「新增記帳時自動帶入上次的地點」本機設定。
  */
 export function useAutoSelectLastPlace(): boolean {
-  return useLiveQuery(async () => getAutoSelectLastPlace(db), []) ?? false;
+  return useLiveQuery(async () => getAutoSelectLastPlace(personalDb), []) ?? false;
 }
 
 /**
  * 訂閱本機定時同步頻率設定（daily / weekly / none）。
  */
 export function useSyncSchedule(): SyncSchedule {
-  return useLiveQuery(async () => getSyncSchedule(db), []) ?? 'daily';
+  return useLiveQuery(async () => getSyncSchedule(personalDb), []) ?? 'daily';
 }
 
 /**
@@ -246,7 +248,7 @@ export function useOutboxCount(): number {
  * 訂閱本機記錄的上次備份到 Google Drive 時間戳記。
  */
 export function useLastDriveBackupAt(): number | null {
-  return useLiveQuery(async () => getLastDriveBackupAt(db), []) ?? null;
+  return useLiveQuery(async () => getLastDriveBackupAt(personalDb), []) ?? null;
 }
 
 /**
@@ -262,22 +264,41 @@ export function useLotteryDraws(): LotteryDraw[] {
 }
 
 /**
- * 訂閱所有未刪除的每月預算設定。
+ * 訂閱所有未刪除的一般每月預算設定（不含成員個人預算）。
  */
 export function useBudgets(): Budget[] {
   return (
     useLiveQuery(async () => {
       const rows = await db.budgets.toArray();
-      return rows.filter((b) => !b.deleted);
+      return rows.filter((b) => !b.deleted && !b.memberId);
     }, []) ?? []
   );
+}
+
+/**
+ * 訂閱所有未刪除的家庭帳本成員。
+ */
+export function useMembers(): Member[] {
+  return (
+    useLiveQuery(async () => {
+      const rows = await db.members.toArray();
+      return rows.filter((m) => !m.deleted);
+    }, []) ?? []
+  );
+}
+
+/**
+ * 訂閱所有未刪除的成員個人預算設定。
+ */
+export function useMemberBudgets(): Budget[] {
+  return useLiveQuery(async () => getMemberBudgets(db), []) ?? [];
 }
 
 /**
  * 訂閱本機新手導覽與首頁提醒卡狀態（meta 表載入完成前為 undefined）。
  */
 export function useOnboardingMetaState(): OnboardingMetaState | undefined {
-  return useLiveQuery(async () => getOnboardingMetaState(db), []);
+  return useLiveQuery(async () => getOnboardingMetaState(personalDb), []);
 }
 
 /**
@@ -296,7 +317,7 @@ export function useNoSpendDays(): NoSpendDay[] {
  * 訂閱首頁是否顯示「連續記帳與漏記提醒」卡片設定（預設開啟）。
  */
 export function useShowHabitCard(): boolean {
-  return useLiveQuery(async () => getShowHabitCard(db), []) ?? true;
+  return useLiveQuery(async () => getShowHabitCard(personalDb), []) ?? true;
 }
 
 /**
@@ -304,7 +325,7 @@ export function useShowHabitCard(): boolean {
  */
 export function useHomeLayout(): HomeLayoutItem<HomeSectionKey>[] {
   return (
-    useLiveQuery(async () => getHomeLayout(db), []) ??
+    useLiveQuery(async () => getHomeLayout(personalDb), []) ??
     DEFAULT_HOME_SECTION_KEYS.map((key) => ({ key, visible: true }))
   );
 }
@@ -313,14 +334,14 @@ export function useHomeLayout(): HomeLayoutItem<HomeSectionKey>[] {
  * 訂閱本機密碼鎖設定（載入完成前為 undefined，未設定為 null）。
  */
 export function usePinRecord(): PinRecord | null | undefined {
-  return useLiveQuery(async () => getPinRecord(db), []);
+  return useLiveQuery(async () => getPinRecord(personalDb), []);
 }
 
 /**
  * 訂閱「預設隱藏金額」設定（載入完成前為 undefined）。
  */
 export function useHideAmountsDefault(): boolean | undefined {
-  return useLiveQuery(async () => getHideAmountsDefault(db), []);
+  return useLiveQuery(async () => getHideAmountsDefault(personalDb), []);
 }
 
 /**

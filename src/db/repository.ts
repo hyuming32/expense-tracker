@@ -7,6 +7,7 @@ import {
   parseHomeLayoutJson,
   resolveHomeLayout,
 } from '../domain/homeLayout';
+import { buildInstallmentDates, splitInstallment } from '../domain/installment';
 import { buildRecurringTransactionId, dueOccurrences } from '../domain/recurring';
 import { getTodayDateString } from '../domain/format';
 import { isValidSellerId, normalizePlaceName } from '../domain/places';
@@ -34,7 +35,15 @@ import {
 } from '../domain/currency';
 import { type BarcodeFormat, guessFormat } from '../lib/barcode';
 import { parsePinRecordJson, type PinRecord } from '../lib/pinLock';
-import { db, type ExpenseDatabase, META_KEYS } from './database';
+import { getFamilyConfig } from '../family/familyConfig';
+import {
+  db,
+  ensureSeeded,
+  type ExpenseDatabase,
+  FAMILY_DB_NAME,
+  META_KEYS,
+  personalDb,
+} from './database';
 import { getDeviceId } from './deviceId';
 import type {
   Account,
@@ -213,9 +222,19 @@ export function isValidHexColor(value: string): boolean {
 }
 
 /**
+ * 若目前資料庫為家庭帳本且已有有效的家庭設定，回傳成員識別碼；否則回傳 null。
+ */
+export function stampMember(database: ExpenseDatabase): string | null {
+  if (database.name !== FAMILY_DB_NAME) {
+    return null;
+  }
+  return getFamilyConfig()?.memberId ?? null;
+}
+
+/**
  * 讀取本機金額顯示顏色設定，無值或格式不正確時回傳預設值。
  */
-export async function getAmountColors(database: ExpenseDatabase = db): Promise<AmountColors> {
+export async function getAmountColors(database: ExpenseDatabase = personalDb): Promise<AmountColors> {
   const [expenseEntry, incomeEntry] = await Promise.all([
     database.meta.get(META_KEYS.COLOR_EXPENSE),
     database.meta.get(META_KEYS.COLOR_INCOME),
@@ -238,7 +257,7 @@ export async function getAmountColors(database: ExpenseDatabase = db): Promise<A
  */
 export async function saveAmountColors(
   colors: Partial<AmountColors>,
-  database: ExpenseDatabase = db,
+  database: ExpenseDatabase = personalDb,
 ): Promise<AmountColors> {
   if (colors.expense !== undefined && !isValidHexColor(colors.expense)) {
     throw new Error('支出色碼格式不正確，請使用 #RRGGBB 格式');
@@ -265,7 +284,7 @@ export async function saveAmountColors(
 /**
  * 將金額顯示顏色恢復為預設值（清除本機自訂色碼，不寫入 outbox）。
  */
-export async function resetAmountColors(database: ExpenseDatabase = db): Promise<AmountColors> {
+export async function resetAmountColors(database: ExpenseDatabase = personalDb): Promise<AmountColors> {
   await database.meta.bulkDelete([META_KEYS.COLOR_EXPENSE, META_KEYS.COLOR_INCOME]);
   return { ...DEFAULT_AMOUNT_COLORS };
 }
@@ -273,7 +292,7 @@ export async function resetAmountColors(database: ExpenseDatabase = db): Promise
 /**
  * 讀取報表頁上次選擇的期間模式（月／季／年），無值時預設為月。
  */
-export async function getReportPeriodKind(database: ExpenseDatabase = db): Promise<PeriodKind> {
+export async function getReportPeriodKind(database: ExpenseDatabase = personalDb): Promise<PeriodKind> {
   const entry = await database.meta.get(META_KEYS.REPORT_PERIOD_KIND);
   if (entry?.value === 'month' || entry?.value === 'quarter' || entry?.value === 'year') {
     return entry.value;
@@ -286,7 +305,7 @@ export async function getReportPeriodKind(database: ExpenseDatabase = db): Promi
  */
 export async function saveReportPeriodKind(
   kind: PeriodKind,
-  database: ExpenseDatabase = db,
+  database: ExpenseDatabase = personalDb,
 ): Promise<void> {
   await database.meta.put({ key: META_KEYS.REPORT_PERIOD_KIND, value: kind });
 }
@@ -319,7 +338,7 @@ export class DuplicateNotePresetError extends Error {
 /**
  * 讀取是否啟用「自動加入常用備註」（預設開啟）。
  */
-export async function getAutoAddNotePresets(database: ExpenseDatabase = db): Promise<boolean> {
+export async function getAutoAddNotePresets(database: ExpenseDatabase = personalDb): Promise<boolean> {
   const entry = await database.meta.get(META_KEYS.AUTO_ADD_NOTE_PRESETS);
   return entry?.value !== 'false';
 }
@@ -329,7 +348,7 @@ export async function getAutoAddNotePresets(database: ExpenseDatabase = db): Pro
  */
 export async function setAutoAddNotePresets(
   enabled: boolean,
-  database: ExpenseDatabase = db,
+  database: ExpenseDatabase = personalDb,
 ): Promise<void> {
   await database.meta.put({
     key: META_KEYS.AUTO_ADD_NOTE_PRESETS,
@@ -465,6 +484,85 @@ export async function swapNotePresetSortOrder(
   }
 }
 
+async function applyTransactionSideEffects(
+  database: ExpenseDatabase,
+  record: Transaction,
+  isNewTx: boolean,
+  currencyInput: string | null | undefined,
+  normalizedCurrency: string | null,
+  autoAddNotePresets: boolean,
+  now: number,
+  deviceId: string,
+): Promise<void> {
+  await database.meta.put({ key: META_KEYS.LAST_ACCOUNT_ID, value: record.accountId });
+  if (isNewTx && currencyInput !== undefined) {
+    await database.meta.put({
+      key: META_KEYS.LAST_CURRENCY,
+      value: normalizedCurrency ?? '',
+    });
+  }
+  if (record.kind === 'expense' && record.categoryId) {
+    await database.meta.put({ key: META_KEYS.LAST_EXPENSE_CATEGORY_ID, value: record.categoryId });
+  } else if (record.kind === 'income' && record.categoryId) {
+    await database.meta.put({ key: META_KEYS.LAST_INCOME_CATEGORY_ID, value: record.categoryId });
+  }
+
+  if (record.placeId) {
+    const place = await database.places.get(record.placeId);
+    if (place && !place.deleted) {
+      await database.places.put({
+        ...place,
+        useCount: place.useCount + 1,
+        lastUsedAt: now,
+        updatedAt: now,
+        deviceId,
+      });
+      await database.outbox.put(createOutboxEntry('places', place.id, now));
+      await database.meta.put({ key: META_KEYS.LAST_PLACE_ID, value: place.id });
+    }
+  }
+
+  if ((record.kind === 'expense' || record.kind === 'income') && record.note) {
+    const presetText = normalizeNotePresetText(record.note);
+    if (presetText) {
+      const candidates = await database.notePresets
+        .filter((p) => !p.deleted && p.text === presetText)
+        .toArray();
+      const targetCategoryId = record.categoryId ?? null;
+      const exactMatch = candidates.find((p) => (p.categoryId ?? null) === targetCategoryId);
+      const globalMatch = candidates.find((p) => p.categoryId === null);
+      const matched = exactMatch ?? globalMatch;
+
+      if (matched) {
+        await database.notePresets.put({
+          ...matched,
+          useCount: matched.useCount + 1,
+          lastUsedAt: now,
+          updatedAt: now,
+          deviceId,
+        });
+        await database.outbox.put(createOutboxEntry('notePresets', matched.id, now));
+      } else if (autoAddNotePresets) {
+        const allActive = await database.notePresets.filter((p) => !p.deleted).toArray();
+        const nextOrder = allActive.reduce((max, item) => Math.max(max, item.sortOrder), 0) + 1;
+        const newPreset: NotePreset = {
+          id: uuidv7(),
+          text: presetText,
+          categoryId: targetCategoryId,
+          useCount: 1,
+          lastUsedAt: now,
+          sortOrder: nextOrder,
+          updatedAt: now,
+          deviceId,
+          deleted: false,
+        };
+        await database.notePresets.put(newPreset);
+        await database.outbox.put(createOutboxEntry('notePresets', newPreset.id, now));
+      }
+    }
+  }
+}
+
 /**
  * 儲存或更新一筆交易紀錄，並同步更新最後使用的帳戶、分類、地點與使用統計。
  */
@@ -474,6 +572,10 @@ export async function saveTransaction(
 ): Promise<Transaction> {
   const now = Date.now();
   const deviceId = getDeviceId();
+  const actorMemberId = stampMember(database);
+  const autoAddNotePresets = await getAutoAddNotePresets(
+    database.name === FAMILY_DB_NAME ? personalDb : database,
+  );
   const normalizedInvoiceNo = input.invoiceNo?.trim()
     ? input.invoiceNo.trim().toUpperCase()
     : undefined;
@@ -527,10 +629,28 @@ export async function saveTransaction(
       const existingTx = input.id ? await database.transactions.get(input.id) : undefined;
       const isNewTx = !existingTx;
 
+      if (actorMemberId) {
+        if (existingTx) {
+          if (existingTx.memberId !== undefined) {
+            record.memberId = existingTx.memberId;
+          }
+        } else {
+          record.memberId = actorMemberId;
+        }
+        record.lastEditedBy = actorMemberId;
+      }
+
       if (!normalizedCurrency && existingTx?.currency) {
         record.currency = null;
         record.originalAmount = null;
         record.rate = null;
+      }
+
+      if (existingTx?.installmentId) {
+        record.installmentId = existingTx.installmentId;
+        record.installmentIndex = existingTx.installmentIndex ?? null;
+        record.installmentCount = existingTx.installmentCount ?? null;
+        record.installmentTotal = existingTx.installmentTotal ?? null;
       }
 
       if (normalizedInvoiceNo) {
@@ -584,81 +704,248 @@ export async function saveTransaction(
           }
         }
       }
-      await database.meta.put({ key: META_KEYS.LAST_ACCOUNT_ID, value: record.accountId });
-      if (isNewTx && input.currency !== undefined) {
-        await database.meta.put({
-          key: META_KEYS.LAST_CURRENCY,
-          value: normalizedCurrency ?? '',
-        });
-      }
-      if (record.kind === 'expense' && record.categoryId) {
-        await database.meta.put({ key: META_KEYS.LAST_EXPENSE_CATEGORY_ID, value: record.categoryId });
-      } else if (record.kind === 'income' && record.categoryId) {
-        await database.meta.put({ key: META_KEYS.LAST_INCOME_CATEGORY_ID, value: record.categoryId });
-      }
 
-      if (normalizedPlaceId) {
-        const place = await database.places.get(normalizedPlaceId);
-        if (place && !place.deleted) {
-          await database.places.put({
-            ...place,
-            useCount: place.useCount + 1,
-            lastUsedAt: now,
-            updatedAt: now,
-            deviceId,
-          });
-          await database.outbox.put(createOutboxEntry('places', place.id, now));
-          await database.meta.put({ key: META_KEYS.LAST_PLACE_ID, value: place.id });
-        }
-      }
-
-      if ((record.kind === 'expense' || record.kind === 'income') && record.note) {
-        const presetText = normalizeNotePresetText(record.note);
-        if (presetText) {
-          const candidates = await database.notePresets
-            .filter((p) => !p.deleted && p.text === presetText)
-            .toArray();
-          const targetCategoryId = record.categoryId ?? null;
-          const exactMatch = candidates.find((p) => (p.categoryId ?? null) === targetCategoryId);
-          const globalMatch = candidates.find((p) => p.categoryId === null);
-          const matched = exactMatch ?? globalMatch;
-
-          if (matched) {
-            await database.notePresets.put({
-              ...matched,
-              useCount: matched.useCount + 1,
-              lastUsedAt: now,
-              updatedAt: now,
-              deviceId,
-            });
-            await database.outbox.put(createOutboxEntry('notePresets', matched.id, now));
-          } else {
-            const autoAddEntry = await database.meta.get(META_KEYS.AUTO_ADD_NOTE_PRESETS);
-            if (autoAddEntry?.value !== 'false') {
-              const allActive = await database.notePresets.filter((p) => !p.deleted).toArray();
-              const nextOrder = allActive.reduce((max, item) => Math.max(max, item.sortOrder), 0) + 1;
-              const newPreset: NotePreset = {
-                id: uuidv7(),
-                text: presetText,
-                categoryId: targetCategoryId,
-                useCount: 1,
-                lastUsedAt: now,
-                sortOrder: nextOrder,
-                updatedAt: now,
-                deviceId,
-                deleted: false,
-              };
-              await database.notePresets.put(newPreset);
-              await database.outbox.put(createOutboxEntry('notePresets', newPreset.id, now));
-            }
-          }
-        }
-      }
+      await applyTransactionSideEffects(
+        database,
+        record,
+        isNewTx,
+        input.currency,
+        normalizedCurrency,
+        autoAddNotePresets,
+        now,
+        deviceId,
+      );
     },
   );
 
   notifyLocalMutation(database);
   return record;
+}
+
+export interface InstallmentUpdatePatch {
+  categoryId?: string | null;
+  accountId?: string;
+  note?: string | null;
+  tags?: string[];
+  placeId?: string | null;
+}
+
+/**
+ * 在同一交易中建立 N 期分期支出紀錄，共用 installmentId、每期寫入 outbox，副作用只計算一次。
+ */
+export async function saveInstallmentTransactions(
+  input: SaveTransactionInput & { installmentCount: number },
+  database: ExpenseDatabase = db,
+): Promise<Transaction[]> {
+  if (input.kind !== 'expense') {
+    throw new Error('分期僅支援支出交易');
+  }
+
+  const now = Date.now();
+  const deviceId = getDeviceId();
+  const actorMemberId = stampMember(database);
+  const autoAddNotePresets = await getAutoAddNotePresets(
+    database.name === FAMILY_DB_NAME ? personalDb : database,
+  );
+  const normalizedInvoiceNo = input.invoiceNo?.trim()
+    ? input.invoiceNo.trim().toUpperCase()
+    : undefined;
+  const normalizedTime = input.time?.trim() ? input.time.trim() : null;
+  const normalizedPlaceId = input.placeId?.trim() ? input.placeId.trim() : null;
+  const normalizedTags = input.tags ? normalizeTags(input.tags) : [];
+  const normalizedNote = input.note?.trim() ? input.note.trim() : null;
+  const normalizedCurrency = input.currency?.trim() ? input.currency.trim().toUpperCase() : null;
+
+  const dates = buildInstallmentDates(input.date, input.installmentCount);
+  const installmentId = uuidv7();
+  let records: Transaction[] = [];
+
+  await database.transaction(
+    'rw',
+    [
+      database.transactions,
+      database.notePresets,
+      database.places,
+      database.currencies,
+      database.meta,
+      database.outbox,
+    ],
+    async () => {
+      const allCurrencies = await database.currencies.toArray();
+      const mainCurrency = getMainCurrency(allCurrencies);
+      if (normalizedCurrency && normalizedCurrency !== mainCurrency.code) {
+        throw new Error('分期僅支援主幣別');
+      }
+
+      const amounts = splitInstallment(input.amount, input.installmentCount, mainCurrency.decimals);
+
+      if (normalizedInvoiceNo) {
+        const duplicate = await database.transactions
+          .where('invoiceNo')
+          .equals(normalizedInvoiceNo)
+          .filter((tx) => !tx.deleted)
+          .first();
+        if (duplicate) {
+          throw new DuplicateInvoiceError(duplicate);
+        }
+      }
+
+      records = dates.map((date, idx) => ({
+        id: uuidv7(),
+        kind: 'expense',
+        date,
+        time: normalizedTime,
+        amount: amounts[idx]!,
+        accountId: input.accountId,
+        toAccountId: null,
+        categoryId: input.categoryId,
+        placeId: normalizedPlaceId,
+        note: normalizedNote,
+        ...(normalizedTags.length > 0 ? { tags: normalizedTags } : {}),
+        ...(idx === 0 && normalizedInvoiceNo ? { invoiceNo: normalizedInvoiceNo } : {}),
+        installmentId,
+        installmentIndex: idx + 1,
+        installmentCount: input.installmentCount,
+        installmentTotal: input.amount,
+        ...(actorMemberId ? { memberId: actorMemberId, lastEditedBy: actorMemberId } : {}),
+        updatedAt: now,
+        deviceId,
+        deleted: false,
+      }));
+
+      await database.transactions.bulkPut(records);
+      await database.outbox.bulkPut(
+        records.map((r) => createOutboxEntry('transactions', r.id, now)),
+      );
+
+      await applyTransactionSideEffects(
+        database,
+        records[0]!,
+        true,
+        input.currency,
+        null,
+        autoAddNotePresets,
+        now,
+        deviceId,
+      );
+    },
+  );
+
+  notifyLocalMutation(database);
+  return records;
+}
+
+/**
+ * 批次更新同一分期群組中 installmentIndex >= fromIndex 的未刪除紀錄（不改金額與日期）。
+ */
+export async function updateInstallmentTransactions(
+  installmentId: string,
+  fromIndex: number,
+  patch: InstallmentUpdatePatch,
+  database: ExpenseDatabase = db,
+): Promise<Transaction[]> {
+  const now = Date.now();
+  const deviceId = getDeviceId();
+  const actorMemberId = stampMember(database);
+  let updatedRecords: Transaction[] = [];
+
+  await database.transaction('rw', database.transactions, database.outbox, async () => {
+    const group = await database.transactions
+      .where('installmentId')
+      .equals(installmentId)
+      .filter((tx) => !tx.deleted && (tx.installmentIndex ?? 0) >= fromIndex)
+      .toArray();
+
+    if (group.length === 0) {
+      return;
+    }
+
+    const normalizedPatchTags = patch.tags !== undefined ? normalizeTags(patch.tags) : undefined;
+    const normalizedPatchNote =
+      patch.note !== undefined ? (patch.note?.trim() ? patch.note.trim() : null) : undefined;
+    const normalizedPatchPlaceId =
+      patch.placeId !== undefined
+        ? patch.placeId?.trim()
+          ? patch.placeId.trim()
+          : null
+        : undefined;
+
+    updatedRecords = group.map((tx) => {
+      const next: Transaction = {
+        ...tx,
+        ...(patch.categoryId !== undefined ? { categoryId: patch.categoryId } : {}),
+        ...(patch.accountId !== undefined ? { accountId: patch.accountId } : {}),
+        ...(normalizedPatchNote !== undefined ? { note: normalizedPatchNote } : {}),
+        ...(normalizedPatchPlaceId !== undefined ? { placeId: normalizedPatchPlaceId } : {}),
+        ...(actorMemberId ? { lastEditedBy: actorMemberId } : {}),
+        updatedAt: now,
+        deviceId,
+      };
+      if (normalizedPatchTags !== undefined) {
+        if (normalizedPatchTags.length > 0) {
+          next.tags = normalizedPatchTags;
+        } else {
+          delete next.tags;
+        }
+      }
+      return next;
+    });
+
+    await database.transactions.bulkPut(updatedRecords);
+    await database.outbox.bulkPut(
+      updatedRecords.map((r) => createOutboxEntry('transactions', r.id, now)),
+    );
+  });
+
+  if (updatedRecords.length > 0) {
+    notifyLocalMutation(database);
+  }
+  return updatedRecords;
+}
+
+/**
+ * 軟刪除同一分期群組中 installmentIndex >= fromIndex 的未刪除紀錄。
+ */
+export async function softDeleteInstallmentTransactions(
+  installmentId: string,
+  fromIndex: number,
+  database: ExpenseDatabase = db,
+): Promise<number> {
+  const now = Date.now();
+  const deviceId = getDeviceId();
+  const actorMemberId = stampMember(database);
+  let deletedCount = 0;
+
+  await database.transaction('rw', database.transactions, database.outbox, async () => {
+    const group = await database.transactions
+      .where('installmentId')
+      .equals(installmentId)
+      .filter((tx) => !tx.deleted && (tx.installmentIndex ?? 0) >= fromIndex)
+      .toArray();
+
+    if (group.length === 0) {
+      return;
+    }
+
+    const deletedRecords = group.map((tx) => ({
+      ...tx,
+      deleted: true,
+      ...(actorMemberId ? { lastEditedBy: actorMemberId } : {}),
+      updatedAt: now,
+      deviceId,
+    }));
+
+    await database.transactions.bulkPut(deletedRecords);
+    await database.outbox.bulkPut(
+      deletedRecords.map((r) => createOutboxEntry('transactions', r.id, now)),
+    );
+    deletedCount = deletedRecords.length;
+  });
+
+  if (deletedCount > 0) {
+    notifyLocalMutation(database);
+  }
+  return deletedCount;
 }
 
 /**
@@ -670,6 +957,7 @@ export async function softDeleteTransaction(
 ): Promise<void> {
   const now = Date.now();
   const deviceId = getDeviceId();
+  const actorMemberId = stampMember(database);
   let updated = false;
 
   await database.transaction('rw', database.transactions, database.outbox, async () => {
@@ -680,6 +968,7 @@ export async function softDeleteTransaction(
     await database.transactions.put({
       ...existing,
       deleted: true,
+      ...(actorMemberId ? { lastEditedBy: actorMemberId } : {}),
       updatedAt: now,
       deviceId,
     });
@@ -2108,7 +2397,7 @@ export type SyncSchedule = 'daily' | 'weekly' | 'none';
 /**
  * 讀取本機定時同步頻率設定（預設 daily）。
  */
-export async function getSyncSchedule(database: ExpenseDatabase = db): Promise<SyncSchedule> {
+export async function getSyncSchedule(database: ExpenseDatabase = personalDb): Promise<SyncSchedule> {
   const entry = await database.meta.get(META_KEYS.SYNC_SCHEDULE);
   if (entry?.value === 'weekly' || entry?.value === 'none' || entry?.value === 'daily') {
     return entry.value;
@@ -2121,7 +2410,7 @@ export async function getSyncSchedule(database: ExpenseDatabase = db): Promise<S
  */
 export async function setSyncSchedule(
   schedule: SyncSchedule,
-  database: ExpenseDatabase = db,
+  database: ExpenseDatabase = personalDb,
 ): Promise<void> {
   await database.meta.put({
     key: META_KEYS.SYNC_SCHEDULE,
@@ -2132,7 +2421,9 @@ export async function setSyncSchedule(
 /**
  * 讀取是否啟用「新增記帳時自動帶入上次的地點」本機設定（預設關閉）。
  */
-export async function getAutoSelectLastPlace(database: ExpenseDatabase = db): Promise<boolean> {
+export async function getAutoSelectLastPlace(
+  database: ExpenseDatabase = personalDb,
+): Promise<boolean> {
   const entry = await database.meta.get(META_KEYS.AUTO_SELECT_LAST_PLACE);
   return entry?.value === 'true';
 }
@@ -2142,7 +2433,7 @@ export async function getAutoSelectLastPlace(database: ExpenseDatabase = db): Pr
  */
 export async function setAutoSelectLastPlace(
   enabled: boolean,
-  database: ExpenseDatabase = db,
+  database: ExpenseDatabase = personalDb,
 ): Promise<void> {
   await database.meta.put({
     key: META_KEYS.AUTO_SELECT_LAST_PLACE,
@@ -2545,11 +2836,93 @@ export function buildBudgetId(categoryId: string | null): string {
 }
 
 /**
- * 讀取所有未刪除的每月預算設定。
+ * 讀取所有未刪除的一般每月預算設定（不含成員個人預算）。
  */
 export async function getBudgets(database: ExpenseDatabase = db): Promise<Budget[]> {
   const rows = await database.budgets.toArray();
-  return rows.filter((b) => !b.deleted);
+  return rows.filter((b) => !b.deleted && !b.memberId);
+}
+
+/**
+ * 產生成員個人預算的固定主鍵：budget-member-<memberId>。
+ */
+export function buildMemberBudgetId(memberId: string): string {
+  return `budget-member-${memberId}`;
+}
+
+/**
+ * 讀取所有未刪除的成員個人預算設定。
+ */
+export async function getMemberBudgets(database: ExpenseDatabase = db): Promise<Budget[]> {
+  const rows = await database.budgets.toArray();
+  return rows.filter((b) => !b.deleted && Boolean(b.memberId));
+}
+
+/**
+ * 設定或清除指定成員的個人每月預算（金額為 0 或 null 時軟刪除），並排入 outbox 同步。
+ */
+export async function saveMemberBudget(
+  memberId: string,
+  amount: number | null,
+  database: ExpenseDatabase = db,
+): Promise<Budget | null> {
+  const trimmedMemberId = memberId.trim();
+  if (!trimmedMemberId) {
+    throw new Error('缺少成員識別碼');
+  }
+
+  const now = Date.now();
+  const deviceId = getDeviceId();
+  const id = buildMemberBudgetId(trimmedMemberId);
+  let savedRecord: Budget | null = null;
+  let changed = false;
+
+  await database.transaction('rw', database.budgets, database.currencies, database.outbox, async () => {
+    const mainDecimals = getMainCurrency(await database.currencies.toArray()).decimals;
+
+    if (amount === null || amount === 0) {
+      const existing = await database.budgets.get(id);
+      if (existing && !existing.deleted) {
+        await database.budgets.put({
+          ...existing,
+          deleted: true,
+          updatedAt: now,
+          deviceId,
+        });
+        await database.outbox.put(createOutboxEntry('budgets', id, now));
+        changed = true;
+      }
+      return;
+    }
+
+    if (!Number.isFinite(amount) || amount < 0 || !hasAtMostDecimals(amount, mainDecimals)) {
+      throw new Error(
+        mainDecimals <= 0
+          ? '預算金額須為正整數'
+          : `預算金額須為正數（最多 ${mainDecimals} 位小數）`,
+      );
+    }
+
+    const record: Budget = {
+      id,
+      categoryId: null,
+      memberId: trimmedMemberId,
+      amount: roundToDecimals(amount, mainDecimals),
+      updatedAt: now,
+      deviceId,
+      deleted: false,
+    };
+    await database.budgets.put(record);
+    await database.outbox.put(createOutboxEntry('budgets', id, now));
+    savedRecord = record;
+    changed = true;
+  });
+
+  if (changed) {
+    notifyLocalMutation(database);
+  }
+
+  return savedRecord;
 }
 
 /**
@@ -2653,7 +3026,7 @@ function parseOptionalTimestamp(raw: string | undefined): number | null {
  * 讀取本機儲存的新手導覽與首頁提醒卡狀態（不同步至雲端）。
  */
 export async function getOnboardingMetaState(
-  database: ExpenseDatabase = db,
+  database: ExpenseDatabase = personalDb,
 ): Promise<OnboardingMetaState> {
   const [completed, lastBackup, dataDismissed, installDismissed] = await Promise.all([
     database.meta.get(META_KEYS.UI_ONBOARDING_COMPLETED),
@@ -2672,7 +3045,9 @@ export async function getOnboardingMetaState(
 /**
  * 記錄使用者已完成或略過新手導覽。
  */
-export async function markOnboardingCompleted(database: ExpenseDatabase = db): Promise<void> {
+export async function markOnboardingCompleted(
+  database: ExpenseDatabase = personalDb,
+): Promise<void> {
   await database.meta.put({ key: META_KEYS.UI_ONBOARDING_COMPLETED, value: 'true' });
 }
 
@@ -2681,7 +3056,7 @@ export async function markOnboardingCompleted(database: ExpenseDatabase = db): P
  */
 export async function recordJsonBackupTimestamp(
   timestamp: number = Date.now(),
-  database: ExpenseDatabase = db,
+  database: ExpenseDatabase = personalDb,
 ): Promise<void> {
   await database.meta.put({ key: META_KEYS.UI_LAST_JSON_BACKUP_AT, value: String(timestamp) });
 }
@@ -2691,7 +3066,7 @@ export async function recordJsonBackupTimestamp(
  */
 export async function dismissDataProtectionCard(
   timestamp: number = Date.now(),
-  database: ExpenseDatabase = db,
+  database: ExpenseDatabase = personalDb,
 ): Promise<void> {
   await database.meta.put({
     key: META_KEYS.UI_DATA_PROTECTION_DISMISSED_AT,
@@ -2704,7 +3079,7 @@ export async function dismissDataProtectionCard(
  */
 export async function dismissInstallPromptCard(
   timestamp: number = Date.now(),
-  database: ExpenseDatabase = db,
+  database: ExpenseDatabase = personalDb,
 ): Promise<void> {
   await database.meta.put({
     key: META_KEYS.UI_INSTALL_PROMPT_DISMISSED_AT,
@@ -2779,7 +3154,7 @@ export async function setNoSpendDay(
 /**
  * 讀取首頁是否顯示「連續記帳與漏記提醒」卡片（預設開啟）。
  */
-export async function getShowHabitCard(database: ExpenseDatabase = db): Promise<boolean> {
+export async function getShowHabitCard(database: ExpenseDatabase = personalDb): Promise<boolean> {
   const entry = await database.meta.get(META_KEYS.UI_SHOW_HABIT_CARD);
   return entry?.value !== 'false';
 }
@@ -2789,7 +3164,7 @@ export async function getShowHabitCard(database: ExpenseDatabase = db): Promise<
  */
 export async function setShowHabitCard(
   enabled: boolean,
-  database: ExpenseDatabase = db,
+  database: ExpenseDatabase = personalDb,
 ): Promise<void> {
   await database.meta.put({
     key: META_KEYS.UI_SHOW_HABIT_CARD,
@@ -2801,7 +3176,7 @@ export async function setShowHabitCard(
  * 讀取首頁區塊顯示與順序設定（存本機 meta，不同步、不進 JSON 備份）。
  */
 export async function getHomeLayout(
-  database: ExpenseDatabase = db,
+  database: ExpenseDatabase = personalDb,
 ): Promise<HomeLayoutItem<HomeSectionKey>[]> {
   const [layoutEntry, habitEntry] = await Promise.all([
     database.meta.get(META_KEYS.UI_HOME_LAYOUT),
@@ -2823,7 +3198,7 @@ export async function getHomeLayout(
  */
 export async function saveHomeLayout(
   layout: readonly HomeLayoutItem<HomeSectionKey>[],
-  database: ExpenseDatabase = db,
+  database: ExpenseDatabase = personalDb,
 ): Promise<void> {
   const habitItem = layout.find((item) => item.key === 'habit');
   await database.meta.put({
@@ -2841,7 +3216,7 @@ export async function saveHomeLayout(
 /**
  * 將首頁區塊顯示與順序恢復為預設值。
  */
-export async function resetHomeLayout(database: ExpenseDatabase = db): Promise<void> {
+export async function resetHomeLayout(database: ExpenseDatabase = personalDb): Promise<void> {
   await database.meta.bulkDelete([META_KEYS.UI_HOME_LAYOUT]);
   await database.meta.put({ key: META_KEYS.UI_SHOW_HABIT_CARD, value: 'true' });
 }
@@ -2849,7 +3224,9 @@ export async function resetHomeLayout(database: ExpenseDatabase = db): Promise<v
 /**
  * 讀取本機密碼鎖的 salt 與雜湊紀錄（未設定時回傳 null）。
  */
-export async function getPinRecord(database: ExpenseDatabase = db): Promise<PinRecord | null> {
+export async function getPinRecord(
+  database: ExpenseDatabase = personalDb,
+): Promise<PinRecord | null> {
   const entry = await database.meta.get(META_KEYS.UI_PIN_HASH);
   return parsePinRecordJson(entry?.value);
 }
@@ -2859,7 +3236,7 @@ export async function getPinRecord(database: ExpenseDatabase = db): Promise<PinR
  */
 export async function savePinRecord(
   record: PinRecord,
-  database: ExpenseDatabase = db,
+  database: ExpenseDatabase = personalDb,
 ): Promise<void> {
   await database.meta.put({
     key: META_KEYS.UI_PIN_HASH,
@@ -2870,14 +3247,16 @@ export async function savePinRecord(
 /**
  * 清除本機密碼鎖設定。
  */
-export async function clearPinRecord(database: ExpenseDatabase = db): Promise<void> {
+export async function clearPinRecord(database: ExpenseDatabase = personalDb): Promise<void> {
   await database.meta.delete(META_KEYS.UI_PIN_HASH);
 }
 
 /**
  * 讀取「預設隱藏金額」設定（預設為 false）。
  */
-export async function getHideAmountsDefault(database: ExpenseDatabase = db): Promise<boolean> {
+export async function getHideAmountsDefault(
+  database: ExpenseDatabase = personalDb,
+): Promise<boolean> {
   const entry = await database.meta.get(META_KEYS.UI_HIDE_AMOUNTS_DEFAULT);
   return entry?.value === 'true';
 }
@@ -2887,7 +3266,7 @@ export async function getHideAmountsDefault(database: ExpenseDatabase = db): Pro
  */
 export async function setHideAmountsDefault(
   enabled: boolean,
-  database: ExpenseDatabase = db,
+  database: ExpenseDatabase = personalDb,
 ): Promise<void> {
   await database.meta.put({
     key: META_KEYS.UI_HIDE_AMOUNTS_DEFAULT,
@@ -3422,4 +3801,156 @@ export async function switchMainCurrency(
 
   notifyLocalMutation(database);
   return { convertedTransactions };
+}
+
+/**
+ * 將家庭帳本畫面輸入的交易對應至個人帳本的帳戶、分類與地點後存入 personalDb。
+ */
+export async function savePrivateTransactionFromFamily(
+  input: SaveTransactionInput,
+  sourceDb: ExpenseDatabase = db,
+  targetDb: ExpenseDatabase = personalDb,
+): Promise<Transaction> {
+  await ensureSeeded(targetDb);
+
+  const [sourceAccounts, sourceCategories, allTargetAccounts, allTargetCategories] =
+    await Promise.all([
+      sourceDb.accounts.toArray(),
+      sourceDb.categories.toArray(),
+      targetDb.accounts.toArray(),
+      targetDb.categories.toArray(),
+    ]);
+
+  const targetAccounts = allTargetAccounts
+    .filter((a) => !a.deleted)
+    .sort((a, b) => a.sortOrder - b.sortOrder);
+  const targetCategories = allTargetCategories
+    .filter((c) => !c.deleted)
+    .sort((a, b) => a.sortOrder - b.sortOrder);
+
+  const resolveAccountId = (srcAccountId: string): string => {
+    const byId = targetAccounts.find((a) => a.id === srcAccountId);
+    if (byId) {
+      return byId.id;
+    }
+    const srcAcc = sourceAccounts.find((a) => a.id === srcAccountId);
+    if (srcAcc) {
+      const targetName = srcAcc.name.trim();
+      const byActiveName = targetAccounts.find(
+        (a) => !a.archived && a.name.trim() === targetName,
+      );
+      if (byActiveName) {
+        return byActiveName.id;
+      }
+      const byName = targetAccounts.find((a) => a.name.trim() === targetName);
+      if (byName) {
+        return byName.id;
+      }
+    }
+    const fallback = targetAccounts.find((a) => !a.archived) ?? targetAccounts[0];
+    if (!fallback) {
+      throw new Error('個人帳本沒有可用帳戶');
+    }
+    return fallback.id;
+  };
+
+  const resolveCategoryId = (
+    srcCategoryId: string | null,
+    kind: TransactionKind,
+  ): string | null => {
+    if (kind === 'transfer' || !srcCategoryId) {
+      return null;
+    }
+    const byId = targetCategories.find((c) => c.id === srcCategoryId && c.kind === kind);
+    if (byId) {
+      return byId.id;
+    }
+
+    const srcCat = sourceCategories.find((c) => c.id === srcCategoryId);
+    if (srcCat) {
+      const targetCatName = srcCat.name.trim();
+      if (srcCat.parentId) {
+        const srcParent = sourceCategories.find((c) => c.id === srcCat.parentId);
+        if (srcParent) {
+          const targetParentName = srcParent.name.trim();
+          const tParent =
+            targetCategories.find(
+              (c) =>
+                !c.archived &&
+                c.kind === kind &&
+                c.parentId === null &&
+                c.name.trim() === targetParentName,
+            ) ??
+            targetCategories.find(
+              (c) =>
+                c.kind === kind && c.parentId === null && c.name.trim() === targetParentName,
+            );
+          if (tParent) {
+            const tChild =
+              targetCategories.find(
+                (c) =>
+                  !c.archived &&
+                  c.kind === kind &&
+                  c.parentId === tParent.id &&
+                  c.name.trim() === targetCatName,
+              ) ??
+              targetCategories.find(
+                (c) =>
+                  c.kind === kind && c.parentId === tParent.id && c.name.trim() === targetCatName,
+              );
+            if (tChild) {
+              return tChild.id;
+            }
+          }
+        }
+      } else {
+        const tRoot =
+          targetCategories.find(
+            (c) =>
+              !c.archived &&
+              c.kind === kind &&
+              c.parentId === null &&
+              c.name.trim() === targetCatName,
+          ) ??
+          targetCategories.find(
+            (c) => c.kind === kind && c.parentId === null && c.name.trim() === targetCatName,
+          );
+        if (tRoot) {
+          return tRoot.id;
+        }
+      }
+    }
+
+    const ofKind = targetCategories.filter((c) => c.kind === kind);
+    const activeOfKind = ofKind.filter((c) => !c.archived);
+    const otherCat =
+      activeOfKind.find((c) => c.parentId === null && c.name.trim() === '其他') ??
+      activeOfKind.find((c) => c.name.trim() === '其他') ??
+      ofKind.find((c) => c.name.trim() === '其他');
+    if (otherCat) {
+      return otherCat.id;
+    }
+    return (activeOfKind[0] ?? ofKind[0])?.id ?? null;
+  };
+
+  const normalizedPlaceId = input.placeId?.trim() ? input.placeId.trim() : null;
+  const targetPlace = normalizedPlaceId ? await targetDb.places.get(normalizedPlaceId) : undefined;
+  const resolvedPlaceId = targetPlace && !targetPlace.deleted ? targetPlace.id : null;
+
+  const resolvedAccountId = resolveAccountId(input.accountId);
+  const resolvedToAccountId =
+    input.kind === 'transfer' && input.toAccountId ? resolveAccountId(input.toAccountId) : null;
+  const resolvedCategoryId = resolveCategoryId(input.categoryId, input.kind);
+
+  return saveTransaction(
+    {
+      ...input,
+      id: undefined,
+      accountId: resolvedAccountId,
+      toAccountId: resolvedToAccountId,
+      categoryId: resolvedCategoryId,
+      placeId: resolvedPlaceId,
+    },
+    targetDb,
+  );
 }

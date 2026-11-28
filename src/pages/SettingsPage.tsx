@@ -1,6 +1,7 @@
 import { type FormEvent, useEffect, useMemo, useRef, useState } from 'react';
 import { Link, useSearchParams } from 'react-router-dom';
 import { CloudRestoreModal } from '../components/CloudRestoreModal';
+import { FamilyLedgerSection } from '../components/FamilyLedgerSection';
 import { useMoney, usePrivacy } from '../contexts/PrivacyContext';
 import {
   type AmountColors,
@@ -26,6 +27,7 @@ import {
   saveCategory,
   saveCurrency,
   saveHomeLayout,
+  saveMemberBudget,
   saveNotePreset,
   savePinRecord,
   savePlace,
@@ -54,6 +56,7 @@ import type {
   Category,
   CategoryKind,
   CurrencyRate,
+  Member,
   NotePreset,
   Place,
   RecurringRule,
@@ -111,6 +114,9 @@ interface SettingsPageProps {
   categories: readonly Category[];
   places: readonly Place[];
   budgets: readonly Budget[];
+  memberBudgets?: readonly Budget[];
+  members?: readonly Member[];
+  isFamilyMode?: boolean;
   currencies?: readonly CurrencyRate[];
   mainCurrency?: MainCurrencyInfo;
   autoSelectLastPlace: boolean;
@@ -161,6 +167,9 @@ export function SettingsPage({
   categories,
   places,
   budgets,
+  memberBudgets = [],
+  members = [],
+  isFamilyMode = false,
   currencies = [],
   mainCurrency = DEFAULT_MAIN_CURRENCY,
   autoSelectLastPlace,
@@ -271,6 +280,7 @@ export function SettingsPage({
   const budgetSectionRef = useRef<HTMLElement | null>(null);
   const [totalBudgetInput, setTotalBudgetInput] = useState('');
   const [categoryBudgetInputs, setCategoryBudgetInputs] = useState<Record<string, string>>({});
+  const [memberBudgetInputs, setMemberBudgetInputs] = useState<Record<string, string>>({});
   const [budgetSaving, setBudgetSaving] = useState(false);
   const [catTab, setCatTab] = useState<CategoryKind>('expense');
   const [catFormOpen, setCatFormOpen] = useState(false);
@@ -354,17 +364,32 @@ export function SettingsPage({
     [categories],
   );
 
+  const activeFamilyMembers = useMemo(
+    () => members.filter((m) => !m.deleted && !m.removed),
+    [members],
+  );
+
   useEffect(() => {
-    const total = budgets.find((b) => !b.deleted && b.categoryId === null);
+    const total = budgets.find((b) => !b.deleted && !b.memberId && b.categoryId === null);
     setTotalBudgetInput(total && total.amount > 0 ? String(total.amount) : '');
     const nextMap: Record<string, string> = {};
     for (const b of budgets) {
-      if (!b.deleted && b.categoryId !== null && b.amount > 0) {
+      if (!b.deleted && !b.memberId && b.categoryId !== null && b.amount > 0) {
         nextMap[b.categoryId] = String(b.amount);
       }
     }
     setCategoryBudgetInputs(nextMap);
   }, [budgets]);
+
+  useEffect(() => {
+    const nextMemberMap: Record<string, string> = {};
+    for (const b of memberBudgets) {
+      if (!b.deleted && b.memberId && b.amount > 0) {
+        nextMemberMap[b.memberId] = String(b.amount);
+      }
+    }
+    setMemberBudgetInputs(nextMemberMap);
+  }, [memberBudgets]);
 
   useEffect(() => {
     if (searchParams.get('section') === 'budget' && budgetSectionRef.current) {
@@ -406,6 +431,26 @@ export function SettingsPage({
       ];
 
       await saveBudgets(inputs);
+
+      if (isFamilyMode && activeFamilyMembers.length > 0) {
+        const existingMemberBudgetByMemberId = new Map(
+          memberBudgets
+            .filter((b) => !b.deleted && b.memberId && b.amount > 0)
+            .map((b) => [b.memberId!, b.amount]),
+        );
+        for (const member of activeFamilyMembers) {
+          const parsedAmount = parseAmount(
+            memberBudgetInputs[member.id] ?? '',
+            `${member.name}預算`,
+          );
+          const normalizedNext = parsedAmount && parsedAmount > 0 ? parsedAmount : null;
+          const existingAmount = existingMemberBudgetByMemberId.get(member.id) ?? null;
+          if (normalizedNext !== existingAmount) {
+            await saveMemberBudget(member.id, normalizedNext);
+          }
+        }
+      }
+
       setStatusMessage('已儲存每月預算');
     } catch (err) {
       setErrorMessage(err instanceof Error ? err.message : '儲存每月預算失敗');
@@ -2061,6 +2106,49 @@ export function SettingsPage({
               </div>
             ))}
           </div>
+
+          {isFamilyMode && activeFamilyMembers.length > 0 && (
+            <div className="border-t border-slate-100 pt-3 dark:border-slate-800">
+              <div className="mb-2 text-xs font-semibold text-slate-700 dark:text-slate-200">
+                每人預算
+              </div>
+              <div className="space-y-2">
+                {activeFamilyMembers.map((member) => (
+                  <div
+                    key={member.id}
+                    className="flex items-center justify-between gap-3 rounded-xl border border-slate-100 bg-slate-50/50 px-3 py-2 dark:border-slate-800 dark:bg-slate-800/40"
+                  >
+                    <label
+                      htmlFor={`budget-member-${member.id}`}
+                      className="flex min-w-0 items-center gap-2 text-sm text-slate-700 dark:text-slate-200"
+                    >
+                      <span
+                        className="h-2.5 w-2.5 shrink-0 rounded-full"
+                        style={{ backgroundColor: member.color }}
+                        aria-hidden="true"
+                      />
+                      <span className="truncate">{member.name}</span>
+                    </label>
+                    <div className="flex items-center gap-1.5">
+                      <span className="text-xs text-slate-400">{mainCurrency.symbol.trimEnd()}</span>
+                      <input
+                        id={`budget-member-${member.id}`}
+                        type="text"
+                        inputMode={mainCurrency.decimals > 0 ? 'decimal' : 'numeric'}
+                        value={memberBudgetInputs[member.id] ?? ''}
+                        onChange={(e) => {
+                          const val = sanitizeBudgetInput(e.target.value, mainCurrency.decimals);
+                          setMemberBudgetInputs((prev) => ({ ...prev, [member.id]: val }));
+                        }}
+                        placeholder="不設"
+                        className="w-28 rounded-lg border border-slate-200 bg-white px-2.5 py-1 text-right text-sm tabular-nums text-slate-900 outline-none focus:border-emerald-500 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100"
+                      />
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
         </div>
       </section>
 
@@ -3069,18 +3157,20 @@ export function SettingsPage({
             </p>
           </div>
 
-          <div>
-            <button
-              type="button"
-              onClick={() => void handleTriggerRestoreJson()}
-              className="w-full rounded-xl border border-emerald-600 px-3 py-2.5 text-sm font-medium text-emerald-700 hover:bg-emerald-50 dark:border-emerald-500 dark:text-emerald-400 dark:hover:bg-emerald-950/40"
-            >
-              從 JSON 備份還原
-            </button>
-            <p className="mt-1 px-1 text-xs text-slate-500 dark:text-slate-400">
-              以編號合併備份資料，不會清空現有紀錄
-            </p>
-          </div>
+          {!isFamilyMode && (
+            <div>
+              <button
+                type="button"
+                onClick={() => void handleTriggerRestoreJson()}
+                className="w-full rounded-xl border border-emerald-600 px-3 py-2.5 text-sm font-medium text-emerald-700 hover:bg-emerald-50 dark:border-emerald-500 dark:text-emerald-400 dark:hover:bg-emerald-950/40"
+              >
+                從 JSON 備份還原
+              </button>
+              <p className="mt-1 px-1 text-xs text-slate-500 dark:text-slate-400">
+                以編號合併備份資料，不會清空現有紀錄
+              </p>
+            </div>
+          )}
 
           <div>
             <button
@@ -3140,7 +3230,7 @@ export function SettingsPage({
             : '未開啟（iPhone 建議加到主畫面）'}
         </p>
 
-        {pendingBackup && (
+        {!isFamilyMode && pendingBackup && (
           <div className="mt-3 rounded-xl border border-amber-200 bg-amber-50 p-3 dark:border-amber-800 dark:bg-amber-950/50">
             <div className="text-xs font-semibold text-amber-900 dark:text-amber-200">
               確認還原備份資料
@@ -3249,7 +3339,12 @@ export function SettingsPage({
         )}
       </section>
 
-      {/* Google 同步 */}
+      {/* 家庭帳本 */}
+      <FamilyLedgerSection isFamilyMode={isFamilyMode} members={members} />
+
+      {/* Google 同步（個人模式專用） */}
+      {!isFamilyMode && (
+      <>
       <section className="rounded-2xl border border-slate-200 bg-white p-4 dark:border-slate-800 dark:bg-slate-900">
         <div className="flex items-start justify-between gap-3">
           <div>
@@ -3403,6 +3498,8 @@ export function SettingsPage({
         mode={cloudRestoreOpen ? { kind: 'manual-backups' } : null}
         onClose={() => setCloudRestoreOpen(false)}
       />
+      </>
+      )}
 
       {/* 關於 */}
       <section className="rounded-2xl border border-slate-200 bg-white p-4 dark:border-slate-800 dark:bg-slate-900">

@@ -18,6 +18,7 @@ export interface TransactionFilterCriteria {
   placeId?: string;
   tag?: string;
   invoice?: InvoiceFilterOption;
+  memberId?: string;
 }
 
 export interface TransactionFilterContext {
@@ -192,6 +193,9 @@ export function filterTransactions(
       if (tx.invoiceNo && tx.invoiceNo.trim()) {
         return false;
       }
+    }
+    if (criteria.memberId && tx.memberId !== criteria.memberId) {
+      return false;
     }
     return true;
   });

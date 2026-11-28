@@ -29,8 +29,9 @@
 <p>如果你選擇登入 Google 以使用雲端同步或備份，本 App 會向 Google 要求以下權限：</p>
 <ul>
   <li><code>drive.appdata</code>：在你的 Google 雲端硬碟中一個<strong>只有本 App 能存取的隱藏資料夾</strong>裡，存放同步用的記帳資料，讓你在手機、平板、電腦之間同步。本 App 無法讀取你雲端硬碟中的其他檔案。</li>
-  <li><code>drive.file</code>：當你按下「備份到 Drive」時，把備份檔存到你的雲端硬碟。本 App 只能存取<strong>它自己建立的檔案</strong>，無法讀取你雲端硬碟中的其他檔案。</li>
+  <li><code>drive.file</code>：當你按下「備份到 Drive」或使用家庭帳本時，在你的雲端硬碟存取相關檔案。本 App 只能存取<strong>它自己建立或使用者選取的檔案</strong>，無法讀取你雲端硬碟中的其他檔案。</li>
 </ul>
+<p><strong>家庭帳本說明</strong>：使用家庭帳本時，帳本資料存在建立者的 Google 雲端硬碟中一個 JSON 檔，並分享給被邀請的成員；成員可看到帳本內全部紀錄；勾選「私人」的紀錄只存在自己的裝置與個人雲端同步。App 只使用 <code>drive.file</code> 權限，只能存取 App 自己建立或使用者選取的檔案。</p>
 <p>登入後取得的存取權杖只保存在你的瀏覽器中，用來直接與 Google 的伺服器溝通，不會傳送給開發者或任何第三方。</p>
 <p>本 App 對 Google API 所取得資訊的使用與轉移，皆遵守 <a href="https://developers.google.com/terms/api-services-user-data-policy" target="_blank" rel="noopener">Google API 服務使用者資料政策</a>，包括「有限使用」（Limited Use）規定：取得的資料只用於提供你看得到的同步與備份功能，不會用於廣告，不會轉移給他人，也不會被人工讀取。</p>
 

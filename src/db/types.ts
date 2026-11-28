@@ -59,6 +59,18 @@ export interface Transaction extends BaseRecord {
   recurringId?: string | null;
   /** 對應的週期發生日期 YYYY-MM-DD（選填） */
   occurrenceDate?: string | null;
+  /** 同一組分期共用的識別碼（uuidv7，選填） */
+  installmentId?: string | null;
+  /** 分期期數索引（1 起算，選填） */
+  installmentIndex?: number | null;
+  /** 分期總期數（選填） */
+  installmentCount?: number | null;
+  /** 分期總額（主幣別，選填） */
+  installmentTotal?: number | null;
+  /** 建立此筆交易的成員識別碼（家庭帳本使用，建立後不變） */
+  memberId?: string | null;
+  /** 最後修改或刪除者的成員識別碼（家庭帳本使用） */
+  lastEditedBy?: string | null;
 }
 
 export interface Place extends BaseRecord {
@@ -143,10 +155,27 @@ export interface LotteryDraw extends BaseRecord {
 }
 
 export interface Budget extends BaseRecord {
-  /** null 代表本月總預算；否則為「支出」主分類 id */
+  /** null 代表本月總預算或成員個人預算；否則為「支出」主分類 id */
   categoryId: string | null;
   /** 每月預算金額（正整數，新台幣元） */
   amount: number;
+  /** 成員個人預算所屬成員識別碼（家庭帳本使用） */
+  memberId?: string | null;
+}
+
+export type MemberRole = 'owner' | 'member';
+
+export interface Member extends BaseRecord {
+  /** 成員顯示名稱 */
+  name: string;
+  /** 代表色（#RRGGBB） */
+  color: string;
+  /** Google 帳號 Email */
+  email: string;
+  /** 成員角色（owner 建立者／member 一般成員） */
+  role: MemberRole;
+  /** 是否已被建立者移除 */
+  removed: boolean;
 }
 
 export interface NoSpendDay extends BaseRecord {
@@ -203,7 +232,8 @@ export type SyncTableName =
   | 'budgets'
   | 'noSpendDays'
   | 'cards'
-  | 'currencies';
+  | 'currencies'
+  | 'members';
 
 export interface OutboxEntry {
   /** 複合主鍵 `${table}:${recordId}`，避免同一筆紀錄重複排隊 */
