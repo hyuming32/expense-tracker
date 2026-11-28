@@ -25,10 +25,14 @@ interface DocsViewInstance {
   setIncludeFolders: (include: boolean) => DocsViewInstance;
   setMimeTypes: (mimeTypes: string) => DocsViewInstance;
   setOwnedByMe: (ownedByMe: boolean) => DocsViewInstance;
+  setFileIds: (fileIds: string) => DocsViewInstance;
+  setQuery: (query: string) => DocsViewInstance;
 }
 
 interface PickerBuilderInstance {
   addView: (view: DocsViewInstance) => PickerBuilderInstance;
+  setTitle: (title: string) => PickerBuilderInstance;
+  setSize: (width: number, height: number) => PickerBuilderInstance;
   setOAuthToken: (token: string) => PickerBuilderInstance;
   setDeveloperKey: (key: string) => PickerBuilderInstance;
   setAppId: (appId: string) => PickerBuilderInstance;
@@ -128,18 +132,25 @@ async function ensureGooglePickerLoaded(): Promise<NonNullable<GooglePickerGloba
   return pickerApi;
 }
 
+export interface PickFamilyLedgerFileOptions {
+  fileId?: string;
+}
+
 /**
  * 動態載入 Google Picker 並讓使用者從 Google Drive 選擇共用家庭帳本 JSON 檔案。
+ * 有指定 fileId 時只顯示該單一檔案；未指定時則篩選檔名含 fun2young 的共用 JSON 檔案。
  * 使用者取消選擇時拋出 DriveAuthCancelledError。
  */
 export async function pickFamilyLedgerFile(
   accessToken: string,
+  options?: PickFamilyLedgerFileOptions,
 ): Promise<{ id: string; name: string }> {
   if (!isPickerConfigured()) {
     throw new Error('尚未設定 Google 檔案選擇器金鑰');
   }
 
   const pickerApi = await ensureGooglePickerLoaded();
+  const targetFileId = options?.fileId?.trim() || undefined;
 
   return new Promise<{ id: string; name: string }>((resolve, reject) => {
     const view = new pickerApi.DocsView()
@@ -147,8 +158,25 @@ export async function pickFamilyLedgerFile(
       .setMimeTypes('application/json')
       .setOwnedByMe(false);
 
+    if (targetFileId) {
+      view.setFileIds(targetFileId);
+    } else {
+      view.setQuery('fun2young');
+    }
+
+    const title = targetFileId
+      ? '請點選家人分享的帳本，再按「選取」'
+      : '請點選結尾是 .fun2young.json 的帳本，再按「選取」';
+
+    const maxW = typeof window !== 'undefined' ? window.innerWidth : 640;
+    const maxH = typeof window !== 'undefined' ? window.innerHeight : 480;
+    const width = Math.min(Math.max(300, maxW - 24), 720);
+    const height = Math.min(Math.max(380, maxH - 48), 540);
+
     const picker = new pickerApi.PickerBuilder()
       .addView(view)
+      .setTitle(title)
+      .setSize(width, height)
       .setOAuthToken(accessToken)
       .setDeveloperKey(GOOGLE_PICKER_API_KEY)
       .setAppId(GOOGLE_CLOUD_PROJECT_NUMBER)

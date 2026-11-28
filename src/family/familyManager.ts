@@ -17,6 +17,7 @@ import {
 import { DriveApiError } from '../sync/driveStore';
 import { toFriendlySyncError } from '../sync/syncManager';
 import {
+  buildFamilyInviteUrl,
   clearFamilyConfig,
   type FamilyConfig,
   getActiveLedger,
@@ -40,7 +41,7 @@ export type FamilySyncStatus =
   | 'syncing'
   | 'synced'
   | 'offline'
-  | 'reauth'
+  | 'needAuth'
   | 'error'
   | 'removed';
 
@@ -180,7 +181,7 @@ async function executeFamilySync(interactive: boolean): Promise<boolean> {
       setState({ status: 'offline', errorMessage: null });
     } else {
       setState({
-        status: 'reauth',
+        status: 'needAuth',
         errorMessage: err instanceof Error ? err.message : null,
       });
     }
@@ -211,7 +212,7 @@ async function executeFamilySync(interactive: boolean): Promise<boolean> {
     }
     if (err instanceof DriveApiError && err.status === 401) {
       clearCachedDriveFileToken();
-      setState({ status: 'reauth', errorMessage: null });
+      setState({ status: 'needAuth', errorMessage: null });
       return false;
     }
     if (isOffline()) {
@@ -224,6 +225,13 @@ async function executeFamilySync(interactive: boolean): Promise<boolean> {
     });
     return false;
   }
+}
+
+/**
+ * 取得目前家庭帳本同步狀態快照。
+ */
+export function getFamilySyncState(): FamilySyncState {
+  return getSnapshot();
 }
 
 /**
@@ -362,7 +370,10 @@ export interface CreateFamilyLedgerInput {
 export interface FamilyManagerDeps {
   store?: FamilyDriveStore;
   database?: ExpenseDatabase;
-  pickFile?: (accessToken: string) => Promise<{ id: string; name: string }>;
+  pickFile?: (
+    accessToken: string,
+    options?: { fileId?: string },
+  ) => Promise<{ id: string; name: string }>;
 }
 
 /**
@@ -447,10 +458,12 @@ export async function createFamilyLedger(
 export interface JoinFamilyLedgerInput {
   myName: string;
   color: string;
+  fileId?: string;
 }
 
 /**
- * 加入他人建立的家庭帳本：自動尋找或透過 Picker 選取共用 JSON 檔、同步資料並寫入設定（不負責重新載入頁面）。
+ * 加入他人建立的家庭帳本：
+ * 若有指定 fileId 會先嘗試直接下載；無權限（403/404）或未指定且找不到唯一受邀檔案時，再透過 Picker 選取。
  */
 export async function joinFamilyLedger(
   input: JoinFamilyLedgerInput,
@@ -458,6 +471,7 @@ export async function joinFamilyLedger(
 ): Promise<FamilyConfig> {
   const myName = input.myName.trim();
   const color = input.color.trim();
+  const requestedFileId = input.fileId?.trim() || undefined;
 
   if (!myName) {
     throw new Error('請輸入您的顯示名稱');
@@ -476,24 +490,46 @@ export async function joinFamilyLedger(
     store = new FetchFamilyDriveStore(async () => fixedToken);
   }
 
-  const about = await store.about();
-  const appFiles = await store.findAppFiles();
-
-  let fileId: string;
-  if (appFiles.length === 1) {
-    fileId = appFiles[0]!.id;
-  } else if (deps?.pickFile) {
-    const picked = await deps.pickFile(token ?? '');
-    fileId = picked.id;
-  } else {
+  const pickWithFileId = async (targetFileId?: string): Promise<{ id: string; name: string }> => {
+    if (deps?.pickFile) {
+      return deps.pickFile(token ?? '', targetFileId ? { fileId: targetFileId } : undefined);
+    }
     if (!token) {
       token = await requestDriveFileAccessToken();
     }
-    const picked = await pickFamilyLedgerFile(token);
-    fileId = picked.id;
+    return pickFamilyLedgerFile(token, targetFileId ? { fileId: targetFileId } : undefined);
+  };
+
+  const about = await store.about();
+
+  let fileId: string;
+  let rawContent: string;
+
+  if (requestedFileId) {
+    try {
+      rawContent = await store.download(requestedFileId);
+      fileId = requestedFileId;
+    } catch (err) {
+      if (err instanceof DriveApiError && (err.status === 403 || err.status === 404)) {
+        const picked = await pickWithFileId(requestedFileId);
+        fileId = picked.id;
+        rawContent = await store.download(fileId);
+      } else {
+        throw err;
+      }
+    }
+  } else {
+    const appFiles = await store.findAppFiles();
+    const sharedFiles = appFiles.filter((f) => !f.ownedByMe);
+    if (sharedFiles.length === 1) {
+      fileId = sharedFiles[0]!.id;
+    } else {
+      const picked = await pickWithFileId();
+      fileId = picked.id;
+    }
+    rawContent = await store.download(fileId);
   }
 
-  const rawContent = await store.download(fileId);
   const parsed = parseFamilyLedgerFile(rawContent);
 
   const now = Date.now();
@@ -555,17 +591,26 @@ function requireActiveOwnerConfig(): FamilyConfig {
 }
 
 /**
- * 邀請成員加入家庭帳本（僅建立者可操作，授權該 Email 可讀寫共用檔案）。
+ * 邀請成員加入家庭帳本（僅建立者可操作，授權該 Email 可讀寫共用檔案，並於通知信附上邀請連結）。
  */
-export async function inviteMember(email: string, deps?: FamilyManagerDeps): Promise<void> {
+export async function inviteMember(
+  email: string,
+  deps?: FamilyManagerDeps & { joinUrl?: string },
+): Promise<void> {
   const config = requireActiveOwnerConfig();
   const trimmedEmail = email.trim();
   if (!trimmedEmail || !trimmedEmail.includes('@')) {
     throw new Error('請輸入有效的 Email 地址');
   }
 
+  const joinUrl =
+    deps?.joinUrl ??
+    (typeof window !== 'undefined' && window.location?.origin
+      ? buildFamilyInviteUrl(config.fileId)
+      : undefined);
+
   const store = deps?.store ?? createInteractiveStore();
-  await store.share(config.fileId, trimmedEmail);
+  await store.share(config.fileId, trimmedEmail, joinUrl);
 }
 
 /**

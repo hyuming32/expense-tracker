@@ -11,7 +11,14 @@ import { type ShortcutDraft, ShortcutSheet } from './components/ShortcutSheet';
 import { type TransactionDraft, TransactionSheet } from './components/TransactionSheet';
 import { PrivacyProvider, useMoney } from './contexts/PrivacyContext';
 import { ensureSeeded } from './db/database';
-import { getActiveLedger, getFamilyConfig, isFamilyReadOnly } from './family/familyConfig';
+import {
+  getActiveLedger,
+  getFamilyConfig,
+  getPendingJoinFileId,
+  isFamilyReadOnly,
+  parseJoinFamilyParam,
+  setPendingJoinFileId,
+} from './family/familyConfig';
 import { startFamilySync, useFamilySyncState } from './family/familyManager';
 import {
   markOnboardingCompleted,
@@ -86,6 +93,8 @@ export function App() {
   const [lastSavedTx, setLastSavedTx] = useState<Transaction | null>(null);
   const [quickToast, setQuickToast] = useState<{ tx: Transaction; label: string } | null>(null);
   const [readOnlyNotice, setReadOnlyNotice] = useState<string | null>(null);
+  const [alreadyJoinedNotice, setAlreadyJoinedNotice] = useState<string | null>(null);
+  const [hasPendingJoin, setHasPendingJoin] = useState<boolean>(() => Boolean(getPendingJoinFileId()));
   const [persistedStatus, setPersistedStatus] = useState<boolean | null>(null);
   const [deferredInstallPrompt, setDeferredInstallPrompt] = useState<BeforeInstallPromptEvent | null>(
     null,
@@ -149,6 +158,30 @@ export function App() {
       platform: navigator.platform,
       maxTouchPoints: navigator.maxTouchPoints,
     });
+  }, []);
+
+  useEffect(() => {
+    if (typeof window === 'undefined') {
+      return;
+    }
+    const joinFileId = parseJoinFamilyParam(window.location.search);
+    if (!joinFileId) {
+      return;
+    }
+
+    const url = new URL(window.location.href);
+    url.searchParams.delete('joinFamily');
+
+    if (getFamilyConfig()) {
+      window.history.replaceState(null, '', url.toString());
+      setAlreadyJoinedNotice('你已經加入一個家庭帳本');
+      return;
+    }
+
+    setPendingJoinFileId(joinFileId);
+    setHasPendingJoin(true);
+    url.hash = '#/settings?section=family';
+    window.history.replaceState(null, '', url.toString());
   }, []);
 
   useEffect(() => {
@@ -271,6 +304,16 @@ export function App() {
     }, 4000);
     return () => window.clearTimeout(timer);
   }, [readOnlyNotice]);
+
+  useEffect(() => {
+    if (!alreadyJoinedNotice) {
+      return;
+    }
+    const timer = window.setTimeout(() => {
+      setAlreadyJoinedNotice(null);
+    }, 5000);
+    return () => window.clearTimeout(timer);
+  }, [alreadyJoinedNotice]);
 
   const accountMap = useMemo(() => new Map(allAccounts.map((a) => [a.id, a])), [allAccounts]);
   const categoryMap = useMemo(() => new Map(categories.map((c) => [c.id, c])), [categories]);
@@ -444,6 +487,7 @@ export function App() {
 
   const autoOnboardingOpen =
     ready &&
+    !hasPendingJoin &&
     onboardingMeta !== undefined &&
     shouldShowOnboarding({
       onboardingCompleted: onboardingMeta.onboardingCompleted,
@@ -691,6 +735,23 @@ export function App() {
               onClick={() => setReadOnlyNotice(null)}
               aria-label="關閉提示"
               className="rounded px-1.5 py-1 text-amber-700 hover:bg-amber-100 dark:text-amber-300 dark:hover:bg-amber-900"
+            >
+              ✕
+            </button>
+          </div>
+        )}
+
+        {alreadyJoinedNotice && (
+          <div
+            role="status"
+            className="fixed bottom-20 left-1/2 z-30 flex w-[calc(100%-2rem)] max-w-[688px] -translate-x-1/2 items-center justify-between gap-2 rounded-xl border border-slate-200 bg-slate-900 px-3.5 py-2.5 text-xs font-medium text-white shadow-lg dark:border-slate-700 dark:bg-slate-800"
+          >
+            <span>{alreadyJoinedNotice}</span>
+            <button
+              type="button"
+              onClick={() => setAlreadyJoinedNotice(null)}
+              aria-label="關閉提示"
+              className="rounded px-1.5 py-1 text-slate-300 hover:bg-slate-700"
             >
               ✕
             </button>

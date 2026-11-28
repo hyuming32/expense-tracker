@@ -18,7 +18,7 @@ export interface FamilyDriveStore {
   download(fileId: string): Promise<string>;
   update(fileId: string, json: string): Promise<void>;
   findAppFiles(): Promise<FamilyDriveFileItem[]>;
-  share(fileId: string, email: string): Promise<void>;
+  share(fileId: string, email: string, joinUrl?: string): Promise<void>;
   unshare(fileId: string, permissionId: string): Promise<void>;
 }
 
@@ -159,10 +159,13 @@ export class FetchFamilyDriveStore implements FamilyDriveStore {
     return files;
   }
 
-  async share(fileId: string, email: string): Promise<void> {
+  async share(fileId: string, email: string, joinUrl?: string): Promise<void> {
+    const emailMessage = joinUrl
+      ? `點擊連結加入家庭帳本：${joinUrl}\n（或打開 Fun2young記帳 → 設定 → 家庭帳本 → 加入）`
+      : SHARE_EMAIL_MESSAGE;
     const params = new URLSearchParams({
       sendNotificationEmail: 'true',
-      emailMessage: SHARE_EMAIL_MESSAGE,
+      emailMessage,
     });
     await this.authorizedFetch(
       `${DRIVE_API_BASE}/files/${encodeURIComponent(fileId)}/permissions?${params.toString()}`,
@@ -302,7 +305,7 @@ export class MemoryFamilyDriveStore implements FamilyDriveStore {
     return result;
   }
 
-  async share(fileId: string, email: string): Promise<void> {
+  async share(fileId: string, email: string, _joinUrl?: string): Promise<void> {
     const entry = this.getAuthorizedFile(fileId);
     const normalized = email.trim().toLowerCase();
     entry.allowedEmails.add(normalized);
