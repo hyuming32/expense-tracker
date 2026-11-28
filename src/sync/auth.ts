@@ -359,3 +359,34 @@ export async function requestDriveFileAccessToken(): Promise<string> {
     return requestDriveFileTokenWithPrompt(oauth2, 'consent');
   }
 }
+
+/**
+ * 清除記憶體中快取的 Google Drive 可見檔案（drive.file）存取權杖。
+ */
+export function clearCachedDriveFileToken(): void {
+  memoryDriveFileToken = null;
+}
+
+/**
+ * 靜默取得 Google Drive 可見檔案（drive.file）存取權杖；
+ * 只使用 prompt: ''，不跳出授權視窗，失敗時直接拋出錯誤。
+ */
+export async function getDriveFileAccessTokenSilently(): Promise<string> {
+  if (!isGoogleClientConfigured()) {
+    throw new Error('尚未設定 Google Client ID');
+  }
+
+  const oauth2 = getGoogleOAuth2();
+  if (!oauth2) {
+    throw new Error('Google 登入元件尚未載入');
+  }
+
+  if (
+    memoryDriveFileToken &&
+    Date.now() < memoryDriveFileToken.expiresAt - TOKEN_EXPIRY_BUFFER_MS
+  ) {
+    return memoryDriveFileToken.accessToken;
+  }
+
+  return requestDriveFileTokenWithPrompt(oauth2, '');
+}

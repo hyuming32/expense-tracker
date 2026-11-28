@@ -1,4 +1,4 @@
-import type { Category, Place, Transaction } from '../db/types';
+import type { Category, Member, Place, Transaction } from '../db/types';
 import { shiftMonth } from './format';
 
 export type PeriodKind = 'month' | 'quarter' | 'year';
@@ -69,6 +69,14 @@ export interface PlaceBreakdownItem {
   placeId: string;
   name: string;
   icon: string;
+  amount: number;
+  percentage: number;
+}
+
+export interface MemberBreakdownItem {
+  memberId: string;
+  name: string;
+  color: string;
   amount: number;
   percentage: number;
 }
@@ -358,6 +366,54 @@ export function placeBreakdownInRange(
     ...item,
     percentage: totalExpense > 0 ? Math.round((item.amount / totalExpense) * 1000) / 10 : 0,
   }));
+}
+
+/**
+ * 依家庭成員彙總指定期間的支出（排除轉帳與已刪除；沒有 memberId 的歸到「未標示」）。
+ */
+export function memberBreakdown(
+  transactions: readonly Transaction[],
+  members: readonly Member[],
+  range: Pick<PeriodRange, 'start' | 'end'>,
+): MemberBreakdownItem[] {
+  const memberMap = new Map(members.filter((m) => !m.deleted).map((m) => [m.id, m]));
+  const totals = new Map<
+    string,
+    { memberId: string; name: string; color: string; amount: number }
+  >();
+  let totalExpense = 0;
+
+  for (const tx of transactions) {
+    if (
+      tx.deleted ||
+      tx.kind !== 'expense' ||
+      tx.date < range.start ||
+      tx.date > range.end
+    ) {
+      continue;
+    }
+
+    const rawMemberId = tx.memberId?.trim() || null;
+    const member = rawMemberId ? memberMap.get(rawMemberId) : undefined;
+    const key = rawMemberId ?? 'unassigned';
+    const name = rawMemberId ? (member?.name ?? '家人') : '未標示';
+    const color = member?.color ?? '#94a3b8';
+
+    const existing = totals.get(key);
+    if (existing) {
+      existing.amount += tx.amount;
+    } else {
+      totals.set(key, { memberId: key, name, color, amount: tx.amount });
+    }
+    totalExpense += tx.amount;
+  }
+
+  return Array.from(totals.values())
+    .map((item) => ({
+      ...item,
+      percentage: totalExpense > 0 ? Math.round((item.amount / totalExpense) * 1000) / 10 : 0,
+    }))
+    .sort((a, b) => b.amount - a.amount);
 }
 
 /**

@@ -314,6 +314,31 @@ describe('filterTransactions', () => {
       filterTransactions(sampleTxs, { range: allRange, invoice: 'without' }, ctx).map((t) => t.id),
     ).toEqual(['tx-nov-income', 'tx-nov-transfer', 'tx-dec-start']);
   });
+
+  it('支援依家庭成員 memberId 篩選，未指定 memberId 時回傳全部', () => {
+    const familyTxs: Transaction[] = [
+      makeTx({ id: 'tx-a', date: '2026-11-01', memberId: 'member-a', amount: 200 }),
+      makeTx({ id: 'tx-b', date: '2026-11-02', memberId: 'member-b', amount: 350 }),
+      makeTx({ id: 'tx-none', date: '2026-11-03', memberId: null, amount: 100 }),
+    ];
+    const allRange = { kind: 'all' } as const;
+
+    expect(
+      filterTransactions(familyTxs, { range: allRange, memberId: 'member-a' }, ctx).map(
+        (t) => t.id,
+      ),
+    ).toEqual(['tx-a']);
+
+    expect(
+      filterTransactions(familyTxs, { range: allRange, memberId: 'member-b' }, ctx).map(
+        (t) => t.id,
+      ),
+    ).toEqual(['tx-b']);
+
+    expect(
+      filterTransactions(familyTxs, { range: allRange }, ctx).map((t) => t.id),
+    ).toEqual(['tx-a', 'tx-b', 'tx-none']);
+  });
 });
 
 describe('summarizeFiltered', () => {

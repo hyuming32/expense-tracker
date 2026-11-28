@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
+import { personalDb } from '../db/database';
 import {
   type AmountColors,
   bindSellerIdToPlace,
@@ -7,16 +8,21 @@ import {
   DuplicatePlaceNameError,
   findActiveTransactionByInvoiceNo,
   saveCurrency,
+  saveInstallmentTransactions,
   saveNotePreset,
   savePlace,
+  savePrivateTransactionFromFamily,
   saveTransaction,
+  softDeleteInstallmentTransactions,
   softDeleteNotePreset,
   softDeleteTransaction,
+  updateInstallmentTransactions,
 } from '../db/repository';
 import type {
   Account,
   Category,
   CurrencyRate,
+  Member,
   NotePreset,
   Place,
   Transaction,
@@ -24,6 +30,7 @@ import type {
 } from '../db/types';
 import {
   appendCalcToken,
+  buildInstallmentDates,
   COMMON_CURRENCIES,
   convertToMain,
   CURRENCY_NAME_MAX_LENGTH,
@@ -34,8 +41,11 @@ import {
   formatRateDisplay,
   getCurrentTimeString,
   getDefaultCurrencyDecimals,
+  getInstallmentProgress,
   getTodayDateString,
   hasCalcOperator,
+  INSTALLMENT_MAX_COUNT,
+  INSTALLMENT_MIN_COUNT,
   isValidCurrencyCode,
   isValidRate,
   isValidSellerId,
@@ -46,6 +56,7 @@ import {
   resolveAmountExpression,
   selectQuickNotePresets,
   selectQuickPlaces,
+  splitInstallment,
   validateTransaction,
   type ParsedInvoice,
 } from '../domain';
@@ -69,6 +80,7 @@ interface TransactionSheetProps {
   open: boolean;
   editingTransaction: Transaction | null;
   initialDraft?: TransactionDraft | null;
+  transactions?: readonly Transaction[];
   accounts: readonly Account[];
   categories: readonly Category[];
   places: readonly Place[];
@@ -79,6 +91,9 @@ interface TransactionSheetProps {
   lastUsed: LastUsedMeta;
   amountColors: AmountColors;
   notePresets: readonly NotePreset[];
+  isFamilyMode?: boolean;
+  readOnly?: boolean;
+  members?: readonly Member[];
   onClose: () => void;
   onSaved?: (tx: Transaction) => void;
 }
@@ -100,6 +115,7 @@ export function TransactionSheet({
   open,
   editingTransaction,
   initialDraft,
+  transactions = [],
   accounts,
   categories,
   places,
@@ -110,6 +126,9 @@ export function TransactionSheet({
   lastUsed,
   amountColors,
   notePresets,
+  isFamilyMode = false,
+  readOnly = false,
+  members = [],
   onClose,
   onSaved,
 }: TransactionSheetProps) {
@@ -166,6 +185,12 @@ export function TransactionSheet({
   const [submitting, setSubmitting] = useState(false);
   const [deletingPreset, setDeletingPreset] = useState<NotePreset | null>(null);
   const [presetMessage, setPresetMessage] = useState<string | null>(null);
+  const [isInstallment, setIsInstallment] = useState(false);
+  const [installmentCountInput, setInstallmentCountInput] = useState('3');
+  const [installmentSavePrompt, setInstallmentSavePrompt] = useState(false);
+  const [isPrivate, setIsPrivate] = useState(false);
+
+  const memberMap = useMemo(() => new Map(members.map((m) => [m.id, m])), [members]);
 
   const activeCategories = useMemo(
     () => categories.filter((c) => !c.archived && c.kind === (kind === 'income' ? 'income' : 'expense')),
@@ -248,6 +273,10 @@ export function TransactionSheet({
     setSubmitting(false);
     setDeletingPreset(null);
     setPresetMessage(null);
+    setIsInstallment(false);
+    setInstallmentCountInput('3');
+    setInstallmentSavePrompt(false);
+    setIsPrivate(false);
     setPlaceQuery('');
     setAddingPlace(false);
     setNewPlaceName('');
@@ -478,6 +507,54 @@ export function TransactionSheet({
       ? convertToMain(resolvedAmount.value, parsedRate, mainCurrency.decimals)
       : null;
 
+  const isEditingInstallment = Boolean(editingTransaction?.installmentId);
+  const canUseInstallment =
+    !editingTransaction && kind === 'expense' && !isForeignCurrency && !isPrivate;
+  const installmentActive = canUseInstallment && isInstallment;
+  const parsedInstallmentCount = Number(installmentCountInput.trim());
+  const installmentCountValid =
+    Number.isInteger(parsedInstallmentCount) &&
+    parsedInstallmentCount >= INSTALLMENT_MIN_COUNT &&
+    parsedInstallmentCount <= INSTALLMENT_MAX_COUNT;
+
+  const installmentPreview = useMemo(() => {
+    if (!installmentActive || !resolvedAmount.ok || !installmentCountValid || !date) {
+      return null;
+    }
+    try {
+      const amounts = splitInstallment(
+        resolvedAmount.value,
+        parsedInstallmentCount,
+        mainCurrency.decimals,
+      );
+      const dates = buildInstallmentDates(date, parsedInstallmentCount);
+      return {
+        firstAmount: amounts[0]!,
+        lastDate: dates[dates.length - 1]!,
+      };
+    } catch {
+      return null;
+    }
+  }, [
+    installmentActive,
+    resolvedAmount,
+    installmentCountValid,
+    parsedInstallmentCount,
+    date,
+    mainCurrency.decimals,
+  ]);
+
+  const installmentProgress = useMemo(() => {
+    if (!editingTransaction?.installmentId) {
+      return null;
+    }
+    return getInstallmentProgress(
+      transactions,
+      editingTransaction.installmentId,
+      getTodayDateString(),
+    );
+  }, [editingTransaction, transactions]);
+
   if (!open) {
     return null;
   }
@@ -490,6 +567,7 @@ export function TransactionSheet({
 
     if (nextKind !== 'expense') {
       setInvoiceNo(null);
+      setIsInstallment(false);
     }
 
     if (nextKind === 'transfer') {
@@ -624,6 +702,7 @@ export function TransactionSheet({
       return;
     }
     setSelectedCurrencyCode(code);
+    setIsInstallment(false);
     const found = currencies.find((c) => c.code === code && !c.deleted);
     if (found) {
       const display = formatRateDisplay(found.rate);
@@ -677,6 +756,7 @@ export function TransactionSheet({
       });
       const display = formatRateDisplay(saved.rate);
       setSelectedCurrencyCode(saved.code);
+      setIsInstallment(false);
       setRateText(display);
       setExactInitialRate({ display, exact: saved.rate });
       setAddingCurrency(false);
@@ -710,13 +790,39 @@ export function TransactionSheet({
     setKeypadOpen(false);
   }
 
-  async function handleSubmit(e: React.FormEvent) {
-    e.preventDefault();
-    if (submitting) {
+  function hasInstallmentSharedFieldsChanged(finalTags: readonly string[]): boolean {
+    if (!editingTransaction) {
+      return false;
+    }
+    const nextCat = kind === 'transfer' ? null : categoryId;
+    if (nextCat !== (editingTransaction.categoryId ?? null)) {
+      return true;
+    }
+    if (accountId !== editingTransaction.accountId) {
+      return true;
+    }
+    const nextNote = note.trim() || null;
+    const prevNote = editingTransaction.note?.trim() || null;
+    if (nextNote !== prevNote) {
+      return true;
+    }
+    if ((placeId || null) !== (editingTransaction.placeId ?? null)) {
+      return true;
+    }
+    const prevTags = normalizeTags(editingTransaction.tags ?? []);
+    if (finalTags.length !== prevTags.length) {
+      return true;
+    }
+    return finalTags.some((t, i) => t !== prevTags[i]);
+  }
+
+  async function executeSave(installmentScope?: 'single' | 'following') {
+    if (submitting || readOnly) {
       return;
     }
 
     setDuplicateMessage(null);
+    setInstallmentSavePrompt(false);
     if (!resolvedAmount.ok) {
       setErrors([resolvedAmount.error]);
       return;
@@ -738,6 +844,11 @@ export function TransactionSheet({
       }
     }
 
+    if (installmentActive && !installmentCountValid) {
+      setErrors([`分期期數需介於 ${INSTALLMENT_MIN_COUNT} 到 ${INSTALLMENT_MAX_COUNT} 期`]);
+      return;
+    }
+
     const payload = {
       kind,
       date,
@@ -753,13 +864,24 @@ export function TransactionSheet({
       return;
     }
 
+    const finalTags = tagInput.trim() ? normalizeTags([...tags, tagInput]) : tags;
+
+    if (isEditingInstallment && editingTransaction && !installmentScope) {
+      if (hasInstallmentSharedFieldsChanged(finalTags)) {
+        setInstallmentSavePrompt(true);
+        return;
+      }
+    }
+
     setSubmitting(true);
     try {
       const effectiveInvoiceNo = kind === 'expense' ? invoiceNo : null;
+      const savingPrivate = isFamilyMode && !editingTransaction && isPrivate;
       if (effectiveInvoiceNo) {
         const duplicate = await findActiveTransactionByInvoiceNo(
           effectiveInvoiceNo,
           editingTransaction?.id,
+          savingPrivate ? personalDb : undefined,
         );
         if (duplicate) {
           setDuplicateMessage(`這張發票已經記過了（${duplicate.date} ${duplicate.amount}）`);
@@ -767,7 +889,41 @@ export function TransactionSheet({
         }
       }
 
-      const finalTags = tagInput.trim() ? normalizeTags([...tags, tagInput]) : tags;
+      if (savingPrivate) {
+        const savedPrivate = await savePrivateTransactionFromFamily({
+          ...payload,
+          currency: isForeignCurrency ? selectedCurrencyCode : null,
+          originalAmount: isForeignCurrency ? inputAmount : null,
+          rate: isForeignCurrency ? parsedRate : null,
+          time: time || null,
+          placeId: placeId || null,
+          note: note || null,
+          tags: finalTags,
+          invoiceNo: effectiveInvoiceNo,
+        });
+        onSaved?.(savedPrivate);
+        onClose();
+        return;
+      }
+
+      if (installmentActive) {
+        const savedList = await saveInstallmentTransactions({
+          ...payload,
+          installmentCount: parsedInstallmentCount,
+          currency: null,
+          originalAmount: null,
+          rate: null,
+          time: time || null,
+          placeId: placeId || null,
+          note: note || null,
+          tags: finalTags,
+          invoiceNo: effectiveInvoiceNo,
+        });
+        onSaved?.(savedList[0]!);
+        onClose();
+        return;
+      }
+
       const saved = await saveTransaction({
         id: editingTransaction?.id,
         ...payload,
@@ -780,26 +936,56 @@ export function TransactionSheet({
         tags: finalTags,
         invoiceNo: effectiveInvoiceNo,
       });
+
+      if (
+        installmentScope === 'following' &&
+        editingTransaction?.installmentId
+      ) {
+        await updateInstallmentTransactions(
+          editingTransaction.installmentId,
+          editingTransaction.installmentIndex ?? 1,
+          {
+            categoryId: payload.categoryId,
+            accountId: payload.accountId,
+            note: note || null,
+            tags: finalTags,
+            placeId: placeId || null,
+          },
+        );
+      }
+
       onSaved?.(saved);
       onClose();
     } catch (err) {
       if (err instanceof DuplicateInvoiceError) {
         setDuplicateMessage(err.message);
       } else {
-        setErrors(['儲存失敗，請稍後再試']);
+        setErrors([err instanceof Error ? err.message : '儲存失敗，請稍後再試']);
       }
     } finally {
       setSubmitting(false);
     }
   }
 
-  async function handleDelete() {
-    if (!editingTransaction || submitting) {
+  async function handleSubmit(e: React.FormEvent) {
+    e.preventDefault();
+    await executeSave();
+  }
+
+  async function handleDelete(scope: 'single' | 'following' = 'single') {
+    if (!editingTransaction || submitting || readOnly) {
       return;
     }
     setSubmitting(true);
     try {
-      await softDeleteTransaction(editingTransaction.id);
+      if (scope === 'following' && editingTransaction.installmentId) {
+        await softDeleteInstallmentTransactions(
+          editingTransaction.installmentId,
+          editingTransaction.installmentIndex ?? 1,
+        );
+      } else {
+        await softDeleteTransaction(editingTransaction.id);
+      }
       onClose();
     } finally {
       setSubmitting(false);
@@ -894,6 +1080,53 @@ export function TransactionSheet({
           </button>
         </div>
 
+        {isFamilyMode && editingTransaction && (() => {
+          const creatorName = editingTransaction.memberId
+            ? (memberMap.get(editingTransaction.memberId)?.name ?? '家人')
+            : '家人';
+          const editorName =
+            editingTransaction.lastEditedBy &&
+            editingTransaction.lastEditedBy !== editingTransaction.memberId
+              ? (memberMap.get(editingTransaction.lastEditedBy)?.name ?? '家人')
+              : null;
+          return (
+            <div className="mb-3 rounded-xl border border-slate-200 bg-slate-50 px-3 py-2 text-xs text-slate-600 dark:border-slate-700 dark:bg-slate-800/60 dark:text-slate-300">
+              由{' '}
+              <span className="font-semibold text-slate-900 dark:text-slate-100">
+                {creatorName}
+              </span>{' '}
+              記錄
+              {editorName && (
+                <>
+                  {' · '}
+                  <span className="font-semibold text-slate-900 dark:text-slate-100">
+                    {editorName}
+                  </span>{' '}
+                  最後修改
+                </>
+              )}
+            </div>
+          );
+        })()}
+
+        {isEditingInstallment && editingTransaction && (
+          <div className="mb-3 rounded-xl border border-amber-200 bg-amber-50 px-3 py-2 text-xs font-medium text-amber-800 dark:border-amber-800 dark:bg-amber-950/50 dark:text-amber-200">
+            分期 第 {editingTransaction.installmentIndex ?? 1}/
+            {editingTransaction.installmentCount ?? installmentProgress?.count ?? 1} 期
+            {installmentProgress && (
+              <>
+                {' '}
+                ｜剩 {installmentProgress.remainingCount} 期{' '}
+                {formatMoney(
+                  installmentProgress.remainingAmount,
+                  mainCurrency.code,
+                  mainCurrency.decimals,
+                )}
+              </>
+            )}
+          </div>
+        )}
+
         {/* 收支類型切換 */}
         <div className="mb-4 grid grid-cols-3 gap-1 rounded-xl bg-slate-100 p-1 dark:bg-slate-800">
           {KIND_TABS.map((tab) => {
@@ -922,7 +1155,9 @@ export function TransactionSheet({
               <span className="text-xs font-medium text-slate-500 dark:text-slate-400">
                 {isForeignCurrency
                   ? `原幣金額（${selectedCurrencyCode}）`
-                  : `金額（${mainCurrency.symbol.trimEnd()}）`}
+                  : installmentActive
+                    ? `總額（${mainCurrency.symbol.trimEnd()}）`
+                    : `金額（${mainCurrency.symbol.trimEnd()}）`}
               </span>
               <button
                 type="button"
@@ -1256,6 +1491,99 @@ export function TransactionSheet({
                 </button>
               </div>
             )}
+
+            {isFamilyMode && !editingTransaction && (
+              <div className="mt-2.5 rounded-xl border border-slate-200 bg-slate-50 px-3 py-2.5 dark:border-slate-700 dark:bg-slate-800/60">
+                <label
+                  htmlFor="tx-private-toggle"
+                  className="flex cursor-pointer items-center gap-2 text-xs font-medium text-slate-700 dark:text-slate-200"
+                >
+                  <input
+                    id="tx-private-toggle"
+                    type="checkbox"
+                    checked={isPrivate}
+                    onChange={(e) => {
+                      const next = e.target.checked;
+                      setIsPrivate(next);
+                      if (next) {
+                        setIsInstallment(false);
+                      }
+                    }}
+                    className="h-4 w-4 rounded border-slate-300 text-emerald-600 focus:ring-emerald-500 dark:border-slate-600 dark:bg-slate-700"
+                  />
+                  <span>私人（只記到個人帳本）</span>
+                </label>
+              </div>
+            )}
+
+            {canUseInstallment && (
+              <div className="mt-2.5 rounded-xl border border-slate-200 bg-slate-50 px-3 py-2.5 dark:border-slate-700 dark:bg-slate-800/60">
+                <div className="flex items-center justify-between gap-2">
+                  <label
+                    htmlFor="tx-installment-toggle"
+                    className="flex cursor-pointer items-center gap-2 text-xs font-medium text-slate-700 dark:text-slate-200"
+                  >
+                    <input
+                      id="tx-installment-toggle"
+                      type="checkbox"
+                      checked={isInstallment}
+                      onChange={(e) => setIsInstallment(e.target.checked)}
+                      className="h-4 w-4 rounded border-slate-300 text-emerald-600 focus:ring-emerald-500 dark:border-slate-600 dark:bg-slate-700"
+                    />
+                    <span>分期</span>
+                  </label>
+
+                  {isInstallment && (
+                    <div className="flex items-center gap-1.5">
+                      <label
+                        htmlFor="tx-installment-count"
+                        className="text-xs text-slate-500 dark:text-slate-400"
+                      >
+                        期數
+                      </label>
+                      <input
+                        id="tx-installment-count"
+                        type="number"
+                        min={INSTALLMENT_MIN_COUNT}
+                        max={INSTALLMENT_MAX_COUNT}
+                        step={1}
+                        inputMode="numeric"
+                        value={installmentCountInput}
+                        onChange={(e) => setInstallmentCountInput(e.target.value)}
+                        className="w-16 rounded-lg border border-slate-200 bg-white px-2 py-1 text-right text-xs font-semibold tabular-nums text-slate-900 outline-none focus:border-emerald-500 dark:border-slate-700 dark:bg-slate-800 dark:text-slate-100"
+                      />
+                      <span className="text-xs text-slate-500 dark:text-slate-400">期</span>
+                    </div>
+                  )}
+                </div>
+
+                {isInstallment && (
+                  <div className="mt-1.5 text-xs text-slate-600 dark:text-slate-300">
+                    {!installmentCountValid ? (
+                      <span className="text-red-600 dark:text-red-400">
+                        期數需介於 {INSTALLMENT_MIN_COUNT} 到 {INSTALLMENT_MAX_COUNT} 期
+                      </span>
+                    ) : installmentPreview ? (
+                      <span>
+                        每期{' '}
+                        <strong className="font-semibold text-emerald-700 dark:text-emerald-400">
+                          {formatMoney(
+                            installmentPreview.firstAmount,
+                            mainCurrency.code,
+                            mainCurrency.decimals,
+                          )}
+                        </strong>{' '}
+                        起 × {parsedInstallmentCount} 期，最後一期 {installmentPreview.lastDate}
+                      </span>
+                    ) : (
+                      <span className="text-slate-400 dark:text-slate-500">
+                        請輸入總額與首期日期以預覽每期金額
+                      </span>
+                    )}
+                  </div>
+                )}
+              </div>
+            )}
           </div>
 
           {/* 分類選擇（僅支出與收入顯示） */}
@@ -1363,7 +1691,7 @@ export function TransactionSheet({
             ) : (
               <div>
                 <label htmlFor="tx-date" className="mb-1 block text-xs font-medium text-slate-500 dark:text-slate-400">
-                  日期與時間
+                  {installmentActive ? '首期日期與時間' : '日期與時間'}
                 </label>
                 <div className="flex items-center gap-1.5">
                   <input
@@ -1758,24 +2086,70 @@ export function TransactionSheet({
             </div>
           )}
 
+          {/* 編輯分期紀錄：套用範圍選擇 */}
+          {installmentSavePrompt && isEditingInstallment && (
+            <div className="rounded-xl border border-amber-200 bg-amber-50 p-3 text-xs text-amber-900 dark:border-amber-800 dark:bg-amber-950/50 dark:text-amber-100">
+              <div className="mb-2 font-medium">要將分類／帳戶／備註／標籤／地點變更套用到哪些期數？</div>
+              <div className="flex flex-wrap items-center gap-2">
+                <button
+                  type="button"
+                  disabled={submitting}
+                  onClick={() => void executeSave('single')}
+                  className="rounded-lg border border-amber-300 bg-white px-3 py-1.5 font-medium text-slate-700 hover:bg-slate-50 disabled:opacity-50 dark:border-amber-700 dark:bg-slate-900 dark:text-slate-200"
+                >
+                  只改這期
+                </button>
+                <button
+                  type="button"
+                  disabled={submitting}
+                  onClick={() => void executeSave('following')}
+                  className="rounded-lg bg-emerald-600 px-3 py-1.5 font-medium text-white hover:bg-emerald-700 disabled:opacity-50"
+                >
+                  這期與之後全部
+                </button>
+                <button
+                  type="button"
+                  disabled={submitting}
+                  onClick={() => setInstallmentSavePrompt(false)}
+                  className="rounded-lg px-2.5 py-1.5 text-slate-600 hover:bg-amber-100 dark:text-slate-300 dark:hover:bg-amber-900/40"
+                >
+                  取消
+                </button>
+              </div>
+            </div>
+          )}
+
+          {isFamilyMode && !editingTransaction && isPrivate && (
+            <div className="rounded-xl border border-indigo-200 bg-indigo-50 px-3 py-2 text-xs font-medium text-indigo-800 dark:border-indigo-800 dark:bg-indigo-950/40 dark:text-indigo-200">
+              這筆不會分享給家人
+            </div>
+          )}
+
+          {readOnly && (
+            <div className="rounded-xl border border-amber-200 bg-amber-50 px-3 py-2 text-xs font-medium text-amber-800 dark:border-amber-800 dark:bg-amber-950/40 dark:text-amber-200">
+              已被移出家庭帳本（唯讀），無法儲存或刪除
+            </div>
+          )}
+
           {/* 操作按鈕 */}
           <div className="flex items-center gap-2 pt-1">
             {editingTransaction && !confirmingDelete && (
               <button
                 type="button"
+                disabled={readOnly || submitting}
                 onClick={() => setConfirmingDelete(true)}
-                className="rounded-xl border border-red-200 px-4 py-2.5 text-sm font-medium text-red-600 hover:bg-red-50 dark:border-red-900 dark:text-red-400 dark:hover:bg-red-950/40"
+                className="rounded-xl border border-red-200 px-4 py-2.5 text-sm font-medium text-red-600 hover:bg-red-50 disabled:cursor-not-allowed disabled:opacity-50 dark:border-red-900 dark:text-red-400 dark:hover:bg-red-950/40"
               >
                 刪除
               </button>
             )}
 
-            {editingTransaction && confirmingDelete && (
+            {editingTransaction && confirmingDelete && !isEditingInstallment && (
               <div className="flex items-center gap-1.5">
                 <button
                   type="button"
-                  onClick={handleDelete}
-                  disabled={submitting}
+                  onClick={() => void handleDelete('single')}
+                  disabled={readOnly || submitting}
                   className="rounded-xl bg-red-600 px-3 py-2.5 text-sm font-medium text-white hover:bg-red-700 disabled:opacity-50"
                 >
                   確認刪除
@@ -1790,9 +2164,43 @@ export function TransactionSheet({
               </div>
             )}
 
+            {editingTransaction && confirmingDelete && isEditingInstallment && (
+              <div className="flex flex-wrap items-center gap-1.5">
+                <button
+                  type="button"
+                  onClick={() => void handleDelete('single')}
+                  disabled={readOnly || submitting}
+                  className="rounded-xl bg-red-600 px-3 py-2.5 text-xs font-medium text-white hover:bg-red-700 disabled:opacity-50"
+                >
+                  只刪這期
+                </button>
+                <button
+                  type="button"
+                  onClick={() => void handleDelete('following')}
+                  disabled={readOnly || submitting}
+                  className="rounded-xl bg-red-700 px-3 py-2.5 text-xs font-medium text-white hover:bg-red-800 disabled:opacity-50"
+                >
+                  這期與之後全部
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setConfirmingDelete(false)}
+                  className="rounded-xl border border-slate-200 px-2.5 py-2.5 text-xs text-slate-600 dark:border-slate-700 dark:text-slate-300"
+                >
+                  取消
+                </button>
+              </div>
+            )}
+
             <button
               type="submit"
-              disabled={submitting || !resolvedAmount.ok || (isForeignCurrency && !rateValid)}
+              disabled={
+                readOnly ||
+                submitting ||
+                !resolvedAmount.ok ||
+                (isForeignCurrency && !rateValid) ||
+                (installmentActive && !installmentCountValid)
+              }
               className="ml-auto flex-1 rounded-xl bg-emerald-600 px-4 py-2.5 text-sm font-semibold text-white shadow-sm hover:bg-emerald-700 disabled:cursor-not-allowed disabled:opacity-50 dark:bg-emerald-500 dark:hover:bg-emerald-600"
             >
               儲存

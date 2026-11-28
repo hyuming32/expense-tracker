@@ -1,7 +1,7 @@
 import { useMemo, useState } from 'react';
 import { useMoney } from '../contexts/PrivacyContext';
 import type { AmountColors } from '../db/repository';
-import type { Account, AccountType, Category, Place, Transaction } from '../db/types';
+import type { Account, AccountType, Category, Member, Place, Transaction } from '../db/types';
 import { accountBalance } from '../domain';
 import { TransactionsPage } from './TransactionsPage';
 
@@ -10,6 +10,8 @@ interface AccountsPageProps {
   allAccounts: readonly Account[];
   categories: readonly Category[];
   places: readonly Place[];
+  members?: readonly Member[];
+  isFamilyMode?: boolean;
   transactions: readonly Transaction[];
   accountMap: ReadonlyMap<string, Account>;
   categoryMap: ReadonlyMap<string, Category>;
@@ -29,6 +31,8 @@ export function AccountsPage({
   allAccounts,
   categories,
   places,
+  members = [],
+  isFamilyMode = false,
   transactions,
   accountMap,
   categoryMap,
@@ -63,6 +67,8 @@ export function AccountsPage({
         accountMap={accountMap}
         categoryMap={categoryMap}
         placeMap={placeMap}
+        members={members}
+        isFamilyMode={isFamilyMode}
         amountColors={amountColors}
         onEditTransaction={onEditTransaction}
         initialAccountId={selectedAccountId}

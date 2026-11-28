@@ -1,6 +1,6 @@
 import { useSyncExternalStore } from 'react';
 import { isGoogleClientConfigured } from '../config';
-import { db, META_KEYS } from '../db/database';
+import { META_KEYS, personalDb } from '../db/database';
 import { getDeviceId } from '../db/deviceId';
 import { getSyncSchedule, processRecurringRules } from '../db/repository';
 import {
@@ -121,7 +121,7 @@ export function toFriendlySyncError(err: unknown): string {
 }
 
 async function loadInitialLastSyncAt(): Promise<void> {
-  const entry = await db.meta.get(META_KEYS.SYNC_LAST_SYNC_AT);
+  const entry = await personalDb.meta.get(META_KEYS.SYNC_LAST_SYNC_AT);
   if (entry) {
     const num = Number(entry.value);
     if (Number.isFinite(num) && num > 0) {
@@ -157,12 +157,12 @@ async function executeSync(): Promise<boolean> {
   try {
     const driveStore = new FetchDriveStore(getValidAccessTokenSilently);
     const result = await syncOnce({
-      database: db,
+      database: personalDb,
       driveStore,
       deviceId: getDeviceId(),
     });
     lastSyncResult = result;
-    await processRecurringRules();
+    await processRecurringRules(undefined, personalDb);
     setState({
       status: 'synced',
       lastSyncAt: result.lastSyncAt,
@@ -186,8 +186,8 @@ async function executeSync(): Promise<boolean> {
 }
 
 const scheduler = createSyncScheduler({
-  getSchedule: () => getSyncSchedule(db),
-  getOutboxCount: () => db.outbox.count(),
+  getSchedule: () => getSyncSchedule(personalDb),
+  getOutboxCount: () => personalDb.outbox.count(),
   getLastSyncAt: () => state.lastSyncAt,
   runSync: executeSync,
   isVisible: () => typeof document === 'undefined' || document.visibilityState !== 'hidden',
@@ -251,7 +251,7 @@ export function startSyncManager(): void {
  */
 export async function loginAndSync(): Promise<void> {
   await signInWithGoogle();
-  const localTransactions = await db.transactions.toArray();
+  const localTransactions = await personalDb.transactions.toArray();
   const wasNewDevice = isNewDevice(localTransactions);
   lastSyncResult = null;
   const ok = await scheduler.start();
@@ -260,8 +260,8 @@ export async function loginAndSync(): Promise<void> {
     const result: SyncOnceResult = lastSyncResult;
     if (result.appliedTransactionsCount > 0) {
       const [allTransactions, allAccounts] = await Promise.all([
-        db.transactions.toArray(),
-        db.accounts.toArray(),
+        personalDb.transactions.toArray(),
+        personalDb.accounts.toArray(),
       ]);
       setRestorePromptState({
         kind: 'synced-restored',

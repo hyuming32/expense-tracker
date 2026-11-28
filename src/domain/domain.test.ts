@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import type { Account, Category, NotePreset, Place, Transaction } from '../db/types';
+import type { Account, Category, Member, NotePreset, Place, Transaction } from '../db/types';
 import {
   accountBalance,
   categoryBreakdown,
@@ -9,6 +9,7 @@ import {
   findPlaceBySellerId,
   getCurrentTimeString,
   groupByDay,
+  memberBreakdown,
   mergeBackup,
   monthSummary,
   monthlyTrend,
@@ -752,5 +753,55 @@ describe('selectQuickPlaces 與地點輔助函式', () => {
   it('getCurrentTimeString 回傳 HH:mm 格式', () => {
     const dt = new Date(2026, 10, 26, 9, 5);
     expect(getCurrentTimeString(dt)).toBe('09:05');
+  });
+});
+
+describe('memberBreakdown', () => {
+  it('依成員彙總期間支出、使用成員顏色、排除收支轉帳與已刪除，無 memberId 歸到「未標示」', () => {
+    const members: Member[] = [
+      {
+        id: 'mem-a',
+        name: '爸爸',
+        color: '#2563EB',
+        email: 'a@example.com',
+        role: 'owner',
+        removed: false,
+        ...baseMeta,
+      },
+      {
+        id: 'mem-b',
+        name: '媽媽',
+        color: '#E11D48',
+        email: 'b@example.com',
+        role: 'member',
+        removed: true,
+        ...baseMeta,
+      },
+    ];
+
+    const txs: Transaction[] = [
+      makeTx({ id: '1', kind: 'expense', date: '2026-11-05', amount: 600, memberId: 'mem-a' }),
+      makeTx({ id: '2', kind: 'expense', date: '2026-11-08', amount: 300, memberId: 'mem-b' }),
+      makeTx({ id: '3', kind: 'expense', date: '2026-11-10', amount: 100, memberId: null }),
+      makeTx({ id: '4', kind: 'income', date: '2026-11-12', amount: 50000, categoryId: 'cat-salary', memberId: 'mem-a' }),
+      makeTx({
+        id: '5',
+        kind: 'transfer',
+        date: '2026-11-14',
+        amount: 3000,
+        toAccountId: 'acc-bank',
+        categoryId: null,
+        memberId: 'mem-a',
+      }),
+      makeTx({ id: '6', kind: 'expense', date: '2026-11-15', amount: 999, memberId: 'mem-a', deleted: true }),
+      makeTx({ id: '7', kind: 'expense', date: '2026-10-31', amount: 800, memberId: 'mem-a' }),
+    ];
+
+    const range = periodRange('month', '2026-11-01');
+    expect(memberBreakdown(txs, members, range)).toEqual([
+      { memberId: 'mem-a', name: '爸爸', color: '#2563EB', amount: 600, percentage: 60 },
+      { memberId: 'mem-b', name: '媽媽', color: '#E11D48', amount: 300, percentage: 30 },
+      { memberId: 'unassigned', name: '未標示', color: '#94a3b8', amount: 100, percentage: 10 },
+    ]);
   });
 });

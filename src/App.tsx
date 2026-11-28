@@ -11,6 +11,8 @@ import { type ShortcutDraft, ShortcutSheet } from './components/ShortcutSheet';
 import { type TransactionDraft, TransactionSheet } from './components/TransactionSheet';
 import { PrivacyProvider, useMoney } from './contexts/PrivacyContext';
 import { ensureSeeded } from './db/database';
+import { getActiveLedger, getFamilyConfig, isFamilyReadOnly } from './family/familyConfig';
+import { startFamilySync, useFamilySyncState } from './family/familyManager';
 import {
   markOnboardingCompleted,
   processRecurringRules,
@@ -40,6 +42,8 @@ import {
   useLastUsedMeta,
   useLotteryDraws,
   useMainCurrency,
+  useMemberBudgets,
+  useMembers,
   useNoSpendDays,
   useNotePresets,
   useOnboardingMetaState,
@@ -81,6 +85,7 @@ export function App() {
   const [shortcutDraft, setShortcutDraft] = useState<ShortcutDraft | null>(null);
   const [lastSavedTx, setLastSavedTx] = useState<Transaction | null>(null);
   const [quickToast, setQuickToast] = useState<{ tx: Transaction; label: string } | null>(null);
+  const [readOnlyNotice, setReadOnlyNotice] = useState<string | null>(null);
   const [persistedStatus, setPersistedStatus] = useState<boolean | null>(null);
   const [deferredInstallPrompt, setDeferredInstallPrompt] = useState<BeforeInstallPromptEvent | null>(
     null,
@@ -112,6 +117,8 @@ export function App() {
   const places = usePlaces();
   const lotteryDraws = useLotteryDraws();
   const budgets = useBudgets();
+  const memberBudgets = useMemberBudgets();
+  const members = useMembers();
   const cards = useCards();
   const currencies = useCurrencies();
   const mainCurrency = useMainCurrency(currencies);
@@ -122,10 +129,16 @@ export function App() {
   const autoSelectLastPlace = useAutoSelectLastPlace();
   const onboardingMeta = useOnboardingMetaState();
   const syncState = useSyncState();
+  const familySyncState = useFamilySyncState();
   const restorePrompt = useRestorePrompt();
   const [isLocked, setIsLocked] = useState(false);
   const initialLockCheckedRef = useRef(false);
   const hiddenAtRef = useRef<number | null>(null);
+
+  const familyConfig = getFamilyConfig();
+  const isFamilyMode = getActiveLedger() === 'family' && Boolean(familyConfig);
+  const isReadOnly =
+    isFamilyMode && (isFamilyReadOnly() || familySyncState.status === 'removed');
 
   const installPlatform = useMemo(() => {
     if (typeof navigator === 'undefined') {
@@ -173,7 +186,11 @@ export function App() {
       await processRecurringRules();
       lastActiveDateRef.current = getTodayDateString();
       setReady(true);
-      startSyncManager();
+      if (getActiveLedger() === 'family') {
+        startFamilySync();
+      } else {
+        startSyncManager();
+      }
     });
   }, []);
 
@@ -245,12 +262,30 @@ export function App() {
     return () => window.clearTimeout(timer);
   }, [quickToast]);
 
+  useEffect(() => {
+    if (!readOnlyNotice) {
+      return;
+    }
+    const timer = window.setTimeout(() => {
+      setReadOnlyNotice(null);
+    }, 4000);
+    return () => window.clearTimeout(timer);
+  }, [readOnlyNotice]);
+
   const accountMap = useMemo(() => new Map(allAccounts.map((a) => [a.id, a])), [allAccounts]);
   const categoryMap = useMemo(() => new Map(categories.map((c) => [c.id, c])), [categories]);
   const placeMap = useMemo(() => new Map(places.map((p) => [p.id, p])), [places]);
   const recentTags = useMemo(() => collectRecentTags(transactions, 8), [transactions]);
 
+  function showReadOnlyAlert() {
+    setReadOnlyNotice('已被移出家庭帳本（唯讀）');
+  }
+
   function handleOpenCreate(draft?: TransactionDraft) {
+    if (isReadOnly) {
+      showReadOnlyAlert();
+      return;
+    }
     setEditingTx(null);
     setTxDraft(draft ?? null);
     setSheetOpen(true);
@@ -276,12 +311,20 @@ export function App() {
   }
 
   async function handleQuickRecordShortcut(shortcut: Shortcut) {
+    if (isReadOnly) {
+      showReadOnlyAlert();
+      return;
+    }
     const saved = await recordShortcutTransaction(shortcut);
     setLastSavedTx(null);
     setQuickToast({ tx: saved, label: shortcut.label });
   }
 
   async function handleQuickRecordText(parsed: QuickTextResult) {
+    if (isReadOnly) {
+      showReadOnlyAlert();
+      return;
+    }
     const saved = await recordQuickTextTransaction(parsed);
     setLastSavedTx(null);
     const categoryName =
@@ -434,6 +477,10 @@ export function App() {
                   cards={cards}
                   lotteryDraws={lotteryDraws}
                   budgets={budgets}
+                  memberBudgets={memberBudgets}
+                  members={members}
+                  isFamilyMode={isFamilyMode}
+                  isReadOnly={isReadOnly}
                   noSpendDays={noSpendDays}
                   homeLayout={homeLayout}
                   accounts={activeAccounts}
@@ -469,6 +516,8 @@ export function App() {
                   accounts={allAccounts}
                   categories={categories}
                   places={places}
+                  members={members}
+                  isFamilyMode={isFamilyMode}
                   accountMap={accountMap}
                   categoryMap={categoryMap}
                   placeMap={placeMap}
@@ -485,6 +534,8 @@ export function App() {
                   categories={categories}
                   places={places}
                   budgets={budgets}
+                  members={members}
+                  isFamilyMode={isFamilyMode}
                   amountColors={amountColors}
                 />
               }
@@ -497,6 +548,8 @@ export function App() {
                   allAccounts={allAccounts}
                   categories={categories}
                   places={places}
+                  members={members}
+                  isFamilyMode={isFamilyMode}
                   transactions={transactions}
                   accountMap={accountMap}
                   categoryMap={categoryMap}
@@ -530,6 +583,8 @@ export function App() {
                   accountMap={accountMap}
                   categoryMap={categoryMap}
                   placeMap={placeMap}
+                  members={members}
+                  isFamilyMode={isFamilyMode}
                   amountColors={amountColors}
                   onOpenCreate={handleOpenCreate}
                   onEditTransaction={handleEditTransaction}
@@ -544,6 +599,9 @@ export function App() {
                   categories={categories}
                   places={places}
                   budgets={budgets}
+                  memberBudgets={memberBudgets}
+                  members={members}
+                  isFamilyMode={isFamilyMode}
                   currencies={currencies}
                   mainCurrency={mainCurrency}
                   autoSelectLastPlace={autoSelectLastPlace}
@@ -601,13 +659,15 @@ export function App() {
               >
                 ⭐ 存成捷徑
               </button>
-              <button
-                type="button"
-                onClick={() => handleMakeMonthlyFromTx(lastSavedTx)}
-                className="rounded-lg bg-emerald-600 px-2.5 py-1 font-medium text-white hover:bg-emerald-500"
-              >
-                🔁 設為每月重複
-              </button>
+              {!lastSavedTx.installmentId && (
+                <button
+                  type="button"
+                  onClick={() => handleMakeMonthlyFromTx(lastSavedTx)}
+                  className="rounded-lg bg-emerald-600 px-2.5 py-1 font-medium text-white hover:bg-emerald-500"
+                >
+                  🔁 設為每月重複
+                </button>
+              )}
               <button
                 type="button"
                 onClick={() => setLastSavedTx(null)}
@@ -620,12 +680,30 @@ export function App() {
           </div>
         )}
 
+        {readOnlyNotice && (
+          <div
+            role="alert"
+            className="fixed bottom-20 left-1/2 z-30 flex w-[calc(100%-2rem)] max-w-[688px] -translate-x-1/2 items-center justify-between gap-2 rounded-xl border border-amber-300 bg-amber-50 px-3.5 py-2.5 text-xs font-semibold text-amber-900 shadow-lg dark:border-amber-700 dark:bg-amber-950/90 dark:text-amber-100"
+          >
+            <span>{readOnlyNotice}</span>
+            <button
+              type="button"
+              onClick={() => setReadOnlyNotice(null)}
+              aria-label="關閉提示"
+              className="rounded px-1.5 py-1 text-amber-700 hover:bg-amber-100 dark:text-amber-300 dark:hover:bg-amber-900"
+            >
+              ✕
+            </button>
+          </div>
+        )}
+
         <BottomNav />
 
         <TransactionSheet
           open={sheetOpen}
           editingTransaction={editingTx}
           initialDraft={txDraft}
+          transactions={transactions}
           accounts={activeAccounts}
           categories={categories}
           places={places}
@@ -636,6 +714,9 @@ export function App() {
           lastUsed={lastUsed}
           amountColors={amountColors}
           notePresets={notePresets}
+          isFamilyMode={isFamilyMode}
+          readOnly={isReadOnly}
+          members={members}
           onClose={handleCloseSheet}
           onSaved={handleTransactionSaved}
         />

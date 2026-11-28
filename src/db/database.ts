@@ -1,4 +1,5 @@
-import Dexie, { type EntityTable, type Table } from 'dexie';
+import Dexie, { type DexieOptions, type EntityTable, type Table } from 'dexie';
+import { getActiveLedger } from '../family/familyConfig';
 import { getDeviceId } from './deviceId';
 import type {
   Account,
@@ -6,6 +7,7 @@ import type {
   Category,
   CurrencyRate,
   LotteryDraw,
+  Member,
   MetaEntry,
   NoSpendDay,
   NotePreset,
@@ -16,6 +18,9 @@ import type {
   Transaction,
   WalletCard,
 } from './types';
+
+export const PERSONAL_DB_NAME = 'expense-tracker-db';
+export const FAMILY_DB_NAME = 'expense-tracker-family-db';
 
 export const META_KEYS = {
   DEVICE_ID: 'deviceId',
@@ -34,6 +39,7 @@ export const META_KEYS = {
   SYNC_LAST_SYNC_AT: 'lastSyncAt',
   SYNC_SEEN_PREFIX: 'seen.',
   SYNC_SCHEDULE: 'sync.schedule',
+  FAMILY_LAST_SYNC_AT: 'family.lastSyncAt',
   DRIVE_BACKUP_FOLDER_ID: 'driveBackup.folderId',
   DRIVE_BACKUP_LAST_AT: 'driveBackup.lastAt',
   UI_ONBOARDING_COMPLETED: 'ui.onboardingCompleted',
@@ -99,11 +105,12 @@ export class ExpenseDatabase extends Dexie {
   noSpendDays!: EntityTable<NoSpendDay, 'id'>;
   cards!: EntityTable<WalletCard, 'id'>;
   currencies!: EntityTable<CurrencyRate, 'id'>;
+  members!: EntityTable<Member, 'id'>;
   meta!: Table<MetaEntry, string>;
   outbox!: Table<OutboxEntry, string>;
 
-  constructor(name = 'expense-tracker-db') {
-    super(name);
+  constructor(name = PERSONAL_DB_NAME, options?: DexieOptions) {
+    super(name, options);
     this.version(1).stores({
       accounts: 'id, updatedAt, deleted, sortOrder',
       categories: 'id, kind, parentId, updatedAt, deleted, sortOrder',
@@ -419,10 +426,48 @@ export class ExpenseDatabase extends Dexie {
       meta: 'key',
       outbox: 'key, table, recordId, updatedAt',
     });
+    this.version(14).stores({
+      accounts: 'id, updatedAt, deleted, sortOrder',
+      categories: 'id, kind, parentId, updatedAt, deleted, sortOrder',
+      transactions:
+        'id, kind, date, accountId, toAccountId, categoryId, placeId, invoiceNo, recurringId, occurrenceDate, installmentId, updatedAt, deleted',
+      notePresets: 'id, categoryId, useCount, lastUsedAt, sortOrder, updatedAt, deleted',
+      recurringRules: 'id, frequency, paused, startDate, endDate, updatedAt, deleted',
+      shortcuts: 'id, sortOrder, updatedAt, deleted',
+      places: 'id, useCount, lastUsedAt, sortOrder, archived, updatedAt, deleted',
+      lotteryDraws: 'id, period, updatedAt, deleted',
+      budgets: 'id, categoryId, updatedAt, deleted',
+      noSpendDays: 'id, date, updatedAt, deleted',
+      cards: 'id, type, sortOrder, lastUsedAt, updatedAt, deleted',
+      currencies: 'id, code, isMain, sortOrder, archived, updatedAt, deleted',
+      meta: 'key',
+      outbox: 'key, table, recordId, updatedAt',
+    });
+    this.version(15).stores({
+      accounts: 'id, updatedAt, deleted, sortOrder',
+      categories: 'id, kind, parentId, updatedAt, deleted, sortOrder',
+      transactions:
+        'id, kind, date, accountId, toAccountId, categoryId, placeId, invoiceNo, recurringId, occurrenceDate, installmentId, memberId, updatedAt, deleted',
+      notePresets: 'id, categoryId, useCount, lastUsedAt, sortOrder, updatedAt, deleted',
+      recurringRules: 'id, frequency, paused, startDate, endDate, updatedAt, deleted',
+      shortcuts: 'id, sortOrder, updatedAt, deleted',
+      places: 'id, useCount, lastUsedAt, sortOrder, archived, updatedAt, deleted',
+      lotteryDraws: 'id, period, updatedAt, deleted',
+      budgets: 'id, categoryId, updatedAt, deleted',
+      noSpendDays: 'id, date, updatedAt, deleted',
+      cards: 'id, type, sortOrder, lastUsedAt, updatedAt, deleted',
+      currencies: 'id, code, isMain, sortOrder, archived, updatedAt, deleted',
+      members: 'id, updatedAt, deleted',
+      meta: 'key',
+      outbox: 'key, table, recordId, updatedAt',
+    });
   }
 }
 
-export const db = new ExpenseDatabase();
+export const personalDb = new ExpenseDatabase(PERSONAL_DB_NAME);
+
+export const db: ExpenseDatabase =
+  getActiveLedger() === 'family' ? new ExpenseDatabase(FAMILY_DB_NAME) : personalDb;
 
 const seedPromises = new WeakMap<ExpenseDatabase, Promise<void>>();
 

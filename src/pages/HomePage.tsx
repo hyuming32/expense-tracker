@@ -22,6 +22,7 @@ import type {
   Budget,
   Category,
   LotteryDraw,
+  Member,
   NoSpendDay,
   NotePreset,
   Place,
@@ -32,6 +33,7 @@ import type {
 import {
   collectActiveDays,
   computeBudgetStatus,
+  computeMemberBudgetUsage,
   computeStreak,
   findFirstRecordDay,
   findMissingDays,
@@ -49,6 +51,17 @@ import {
   shiftDate,
 } from '../domain';
 import { getHomeReminderCard, type InstallPlatform } from '../domain/onboarding';
+import {
+  getActiveLedger,
+  getFamilyConfig,
+  isFamilyReadOnly,
+  setActiveLedger,
+} from '../family/familyConfig';
+import {
+  type FamilySyncState,
+  triggerFamilySync,
+  useFamilySyncState,
+} from '../family/familyManager';
 import { useOutboxCount } from '../hooks/useExpenseData';
 import {
   formatSyncStatusText,
@@ -65,6 +78,10 @@ interface HomePageProps {
   cards: readonly WalletCard[];
   lotteryDraws: readonly LotteryDraw[];
   budgets: readonly Budget[];
+  memberBudgets?: readonly Budget[];
+  members?: readonly Member[];
+  isFamilyMode?: boolean;
+  isReadOnly?: boolean;
   noSpendDays: readonly NoSpendDay[];
   homeLayout: readonly HomeLayoutItem<HomeSectionKey>[];
   accounts: readonly Account[];
@@ -91,12 +108,39 @@ interface HomePageProps {
   onEditShortcut: (shortcut: Shortcut) => void;
 }
 
+function formatFamilySyncBannerText(syncState: FamilySyncState): string {
+  switch (syncState.status) {
+    case 'idle':
+      return syncState.lastSyncAt
+        ? `已同步 · ${formatSyncTimeLabel(syncState.lastSyncAt)}`
+        : '同步準備中…';
+    case 'syncing':
+      return '同步中…';
+    case 'synced':
+      return syncState.lastSyncAt
+        ? `已同步 · ${formatSyncTimeLabel(syncState.lastSyncAt)}`
+        : '已同步';
+    case 'offline':
+      return '離線，恢復網路後自動同步';
+    case 'reauth':
+      return '需要重新授權';
+    case 'error':
+      return syncState.errorMessage ? `同步失敗：${syncState.errorMessage}` : '同步失敗';
+    case 'removed':
+      return '已被移出家庭帳本（唯讀）';
+  }
+}
+
 export function HomePage({
   transactions,
   shortcuts,
   cards,
   lotteryDraws,
   budgets,
+  memberBudgets = [],
+  members = [],
+  isFamilyMode = false,
+  isReadOnly = false,
   noSpendDays,
   homeLayout,
   accounts,
@@ -146,6 +190,11 @@ export function HomePage({
 
   const formatMoney = useMoney();
   const { hideAmounts, toggleHideAmounts } = usePrivacy();
+  const familyConfig = getFamilyConfig();
+  const activeLedger = getActiveLedger();
+  const familySyncState = useFamilySyncState();
+  const effectiveReadOnly = isReadOnly || (isFamilyMode && (isFamilyReadOnly() || familySyncState.status === 'removed'));
+  const memberMap = useMemo(() => new Map(members.map((m) => [m.id, m])), [members]);
   const currentMonth = getCurrentMonthString();
   const today = getTodayDateString();
   const summary = useMemo(() => monthSummary(transactions, currentMonth), [transactions, currentMonth]);
@@ -153,6 +202,18 @@ export function HomePage({
     () => computeBudgetStatus(budgets, transactions, categories, today),
     [budgets, transactions, categories, today],
   );
+  const myBudgetUsage = useMemo(() => {
+    if (!isFamilyMode || !familyConfig?.memberId) {
+      return null;
+    }
+    const myBudget = memberBudgets.find(
+      (b) => !b.deleted && b.memberId === familyConfig.memberId && b.amount > 0,
+    );
+    if (!myBudget) {
+      return null;
+    }
+    return computeMemberBudgetUsage(transactions, familyConfig.memberId, currentMonth, myBudget.amount);
+  }, [isFamilyMode, familyConfig?.memberId, memberBudgets, transactions, currentMonth]);
   const topBudgetCategories = useMemo(
     () => budgetStatus.categories.slice(0, 3),
     [budgetStatus.categories],
@@ -198,7 +259,7 @@ export function HomePage({
     }
     return getHomeReminderCard({
       dataProtection: {
-        isSyncEnabled: syncState.status !== 'disabled',
+        isSyncEnabled: isFamilyMode || syncState.status !== 'disabled',
         isPersisted,
         transactionCount: transactions.length,
         lastJsonBackupAt: onboardingMeta.lastJsonBackupAt,
@@ -212,7 +273,7 @@ export function HomePage({
         now: Date.now(),
       },
     });
-  }, [onboardingMeta, syncState.status, isPersisted, transactions.length, isInstalled]);
+  }, [onboardingMeta, isFamilyMode, syncState.status, isPersisted, transactions.length, isInstalled]);
 
   const parsedQuickText = useMemo(() => {
     const trimmed = quickText.trim();
@@ -255,6 +316,10 @@ export function HomePage({
     if (!parsedQuickText || submittingQuickText) {
       return;
     }
+    if (effectiveReadOnly) {
+      onOpenCreate(buildDraftFromParsed(parsedQuickText));
+      return;
+    }
     if (parsedQuickText.amount !== null && parsedQuickText.amount > 0) {
       setSubmittingQuickText(true);
       try {
@@ -277,6 +342,9 @@ export function HomePage({
   function renderHomeSection(sectionKey: HomeSectionKey) {
     switch (sectionKey) {
       case 'syncStatus':
+        if (isFamilyMode) {
+          return null;
+        }
         return (
           <div className="space-y-2">
             <div className="flex items-center justify-end px-1">
@@ -572,7 +640,7 @@ export function HomePage({
         );
 
       case 'budget':
-        return !budgetStatus.total && topBudgetCategories.length === 0 ? (
+        return !budgetStatus.total && topBudgetCategories.length === 0 && !myBudgetUsage ? (
         <Link
           to="/settings?section=budget"
           className="flex items-center justify-between rounded-2xl border border-slate-200 bg-white px-4 py-3 text-xs font-medium text-slate-600 transition-colors hover:border-emerald-300 hover:text-emerald-700 dark:border-slate-800 dark:bg-slate-900 dark:text-slate-300 dark:hover:border-emerald-700 dark:hover:text-emerald-300"
@@ -644,6 +712,46 @@ export function HomePage({
                   {formatMoney(budgetStatus.total.budget)}
                 </span>
                 <span>剩餘 {budgetStatus.daysLeft} 天</span>
+              </div>
+            </div>
+          )}
+
+          {myBudgetUsage && (
+            <div
+              className={
+                budgetStatus.total
+                  ? 'mt-3 border-t border-slate-100 pt-2.5 dark:border-slate-800'
+                  : ''
+              }
+            >
+              <div className="flex items-center justify-between gap-2 text-xs">
+                <span className="font-medium text-slate-700 tabular-nums dark:text-slate-200">
+                  我的預算：已用 {formatMoney(myBudgetUsage.spent)} /{' '}
+                  {formatMoney(myBudgetUsage.budget)}
+                </span>
+                {myBudgetUsage.status !== 'normal' && (
+                  <span
+                    className={`shrink-0 rounded-full px-2 py-0.5 text-[10px] font-semibold ${
+                      myBudgetUsage.status === 'over'
+                        ? 'bg-red-100 text-red-700 dark:bg-red-950/60 dark:text-red-300'
+                        : 'bg-amber-100 text-amber-800 dark:bg-amber-950/60 dark:text-amber-300'
+                    }`}
+                  >
+                    {myBudgetUsage.statusLabel}
+                  </span>
+                )}
+              </div>
+              <div className="mt-1.5 h-1.5 w-full overflow-hidden rounded-full bg-slate-100 dark:bg-slate-800">
+                <div
+                  className={`h-full rounded-full ${
+                    myBudgetUsage.status === 'over'
+                      ? 'bg-red-500'
+                      : myBudgetUsage.status === 'warning'
+                        ? 'bg-amber-500'
+                        : 'bg-emerald-500'
+                  }`}
+                  style={{ width: `${Math.min(100, Math.round(myBudgetUsage.ratio * 100))}%` }}
+                />
               </div>
             </div>
           )}
@@ -822,6 +930,8 @@ export function HomePage({
                 accountMap={accountMap}
                 categoryMap={categoryMap}
                 placeMap={placeMap}
+                memberMap={isFamilyMode ? memberMap : undefined}
+                isFamilyMode={isFamilyMode}
                 amountColors={amountColors}
                 onSelect={onEditTransaction}
                 showDate
@@ -889,32 +999,105 @@ export function HomePage({
 
   return (
     <div className="space-y-4 pb-40">
-      {/* 頂部快速操作列：出示條碼與隱藏金額 */}
-      <div className="flex items-center justify-end gap-2 px-1">
-        <button
-          type="button"
-          onClick={() => openShowCard(cards[0]?.id ?? null)}
-          className="inline-flex items-center gap-1 rounded-full border border-slate-200 bg-white px-2.5 py-1 text-xs font-medium text-slate-700 transition-colors hover:border-emerald-400 hover:bg-emerald-50 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-200 dark:hover:border-emerald-500 dark:hover:bg-slate-800"
-        >
-          <span aria-hidden="true">💳</span>
-          <span>出示條碼</span>
-        </button>
-        <button
-          type="button"
-          onClick={toggleHideAmounts}
-          aria-label={hideAmounts ? '顯示金額' : '隱藏金額'}
-          aria-pressed={hideAmounts}
-          title={hideAmounts ? '目前隱藏金額，點擊顯示' : '點擊隱藏所有金額'}
-          className={`inline-flex items-center gap-1 rounded-full border px-2.5 py-1 text-xs font-medium transition-colors ${
-            hideAmounts
-              ? 'border-emerald-300 bg-emerald-50 text-emerald-800 dark:border-emerald-700 dark:bg-emerald-950/50 dark:text-emerald-200'
-              : 'border-slate-200 bg-white text-slate-600 hover:bg-slate-100 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-300 dark:hover:bg-slate-800'
-          }`}
-        >
-          <span aria-hidden="true">👁</span>
-          <span>{hideAmounts ? '已隱藏金額' : '隱藏金額'}</span>
-        </button>
+      {/* 頂部快速操作列：帳本切換、出示條碼與隱藏金額 */}
+      <div className="flex flex-wrap items-center justify-between gap-2 px-1">
+        {familyConfig ? (
+          <div
+            role="group"
+            aria-label="帳本切換"
+            className="inline-flex items-center rounded-full border border-slate-200 bg-white p-0.5 text-xs font-medium dark:border-slate-700 dark:bg-slate-900"
+          >
+            <button
+              type="button"
+              onClick={() => {
+                if (activeLedger !== 'personal') {
+                  setActiveLedger('personal');
+                  window.location.reload();
+                }
+              }}
+              className={`rounded-full px-3 py-1 transition-colors ${
+                activeLedger === 'personal'
+                  ? 'bg-slate-900 text-white dark:bg-slate-100 dark:text-slate-900'
+                  : 'text-slate-600 hover:text-slate-900 dark:text-slate-300 dark:hover:text-white'
+              }`}
+            >
+              個人
+            </button>
+            <button
+              type="button"
+              onClick={() => {
+                if (activeLedger !== 'family') {
+                  setActiveLedger('family');
+                  window.location.reload();
+                }
+              }}
+              className={`max-w-[140px] truncate rounded-full px-3 py-1 transition-colors ${
+                activeLedger === 'family'
+                  ? 'bg-emerald-600 text-white dark:bg-emerald-500'
+                  : 'text-slate-600 hover:text-slate-900 dark:text-slate-300 dark:hover:text-white'
+              }`}
+            >
+              {familyConfig.ledgerName}
+            </button>
+          </div>
+        ) : (
+          <div />
+        )}
+
+        <div className="flex items-center gap-2">
+          <button
+            type="button"
+            onClick={() => openShowCard(cards[0]?.id ?? null)}
+            className="inline-flex items-center gap-1 rounded-full border border-slate-200 bg-white px-2.5 py-1 text-xs font-medium text-slate-700 transition-colors hover:border-emerald-400 hover:bg-emerald-50 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-200 dark:hover:border-emerald-500 dark:hover:bg-slate-800"
+          >
+            <span aria-hidden="true">💳</span>
+            <span>出示條碼</span>
+          </button>
+          <button
+            type="button"
+            onClick={toggleHideAmounts}
+            aria-label={hideAmounts ? '顯示金額' : '隱藏金額'}
+            aria-pressed={hideAmounts}
+            title={hideAmounts ? '目前隱藏金額，點擊顯示' : '點擊隱藏所有金額'}
+            className={`inline-flex items-center gap-1 rounded-full border px-2.5 py-1 text-xs font-medium transition-colors ${
+              hideAmounts
+                ? 'border-emerald-300 bg-emerald-50 text-emerald-800 dark:border-emerald-700 dark:bg-emerald-950/50 dark:text-emerald-200'
+                : 'border-slate-200 bg-white text-slate-600 hover:bg-slate-100 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-300 dark:hover:bg-slate-800'
+            }`}
+          >
+            <span aria-hidden="true">👁</span>
+            <span>{hideAmounts ? '已隱藏金額' : '隱藏金額'}</span>
+          </button>
+        </div>
       </div>
+
+      {isFamilyMode && (
+        <div className="space-y-2 px-1">
+          {effectiveReadOnly && (
+            <div
+              role="alert"
+              className="rounded-2xl border border-amber-300 bg-amber-50 px-4 py-2.5 text-xs font-semibold text-amber-900 dark:border-amber-700 dark:bg-amber-950/50 dark:text-amber-200"
+            >
+              已被移出家庭帳本（唯讀）
+            </div>
+          )}
+          <div className="flex items-center justify-end gap-2">
+            <span className="text-xs text-slate-500 dark:text-slate-400">
+              {formatFamilySyncBannerText(familySyncState)}
+            </span>
+            {!effectiveReadOnly &&
+              (familySyncState.status === 'reauth' || familySyncState.status === 'error') && (
+                <button
+                  type="button"
+                  onClick={() => void triggerFamilySync({ interactive: true })}
+                  className="rounded-lg bg-amber-600 px-2 py-0.5 text-[11px] font-medium text-white hover:bg-amber-700"
+                >
+                  {familySyncState.status === 'reauth' ? '重新授權' : '重試'}
+                </button>
+              )}
+          </div>
+        </div>
+      )}
 
       {homeLayout
         .filter((item) => item.visible && item.key !== 'shortcuts')

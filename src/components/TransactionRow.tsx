@@ -1,6 +1,6 @@
 import { useMoney, usePrivacy } from '../contexts/PrivacyContext';
 import type { AmountColors } from '../db/repository';
-import type { Account, Category, Place, Transaction } from '../db/types';
+import type { Account, Category, Member, Place, Transaction } from '../db/types';
 import { formatMoney as formatForeignMoney, getHiddenAmountText } from '../domain';
 
 interface TransactionRowProps {
@@ -8,6 +8,8 @@ interface TransactionRowProps {
   categoryMap: ReadonlyMap<string, Category>;
   accountMap: ReadonlyMap<string, Account>;
   placeMap?: ReadonlyMap<string, Place>;
+  memberMap?: ReadonlyMap<string, Member>;
+  isFamilyMode?: boolean;
   amountColors: AmountColors;
   onSelect: (tx: Transaction) => void;
   showDate?: boolean;
@@ -18,6 +20,8 @@ export function TransactionRow({
   categoryMap,
   accountMap,
   placeMap,
+  memberMap,
+  isFamilyMode = false,
   amountColors,
   onSelect,
   showDate = false,
@@ -55,6 +59,16 @@ export function TransactionRow({
     subtitleParts.push(transaction.note);
   }
   const tags = transaction.tags ?? [];
+  const isInstallment = Boolean(
+    transaction.installmentId && transaction.installmentIndex && transaction.installmentCount,
+  );
+  const member =
+    isFamilyMode && transaction.memberId ? memberMap?.get(transaction.memberId) : undefined;
+  const memberShortName = member
+    ? Array.from(member.name.trim()).slice(0, 2).join('')
+    : isFamilyMode && transaction.memberId
+      ? '家人'
+      : null;
 
   return (
     <button
@@ -78,10 +92,15 @@ export function TransactionRow({
               </span>
             )}
           </div>
-          {(subtitleParts.length > 0 || tags.length > 0) && (
+          {(subtitleParts.length > 0 || tags.length > 0 || isInstallment) && (
             <div className="flex items-center gap-1.5 truncate text-xs text-slate-500 dark:text-slate-400">
               {subtitleParts.length > 0 && (
                 <span className="truncate">{subtitleParts.join(' · ')}</span>
+              )}
+              {isInstallment && (
+                <span className="shrink-0 rounded bg-amber-50 px-1.5 py-0.5 text-[11px] font-medium text-amber-700 dark:bg-amber-950/60 dark:text-amber-300">
+                  分期 {transaction.installmentIndex}/{transaction.installmentCount}
+                </span>
               )}
               {tags.length > 0 && (
                 <span className="shrink-0 text-[11px] text-emerald-600 dark:text-emerald-400">
@@ -113,6 +132,16 @@ export function TransactionRow({
             {hideAmounts
               ? getHiddenAmountText(transaction.currency)
               : formatForeignMoney(transaction.originalAmount, transaction.currency)}
+          </div>
+        )}
+        {memberShortName && (
+          <div className="mt-0.5 flex items-center justify-end gap-1 text-[11px] text-slate-500 dark:text-slate-400">
+            <span
+              className="h-2 w-2 shrink-0 rounded-full"
+              style={{ backgroundColor: member?.color ?? '#94a3b8' }}
+              aria-hidden="true"
+            />
+            <span>{memberShortName}</span>
           </div>
         )}
       </div>

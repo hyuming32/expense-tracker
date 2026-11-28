@@ -1,5 +1,5 @@
 import type { EntityTable, IDType } from 'dexie';
-import { db, type ExpenseDatabase, META_KEYS } from '../db/database';
+import { type ExpenseDatabase, META_KEYS, personalDb } from '../db/database';
 import type {
   Account,
   BaseRecord,
@@ -7,6 +7,7 @@ import type {
   Category,
   CurrencyRate,
   LotteryDraw,
+  Member,
   NoSpendDay,
   NotePreset,
   OutboxEntry,
@@ -36,6 +37,7 @@ export interface SyncRecordsPayload {
   noSpendDays?: NoSpendDay[];
   cards?: WalletCard[];
   currencies?: CurrencyRate[];
+  members?: Member[];
 }
 
 export interface ChangeBatchFile {
@@ -96,7 +98,10 @@ async function readMetaNumber(database: ExpenseDatabase, key: string): Promise<n
   return Number.isFinite(num) ? num : 0;
 }
 
-async function mergeTableRecords<T extends BaseRecord>(
+/**
+ * 合併單張資料表的遠端紀錄：僅在遠端版本勝出時寫入本機，並回傳實際寫入的紀錄。
+ */
+export async function mergeTableRecords<T extends BaseRecord>(
   table: EntityTable<T, 'id'>,
   incoming: readonly T[],
 ): Promise<T[]> {
@@ -151,6 +156,7 @@ async function applyRemoteRecords(
       database.noSpendDays,
       database.cards,
       database.currencies,
+      database.members,
       database.meta,
     ],
     async () => {
@@ -167,6 +173,7 @@ async function applyRemoteRecords(
         appliedNoSpendDays,
         appliedCards,
         appliedCurrencies,
+        appliedMembers,
       ] = await Promise.all([
         mergeTableRecords(database.accounts, records.accounts),
         mergeTableRecords(database.categories, records.categories),
@@ -180,6 +187,7 @@ async function applyRemoteRecords(
         mergeTableRecords(database.noSpendDays, records.noSpendDays ?? []),
         mergeTableRecords(database.cards, records.cards ?? []),
         mergeTableRecords(database.currencies, records.currencies ?? []),
+        mergeTableRecords(database.members, records.members ?? []),
       ]);
 
       for (const item of seenUpdates) {
@@ -202,7 +210,8 @@ async function applyRemoteRecords(
         appliedBudgets.length +
         appliedNoSpendDays.length +
         appliedCards.length +
-        appliedCurrencies.length;
+        appliedCurrencies.length +
+        appliedMembers.length;
 
       return { appliedCount, appliedTransactions };
     },
@@ -225,6 +234,7 @@ async function buildOutboxRecords(
   const noSpendDayIds: string[] = [];
   const cardIds: string[] = [];
   const currencyIds: string[] = [];
+  const memberIds: string[] = [];
 
   for (const entry of entries) {
     if (entry.table === 'accounts') {
@@ -249,6 +259,8 @@ async function buildOutboxRecords(
       cardIds.push(entry.recordId);
     } else if (entry.table === 'currencies') {
       currencyIds.push(entry.recordId);
+    } else if (entry.table === 'members') {
+      memberIds.push(entry.recordId);
     } else {
       transactionIds.push(entry.recordId);
     }
@@ -267,6 +279,7 @@ async function buildOutboxRecords(
     noSpendDaysRaw,
     cardsRaw,
     currenciesRaw,
+    membersRaw,
   ] = await Promise.all([
     accountIds.length > 0
       ? database.accounts.bulkGet(accountIds)
@@ -304,6 +317,9 @@ async function buildOutboxRecords(
     currencyIds.length > 0
       ? database.currencies.bulkGet(currencyIds)
       : Promise.resolve<Array<CurrencyRate | undefined>>([]),
+    memberIds.length > 0
+      ? database.members.bulkGet(memberIds)
+      : Promise.resolve<Array<Member | undefined>>([]),
   ]);
 
   const accounts: Account[] = [];
@@ -378,6 +394,12 @@ async function buildOutboxRecords(
       currencies.push(item);
     }
   }
+  const members: Member[] = [];
+  for (const item of membersRaw) {
+    if (item) {
+      members.push(item);
+    }
+  }
 
   return {
     accounts,
@@ -392,6 +414,7 @@ async function buildOutboxRecords(
     noSpendDays,
     cards,
     currencies,
+    members,
   };
 }
 
@@ -399,7 +422,7 @@ async function buildOutboxRecords(
  * 執行一次完整雙向同步流程（上傳 outbox、套用快照與他裝置變更、必要時壓縮快照）。
  */
 export async function syncOnce(options: SyncOnceOptions): Promise<SyncOnceResult> {
-  const database = options.database ?? db;
+  const database = options.database ?? personalDb;
   const { driveStore, deviceId } = options;
   const snapshotThreshold = options.snapshotThreshold ?? DEFAULT_SNAPSHOT_THRESHOLD;
 
@@ -510,6 +533,7 @@ export async function syncOnce(options: SyncOnceOptions): Promise<SyncOnceResult
       noSpendDays,
       cards,
       currencies,
+      members,
       allMeta,
     ] = await Promise.all([
       database.accounts.toArray(),
@@ -524,6 +548,7 @@ export async function syncOnce(options: SyncOnceOptions): Promise<SyncOnceResult
       database.noSpendDays.toArray(),
       database.cards.toArray(),
       database.currencies.toArray(),
+      database.members.toArray(),
       database.meta.toArray(),
     ]);
 
@@ -559,6 +584,7 @@ export async function syncOnce(options: SyncOnceOptions): Promise<SyncOnceResult
         noSpendDays,
         cards,
         currencies,
+        members,
       },
     };
     const snapshotJson = JSON.stringify(snapshot);

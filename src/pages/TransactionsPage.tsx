@@ -3,7 +3,7 @@ import { Link } from 'react-router-dom';
 import { useMoney } from '../contexts/PrivacyContext';
 import { TransactionRow } from '../components/TransactionRow';
 import type { AmountColors } from '../db/repository';
-import type { Account, Category, Place, Transaction, TransactionKind } from '../db/types';
+import type { Account, Category, Member, Place, Transaction, TransactionKind } from '../db/types';
 import {
   collectRecentTags,
   filterTransactions,
@@ -25,6 +25,8 @@ interface TransactionsPageProps {
   accountMap: ReadonlyMap<string, Account>;
   categoryMap: ReadonlyMap<string, Category>;
   placeMap: ReadonlyMap<string, Place>;
+  members?: readonly Member[];
+  isFamilyMode?: boolean;
   amountColors: AmountColors;
   onEditTransaction: (tx: Transaction) => void;
   initialAccountId?: string;
@@ -71,6 +73,8 @@ export function TransactionsPage({
   accountMap,
   categoryMap,
   placeMap,
+  members = [],
+  isFamilyMode = false,
   amountColors,
   onEditTransaction,
   initialAccountId = '',
@@ -89,6 +93,7 @@ export function TransactionsPage({
   const [selectedAccountId, setSelectedAccountId] = useState(initialAccountId);
   const [selectedPlaceId, setSelectedPlaceId] = useState('');
   const [selectedTag, setSelectedTag] = useState('');
+  const [selectedMemberId, setSelectedMemberId] = useState('');
   const [invoiceFilter, setInvoiceFilter] = useState<InvoiceFilterOption>('any');
 
   // 進階篩選底部面板狀態（暫存，按「套用」才生效）
@@ -103,7 +108,10 @@ export function TransactionsPage({
   const [draftAccountId, setDraftAccountId] = useState('');
   const [draftPlaceId, setDraftPlaceId] = useState('');
   const [draftTag, setDraftTag] = useState('');
+  const [draftMemberId, setDraftMemberId] = useState('');
   const [draftInvoice, setDraftInvoice] = useState<InvoiceFilterOption>('any');
+
+  const memberMap = useMemo(() => new Map(members.map((m) => [m.id, m])), [members]);
 
   useEffect(() => {
     setSelectedAccountId(initialAccountId);
@@ -139,6 +147,7 @@ export function TransactionsPage({
         placeId: selectedPlaceId,
         tag: selectedTag,
         invoice: invoiceFilter,
+        memberId: isFamilyMode ? selectedMemberId : undefined,
       },
       { categoryMap, accountMap, placeMap },
     );
@@ -154,6 +163,8 @@ export function TransactionsPage({
     selectedPlaceId,
     selectedTag,
     invoiceFilter,
+    isFamilyMode,
+    selectedMemberId,
     categoryMap,
     accountMap,
     placeMap,
@@ -172,6 +183,7 @@ export function TransactionsPage({
     if (selectedAccountId) count += 1;
     if (selectedPlaceId) count += 1;
     if (selectedTag) count += 1;
+    if (isFamilyMode && selectedMemberId) count += 1;
     return count;
   }, [
     rangeMode,
@@ -183,6 +195,8 @@ export function TransactionsPage({
     selectedAccountId,
     selectedPlaceId,
     selectedTag,
+    isFamilyMode,
+    selectedMemberId,
   ]);
 
   const activeChips = useMemo(() => {
@@ -281,6 +295,14 @@ export function TransactionsPage({
       });
     }
 
+    if (isFamilyMode && selectedMemberId) {
+      chips.push({
+        key: 'member',
+        label: `成員：${memberMap.get(selectedMemberId)?.name ?? '已選成員'}`,
+        onRemove: () => setSelectedMemberId(''),
+      });
+    }
+
     return chips;
   }, [
     rangeMode,
@@ -295,9 +317,12 @@ export function TransactionsPage({
     selectedAccountId,
     selectedPlaceId,
     selectedTag,
+    isFamilyMode,
+    selectedMemberId,
     categoryMap,
     accountMap,
     placeMap,
+    memberMap,
   ]);
 
   function openFilterSheet() {
@@ -311,6 +336,7 @@ export function TransactionsPage({
     setDraftAccountId(selectedAccountId);
     setDraftPlaceId(selectedPlaceId);
     setDraftTag(selectedTag);
+    setDraftMemberId(selectedMemberId);
     setDraftInvoice(invoiceFilter);
     setFilterSheetOpen(true);
   }
@@ -332,6 +358,7 @@ export function TransactionsPage({
     setDraftAccountId('');
     setDraftPlaceId('');
     setDraftTag('');
+    setDraftMemberId('');
     setDraftInvoice('any');
   }
 
@@ -346,6 +373,7 @@ export function TransactionsPage({
     setSelectedAccountId(draftAccountId);
     setSelectedPlaceId(draftPlaceId);
     setSelectedTag(draftTag);
+    setSelectedMemberId(draftMemberId);
     setInvoiceFilter(draftInvoice);
     setFilterSheetOpen(false);
   }
@@ -543,6 +571,8 @@ export function TransactionsPage({
                     accountMap={accountMap}
                     categoryMap={categoryMap}
                     placeMap={placeMap}
+                    memberMap={isFamilyMode ? memberMap : undefined}
+                    isFamilyMode={isFamilyMode}
                     amountColors={amountColors}
                     onSelect={onEditTransaction}
                   />
@@ -772,6 +802,23 @@ export function TransactionsPage({
                       </option>
                     ))}
                   </select>
+
+                  {isFamilyMode && (
+                    <select
+                      aria-label="篩選成員"
+                      value={draftMemberId}
+                      onChange={(e) => setDraftMemberId(e.target.value)}
+                      className="col-span-2 w-full rounded-xl border border-slate-200 bg-white px-2.5 py-2 text-xs text-slate-800 outline-none focus:border-emerald-500 dark:border-slate-700 dark:bg-slate-800 dark:text-slate-200"
+                    >
+                      <option value="">全部成員</option>
+                      {members.map((member) => (
+                        <option key={member.id} value={member.id}>
+                          {member.name}
+                          {member.removed ? '（已移出）' : ''}
+                        </option>
+                      ))}
+                    </select>
+                  )}
                 </div>
               </div>
             </div>

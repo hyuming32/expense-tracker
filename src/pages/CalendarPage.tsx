@@ -4,7 +4,7 @@ import { useMoney } from '../contexts/PrivacyContext';
 import { TransactionRow } from '../components/TransactionRow';
 import type { TransactionDraft } from '../components/TransactionSheet';
 import { type AmountColors, setNoSpendDay } from '../db/repository';
-import type { Account, Category, NoSpendDay, Place, Transaction } from '../db/types';
+import type { Account, Category, Member, NoSpendDay, Place, Transaction } from '../db/types';
 import {
   collectActiveDays,
   computeMonthHabitStats,
@@ -22,6 +22,8 @@ interface CalendarPageProps {
   accountMap: ReadonlyMap<string, Account>;
   categoryMap: ReadonlyMap<string, Category>;
   placeMap: ReadonlyMap<string, Place>;
+  members?: readonly Member[];
+  isFamilyMode?: boolean;
   amountColors: AmountColors;
   onOpenCreate: (draft?: TransactionDraft) => void;
   onEditTransaction: (tx: Transaction) => void;
@@ -36,10 +38,13 @@ export function CalendarPage({
   accountMap,
   categoryMap,
   placeMap,
+  members = [],
+  isFamilyMode = false,
   amountColors,
   onOpenCreate,
   onEditTransaction,
 }: CalendarPageProps) {
+  const memberMap = useMemo(() => new Map(members.map((m) => [m.id, m])), [members]);
   const formatMoney = useMoney();
   const today = getTodayDateString();
   const [month, setMonth] = useState(getCurrentMonthString);
@@ -332,6 +337,8 @@ export function CalendarPage({
                   accountMap={accountMap}
                   categoryMap={categoryMap}
                   placeMap={placeMap}
+                  memberMap={isFamilyMode ? memberMap : undefined}
+                  isFamilyMode={isFamilyMode}
                   amountColors={amountColors}
                   onSelect={onEditTransaction}
                 />

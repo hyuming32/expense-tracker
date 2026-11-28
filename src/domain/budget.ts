@@ -113,7 +113,8 @@ export function computeBudgetStatus(
     }
   }
 
-  const activeBudgets = budgets.filter((b) => !b.deleted && b.amount > 0);
+  // 忽略帶有 memberId 的成員個人預算，維持既有總預算與分類預算計算邏輯不變
+  const activeBudgets = budgets.filter((b) => !b.deleted && !b.memberId && b.amount > 0);
   const totalBudgetRecord = activeBudgets.find((b) => b.categoryId === null);
   const total = totalBudgetRecord
     ? buildStatusItem(null, totalBudgetRecord.amount, totalSpent, daysLeft)
@@ -142,5 +143,52 @@ export function computeBudgetStatus(
     daysLeft,
     total,
     categories: categoryStatuses,
+  };
+}
+
+export interface MemberBudgetUsage {
+  memberId: string;
+  budget: number;
+  spent: number;
+  remaining: number;
+  ratio: number;
+  status: BudgetAlertLevel;
+  statusLabel: '正常' | '快用完' | '已超支';
+}
+
+/**
+ * 計算家庭成員在指定月份（YYYY-MM）的個人預算使用狀況（只計 memberId 為該成員且未刪除的支出）。
+ */
+export function computeMemberBudgetUsage(
+  transactions: readonly Transaction[],
+  memberId: string,
+  month: string,
+  amount: number,
+): MemberBudgetUsage {
+  let spent = 0;
+  for (const tx of transactions) {
+    if (
+      tx.deleted ||
+      tx.kind !== 'expense' ||
+      tx.memberId !== memberId ||
+      !tx.date.startsWith(month)
+    ) {
+      continue;
+    }
+    spent += tx.amount;
+  }
+
+  const remaining = amount - spent;
+  const ratio = amount > 0 ? spent / amount : 0;
+  const { status, statusLabel } = getBudgetAlertLevel(ratio);
+
+  return {
+    memberId,
+    budget: amount,
+    spent,
+    remaining,
+    ratio,
+    status,
+    statusLabel,
   };
 }

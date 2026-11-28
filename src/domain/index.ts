@@ -6,6 +6,7 @@ export {
   categoryCompare,
   clipToElapsed,
   compareSummary,
+  memberBreakdown,
   monthlyTrend,
   periodRange,
   periodSummary,
@@ -20,6 +21,7 @@ export type {
   CategoryCompareSubItem,
   ClippedPeriodPair,
   CompareResult,
+  MemberBreakdownItem,
   MonthlyTrendItem,
   PeriodKind,
   PeriodRange,
@@ -140,12 +142,17 @@ export type {
   LotteryPrize,
   MatchPeriodResult,
 } from './lottery';
-export { computeBudgetStatus, getBudgetAlertLevel } from './budget';
+export {
+  computeBudgetStatus,
+  computeMemberBudgetUsage,
+  getBudgetAlertLevel,
+} from './budget';
 export type {
   BudgetAlertLevel,
   BudgetStatusItem,
   BudgetStatusResult,
   CategoryBudgetStatusItem,
+  MemberBudgetUsage,
 } from './budget';
 export { parseQuickText } from './quickText';
 export type { QuickTextContext, QuickTextResult } from './quickText';
@@ -192,6 +199,14 @@ export type {
   TransactionFilterCriteria,
   TransactionFilterRange,
 } from './transactionFilter';
+export {
+  buildInstallmentDates,
+  getInstallmentProgress,
+  INSTALLMENT_MAX_COUNT,
+  INSTALLMENT_MIN_COUNT,
+  splitInstallment,
+} from './installment';
+export type { InstallmentProgress } from './installment';
 export {
   CARD_COLOR_PALETTE,
   CARRIER_CARD_ID,
